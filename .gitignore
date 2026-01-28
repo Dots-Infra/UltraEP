@@ -1,0 +1,21 @@
+# VS Code
+compile_commands.json
+.clangd
+.cache/
+.vscode/
+
+# macOS
+.DS_Store
+
+# JetBrains
+.idea
+*/cmake-build-*/
+
+# Python
+*.pyc
+
+# Build
+build/
+*.so
+*.egg-info/
+dist/
