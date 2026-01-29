@@ -52,7 +52,7 @@ class Manager {
     int num_global_physical_experts;
     int num_global_logical_experts;
 
-    // Placement
+    // Placement (on CPU)
     GlobalExpertPlacement placement;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
@@ -98,6 +98,9 @@ public:
                                  const std::vector<std::optional<pybind11::bytes>>& all_gathered_grad_handles);
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
     torch::Tensor get_local_replica_grad_buffer_tensor() const { return local_replica_grad_buffer_tensor; }
+    torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
+    torch::Tensor get_logical_to_physical_map_tensor() const { return placement.logical_to_physical_map; }
+    torch::Tensor get_logical_replica_counts_tensor() const { return placement.logical_replica_counts; }
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -109,7 +112,10 @@ static void register_apis(pybind11::module_& m) {
         .def("get_local_grad_ipc_handle", &Manager::get_local_grad_ipc_handle)
         .def("sync_global_ipc_handles", &Manager::sync_global_ipc_handles)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
-        .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor);
+        .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)
+        .def("get_physical_to_logical_map_tensor", &Manager::get_physical_to_logical_map_tensor)
+        .def("get_logical_to_physical_map_tensor", &Manager::get_logical_to_physical_map_tensor)
+        .def("get_logical_replica_counts_tensor", &Manager::get_logical_replica_counts_tensor);
 }
 
 }  // namespace ultra_ep

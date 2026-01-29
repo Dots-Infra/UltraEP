@@ -27,15 +27,15 @@ Manager::Manager(const int& num_local_master_experts,
     num_global_physical_experts = (num_local_master_experts + num_local_redundant_experts) * runtime::num_ranks;
     num_global_logical_experts = num_local_master_experts * runtime::num_ranks;
 
-    // Allocate global placement tensors
+    // Allocate global placement tensors on CPU
     int num_ranks = runtime::num_ranks;
     int device_id = runtime::device_id;
     placement.physical_to_logical_map =
-        torch::full({num_global_physical_experts}, -1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA, device_id));
+        torch::full({num_global_physical_experts}, -1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
     placement.logical_to_physical_map = torch::full(
-        {num_global_logical_experts, num_ranks}, -1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA, device_id));
+        {num_global_logical_experts, num_ranks}, -1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
     placement.logical_replica_counts =
-        torch::zeros({num_global_logical_experts}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA, device_id));
+        torch::zeros({num_global_logical_experts}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
 
     // Allocate local replica weight and grad buffers, and ptr buffers on GPU
     // then set local IPC handles
