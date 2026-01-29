@@ -19,7 +19,7 @@ class Manager:
         explicitly_destroy: bool = False,
     ):
         # Initialize global nvshmem runtime (if not initialized)
-        init_runtime(group, dict())
+        init_runtime(group)
 
         self.group = group
 

@@ -6,17 +6,19 @@ from .util import print_rank_0
 import ultra_ep._C as _C
 
 _group = None
-_nvshmem_envs = None
 
 
-def init_runtime(group: dist.ProcessGroup, nvshmem_envs: dict):
-    global _group, _nvshmem_envs
+def init_runtime(group: dist.ProcessGroup):
+    global _group
     if _C.is_runtime_initialized():
         assert group == _group, f"All EP buffers should share the same process group"
-        assert (
-            nvshmem_envs == _nvshmem_envs
-        ), f"All EP buffers should share the same NVSHMEM envs"
         return
+
+    # * IMPORTANT: NVSHMEM environment variables
+    # Disable NVLink SHArP to avoid cuMemMap failure
+    os.environ["NVSHMEM_DISABLE_NVLS"] = "1"
+    # NOTES: NVSHMEM initialization requires at least 256 MiB
+    os.environ["NVSHMEM_CUMEM_GRANULARITY"] = f"{2 ** 29}"
 
     # Synchronize NVSHMEM unique IDs
     root_unique_id = None
@@ -25,10 +27,6 @@ def init_runtime(group: dist.ProcessGroup, nvshmem_envs: dict):
     nvshmem_unique_ids = [None] * group.size()
     dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
     root_unique_id = nvshmem_unique_ids[0]
-
-    # Setup NVSHMEM envs
-    for key, value in nvshmem_envs.items():
-        os.environ[key] = value
 
     # Support both MNNVL and RDMA by setting MAX_NVL_PEERS
     allocator = _C.RemoteMemAllocator()
@@ -39,12 +37,12 @@ def init_runtime(group: dist.ProcessGroup, nvshmem_envs: dict):
         max_nvl_peers = int(max_nvl_peers)
         if max_nvl_peers != detected_ranks:
             print_rank_0(
-                f"Warning: MAX_NUM_NVL_PEERS={max_nvl_peers} differs from detected value {detected_ranks}. Using environment variable."
+                f"[WARN] MAX_NUM_NVL_PEERS={max_nvl_peers} differs from detected value {detected_ranks}. Using environment variable."
             )
     else:
         max_nvl_peers = detected_ranks
         print_rank_0(
-            f"Warning: MAX_NUM_NVL_PEERS is not set. Using detected value {detected_ranks}."
+            f"[WARN] MAX_NUM_NVL_PEERS is not set. Using detected value {detected_ranks}."
         )
 
     # Initialize CPP runtime
@@ -52,7 +50,6 @@ def init_runtime(group: dist.ProcessGroup, nvshmem_envs: dict):
 
     # Remember the EP group, which can not be changed anymore
     _group = group
-    _nvshmem_envs = nvshmem_envs
 
 
 def sync_ipc_handles(runtime):
