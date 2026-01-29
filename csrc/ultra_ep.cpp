@@ -49,6 +49,16 @@ Manager::Manager(const int& num_local_master_experts,
     global_replica_grad_buffer_ptrs = (void**)std::malloc(global_replica_buffer_ptrs_bytes);
     mem_allocator.get_handle(&weight_ipc_handles[runtime::nvl_rank_idx], local_replica_weight_buffer);
     mem_allocator.get_handle(&grad_ipc_handles[runtime::nvl_rank_idx], local_replica_grad_buffer);
+
+    // Initialize local replica weight and grad buffer tensors
+    local_replica_weight_buffer_tensor = make_tensor_from_buffer(local_replica_weight_buffer,
+                                                                 {num_local_redundant_experts, expert_total_numel},
+                                                                 torch::kBFloat16,
+                                                                 torch::Device(torch::kCUDA, device_id));
+    local_replica_grad_buffer_tensor = make_tensor_from_buffer(local_replica_grad_buffer,
+                                                               {num_local_redundant_experts, expert_total_numel},
+                                                               torch::kFloat32,
+                                                               torch::Device(torch::kCUDA, device_id));
 }
 
 Manager::~Manager() noexcept(false) {

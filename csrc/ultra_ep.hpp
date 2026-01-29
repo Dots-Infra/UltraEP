@@ -7,6 +7,7 @@
 #include "runtime.hpp"
 #include "utils/mem_alloc.hpp"
 #include "utils/nvshmem.hpp"
+#include "utils/utils.hpp"
 
 namespace ultra_ep {
 
@@ -68,6 +69,8 @@ class Manager {
     // Shape (before flattened): [num_local_redundant_experts, expert_total_numel]
     void* local_replica_weight_buffer = nullptr;
     void* local_replica_grad_buffer = nullptr;
+    torch::Tensor local_replica_weight_buffer_tensor;
+    torch::Tensor local_replica_grad_buffer_tensor;
 
     // Host-side remote memory pointers with cudaIPC access of replica buffers of NVL ranks
     // Shape (before flattened): [num_nvl_ranks, num_local_redundant_experts]
@@ -93,6 +96,8 @@ public:
     pybind11::bytes get_local_grad_ipc_handle() const;
     void sync_global_ipc_handles(const std::vector<std::optional<pybind11::bytes>>& all_gathered_weight_handles,
                                  const std::vector<std::optional<pybind11::bytes>>& all_gathered_grad_handles);
+    torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
+    torch::Tensor get_local_replica_grad_buffer_tensor() const { return local_replica_grad_buffer_tensor; }
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -102,7 +107,9 @@ static void register_apis(pybind11::module_& m) {
         .def("is_available", &Manager::is_available)
         .def("get_local_weight_ipc_handle", &Manager::get_local_weight_ipc_handle)
         .def("get_local_grad_ipc_handle", &Manager::get_local_grad_ipc_handle)
-        .def("sync_global_ipc_handles", &Manager::sync_global_ipc_handles);
+        .def("sync_global_ipc_handles", &Manager::sync_global_ipc_handles)
+        .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
+        .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor);
 }
 
 }  // namespace ultra_ep
