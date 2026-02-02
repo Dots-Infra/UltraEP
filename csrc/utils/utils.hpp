@@ -26,4 +26,16 @@ inline torch::Tensor make_tensor_from_buffer(void* ptr,
     return torch::from_blob(ptr, shape, options);
 }
 
+/**
+ * @brief Check if two ranks are in the same NVL domain.
+ *
+ * @param rank1 The rank of the first rank.
+ * @param rank2 The rank of the second rank.
+ * @param max_nvl_peers The maximum number of NVL peers.
+ * @return bool True if the two ranks are in the same NVL domain, false otherwise.
+ */
+inline bool is_in_same_nvl_domain(int rank1, int rank2, int max_nvl_peers) {
+    return rank1 / max_nvl_peers == rank2 / max_nvl_peers;
+}
+
 }  // namespace ultra_ep

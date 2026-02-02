@@ -105,6 +105,14 @@ void RemoteMemAllocator::free(void* ptr) {
     }
 }
 
+void RemoteMemAllocator::malloc_pinned(void** ptr, size_t size_raw) {
+    CUDA_RUNTIME_CHECK(cudaMallocHost(ptr, size_raw));
+}
+
+void RemoteMemAllocator::free_pinned(void* ptr) {
+    CUDA_RUNTIME_CHECK(cudaFreeHost(ptr));
+}
+
 void RemoteMemAllocator::get_handle(MemHandle* mem_handle, void* ptr) {
     size_t size = 0;
     CUDA_DRIVER_CHECK(cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr));

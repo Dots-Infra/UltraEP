@@ -39,6 +39,10 @@ public:
 
     void free(void* ptr);
 
+    void malloc_pinned(void** ptr, size_t size_raw);
+
+    void free_pinned(void* ptr);
+
     void get_handle(MemHandle* mem_handle, void* ptr);
 
     void open_handle(void** ptr, MemHandle* mem_handle);

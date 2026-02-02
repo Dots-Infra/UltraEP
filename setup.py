@@ -93,7 +93,7 @@ if __name__ == "__main__":
     )
 
     # Prefer Hopper and Blackwell series
-    os.environ["TORCH_CUDA_ARCH_LIST"] = os.getenv("TORCH_CUDA_ARCH_LIST", "9.0 12.0")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = os.getenv("TORCH_CUDA_ARCH_LIST", "9.0 10.0")
 
     # CUDA 12 flags
     nvcc_flags.extend(["-rdc=true", "--ptxas-options=--register-usage-level=10"])

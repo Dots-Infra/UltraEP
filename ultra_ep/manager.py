@@ -1,11 +1,12 @@
 import os
 import torch
 import torch.distributed as dist
-from dataclasses import dataclass
-from typing import Optional
+from typing import Any, List, Optional, Dict
 
 import ultra_ep._C as _C
 from .runtime import init_runtime, sync_ipc_handles
+
+MAX_MODEL_LAYERS = 200
 
 
 class Manager:
@@ -19,7 +20,7 @@ class Manager:
         explicitly_destroy: bool = False,
     ):
         # Initialize global nvshmem runtime (if not initialized)
-        init_runtime(group)
+        self.nvl_domain_size = init_runtime(group)
 
         self.group = group
         self.device = torch.cuda.current_device()
@@ -38,6 +39,13 @@ class Manager:
             self.num_local_physical_experts * self.num_ranks
         )
         self.num_global_logical_experts = num_local_master_experts * self.num_ranks
+
+        # Pre-configured during model construction
+        # Shape: num_layers x [num_local_master_experts,]
+        self.local_master_fc1_weight_pool = [None] * MAX_MODEL_LAYERS
+        self.local_master_fc2_weight_pool = [None] * MAX_MODEL_LAYERS
+        self.local_master_fc1_grad_pool = [None] * MAX_MODEL_LAYERS
+        self.local_master_fc2_grad_pool = [None] * MAX_MODEL_LAYERS
 
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
@@ -78,6 +86,41 @@ class Manager:
         if self.runtime is not None:
             self.runtime.destroy()
         self.runtime = None
+
+    def construct_local_master_ptr_pool(
+        self,
+        layer_id: int,
+        fc1_weights: List[torch.Tensor],
+        fc2_weights: List[torch.Tensor],
+        fc1_grads: List[torch.Tensor],
+        fc2_grads: List[torch.Tensor],
+    ):
+        assert layer_id < MAX_MODEL_LAYERS
+        assert len(fc1_weights) == self.num_local_master_experts
+        assert len(fc2_weights) == self.num_local_master_experts
+        assert len(fc1_grads) == self.num_local_master_experts
+        assert len(fc2_grads) == self.num_local_master_experts
+
+        def _to_dataptr_tensor(tensors: List[torch.Tensor]) -> torch.Tensor:
+            return torch.tensor(
+                [t.data_ptr() for t in tensors], dtype=torch.int64, device="cpu"
+            ).contiguous()
+
+        self.local_master_fc1_weight_pool[layer_id] = _to_dataptr_tensor(fc1_weights)
+        self.local_master_fc2_weight_pool[layer_id] = _to_dataptr_tensor(fc2_weights)
+        self.local_master_fc1_grad_pool[layer_id] = _to_dataptr_tensor(fc1_grads)
+        self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(fc2_grads)
+
+    def grad_reduce(self, layer_id: int):
+        assert layer_id < MAX_MODEL_LAYERS
+        assert (
+            self.local_master_fc1_grad_pool[layer_id] is not None
+            and self.local_master_fc2_grad_pool[layer_id] is not None
+        )
+        self.runtime.grad_reduce(
+            self.local_master_fc1_grad_pool[layer_id],
+            self.local_master_fc2_grad_pool[layer_id],
+        )
 
     def check_tensors_blob_from_cpp(self):
         assert (

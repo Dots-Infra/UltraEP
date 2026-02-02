@@ -4,6 +4,7 @@
 #include <torch/extension.h>
 
 #include "config.hpp"
+#include "kernels/api.cuh"
 #include "runtime.hpp"
 #include "utils/mem_alloc.hpp"
 #include "utils/nvshmem.hpp"
@@ -41,12 +42,16 @@ struct GlobalExpertPlacement {
     torch::Tensor physical_to_logical_map;
     torch::Tensor logical_to_physical_map;
     torch::Tensor logical_replica_counts;
+    int32_t* p2l_ptr;
+    int32_t* l2p_ptr;
+    int32_t* lcnts_ptr;
 };
 
 class Manager {
     // Model and expert settings
     int num_local_master_experts;
     int num_local_redundant_experts;
+    int num_local_physical_experts;
     int64_t expert_fc1_numel, expert_fc2_numel;
     int64_t expert_total_numel;
     int num_global_physical_experts;
@@ -73,14 +78,19 @@ class Manager {
     torch::Tensor local_replica_grad_buffer_tensor;
 
     // Host-side remote memory pointers with cudaIPC access of replica buffers of NVL ranks
-    // Shape (before flattened): [num_nvl_ranks, num_local_redundant_experts]
-    void** global_replica_weight_buffer_ptrs = nullptr;
-    void** global_replica_grad_buffer_ptrs = nullptr;
+    // Shape: [num_nvl_ranks,]
+    void* global_replica_weight_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
+    void* global_replica_grad_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
 
     // Host-side IPC manager for intra-NVL domain communication
     ipc::RemoteMemAllocator mem_allocator;
     ipc::MemHandle weight_ipc_handles[MAX_NVL_DOMAIN_SIZE];
     ipc::MemHandle grad_ipc_handles[MAX_NVL_DOMAIN_SIZE];
+
+    // Intermediate buffers for grad reduce tasks
+    kernels::GradReduceTask* _grad_reduce_tasks_cpu = nullptr;
+    kernels::GradReduceTask* _grad_reduce_tasks_gpu = nullptr;
+    int* _global_task_counter_gpu = nullptr;
 
 public:
     Manager(const int& num_local_master_experts,
@@ -91,6 +101,13 @@ public:
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
+
+    // Aggregate grad from remote replicas to local master
+    // then zero-out replica grad buffers
+    // Parameters (ptr tensor of local master grad buffers, for the current layer):
+    // - local_master_fc1_grad_ptr_tensor: [num_local_master_experts]
+    // - local_master_fc2_grad_ptr_tensor: [num_local_master_experts]
+    void grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor, torch::Tensor local_master_fc2_grad_ptr_tensor);
 
     pybind11::bytes get_local_weight_ipc_handle() const;
     pybind11::bytes get_local_grad_ipc_handle() const;
@@ -108,6 +125,7 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<int, int, int64_t, int64_t, bool>())
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
+        .def("grad_reduce", &Manager::grad_reduce)
         .def("get_local_weight_ipc_handle", &Manager::get_local_weight_ipc_handle)
         .def("get_local_grad_ipc_handle", &Manager::get_local_grad_ipc_handle)
         .def("sync_global_ipc_handles", &Manager::sync_global_ipc_handles)

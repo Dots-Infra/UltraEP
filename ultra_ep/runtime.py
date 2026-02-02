@@ -51,6 +51,8 @@ def init_runtime(group: dist.ProcessGroup):
     # Remember the EP group, which can not be changed anymore
     _group = group
 
+    return max_nvl_peers
+
 
 def sync_ipc_handles(runtime):
     global _group
