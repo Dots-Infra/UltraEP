@@ -3,9 +3,12 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <optional>
+
 #include "config.hpp"
 #include "kernels/api.cuh"
 #include "runtime.hpp"
+#include "utils/event.hpp"
 #include "utils/exception.cuh"
 #include "utils/nvshmem.cuh"
 #include "utils/utils.hpp"
@@ -86,7 +89,8 @@ class Manager {
     // Intermediate buffers for grad reduce tasks
     kernels::GradReduceTask* _grad_reduce_tasks_cpu = nullptr;
     kernels::GradReduceTask* _grad_reduce_tasks_gpu = nullptr;
-    int* _global_task_counter_gpu = nullptr;
+    int* _global_tile_counter_gpu = nullptr;
+    int* _task_tile_offsets_gpu = nullptr;
 
 public:
     Manager(const int& num_local_master_experts,
@@ -103,7 +107,12 @@ public:
     // Parameters (ptr tensor of local master grad buffers, for the current layer):
     // - local_master_fc1_grad_ptr_tensor: [num_local_master_experts]
     // - local_master_fc2_grad_ptr_tensor: [num_local_master_experts]
-    void grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor, torch::Tensor local_master_fc2_grad_ptr_tensor);
+    std::optional<EventHandle> grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
+                                           torch::Tensor local_master_fc2_grad_ptr_tensor,
+                                           std::optional<EventHandle>& previous_event,
+                                           bool async);
+
+    torch::Stream get_comm_stream() const { return comm_stream; }
 
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
     torch::Tensor get_local_replica_grad_buffer_tensor() const { return local_replica_grad_buffer_tensor; }
@@ -118,6 +127,7 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("grad_reduce", &Manager::grad_reduce)
+        .def("get_comm_stream", &Manager::get_comm_stream)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
         .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)
         .def("get_physical_to_logical_map_tensor", &Manager::get_physical_to_logical_map_tensor)

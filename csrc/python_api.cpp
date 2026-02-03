@@ -18,4 +18,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     ultra_ep::register_apis(m);
     ultra_ep::runtime::register_apis(m);
     ultra_ep::ipc::register_apis(m);
+    ultra_ep::event::register_apis(m);
 }

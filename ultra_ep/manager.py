@@ -1,9 +1,10 @@
 import torch
 import torch.distributed as dist
-from typing import List
+from typing import List, Optional
 
 import ultra_ep._C as _C
 from .runtime import init_runtime
+from .event import EventOverlap
 
 MAX_MODEL_LAYERS = 200
 
@@ -109,16 +110,24 @@ class Manager:
         self.local_master_fc1_grad_pool[layer_id] = _to_dataptr_tensor(fc1_grads)
         self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(fc2_grads)
 
-    def grad_reduce(self, layer_id: int):
+    def grad_reduce(
+        self,
+        layer_id: int,
+        previous_event: Optional[EventOverlap] = None,
+        async_finish: bool = False,
+    ):
         assert layer_id < MAX_MODEL_LAYERS
         assert (
             self.local_master_fc1_grad_pool[layer_id] is not None
             and self.local_master_fc2_grad_pool[layer_id] is not None
         )
-        self.runtime.grad_reduce(
+        event = self.runtime.grad_reduce(
             self.local_master_fc1_grad_pool[layer_id],
             self.local_master_fc2_grad_pool[layer_id],
+            getattr(previous_event, "event", None),
+            async_finish,
         )
+        return EventOverlap(event)
 
     def check_tensors_blob_from_cpp(self):
         assert (
@@ -154,4 +163,12 @@ class Manager:
         assert self.local_replica_grad_buffer.shape == (
             self.num_local_redundant_experts,
             self.expert_total_numel,
+        )
+
+    def get_comm_stream(self) -> torch.Stream:
+        ts: torch.Stream = self.runtime.get_comm_stream()
+        return torch.cuda.Stream(
+            stream_id=ts.stream_id,
+            device_index=ts.device_index,
+            device_type=ts.device_type,
         )

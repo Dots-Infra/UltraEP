@@ -90,7 +90,9 @@ Manager::Manager(const int& num_local_master_experts,
         cudaMallocHost((void**)&_grad_reduce_tasks_cpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
     CUDA_RUNTIME_CHECK(
         cudaMalloc((void**)&_grad_reduce_tasks_gpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
-    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_global_task_counter_gpu, sizeof(int)));
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_global_tile_counter_gpu, sizeof(int)));
+    // +1 for the final offset (total tile count)
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_tile_offsets_gpu, (MAX_GRAD_REDUCE_TASK_NUM + 1) * sizeof(int)));
 
     // Ready to use (no IPC handle exchange needed with NVSHMEM)
     _available = true;
@@ -129,10 +131,12 @@ void Manager::destroy() {
     // Free intermediate CUDA buffers
     CUDA_RUNTIME_CHECK(cudaFreeHost(_grad_reduce_tasks_cpu));
     CUDA_RUNTIME_CHECK(cudaFree(_grad_reduce_tasks_gpu));
-    CUDA_RUNTIME_CHECK(cudaFree(_global_task_counter_gpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_global_tile_counter_gpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_task_tile_offsets_gpu));
     _grad_reduce_tasks_cpu = nullptr;
     _grad_reduce_tasks_gpu = nullptr;
-    _global_task_counter_gpu = nullptr;
+    _global_tile_counter_gpu = nullptr;
+    _task_tile_offsets_gpu = nullptr;
 
     // Free NVSHMEM runtime
     runtime::destroy();
@@ -141,9 +145,19 @@ void Manager::destroy() {
     _available = false;
 }
 
-void Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
-                          torch::Tensor local_master_fc2_grad_ptr_tensor) {
+std::optional<EventHandle> Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
+                                                torch::Tensor local_master_fc2_grad_ptr_tensor,
+                                                std::optional<EventHandle>& previous_event,
+                                                bool async) {
     EP_HOST_ASSERT(is_available());
+
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    // Wait for previous event to be finished
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
+    }
 
     void** local_master_fc1_grad_ptrs = reinterpret_cast<void**>(local_master_fc1_grad_ptr_tensor.data<int64_t>());
     void** local_master_fc2_grad_ptrs = reinterpret_cast<void**>(local_master_fc2_grad_ptr_tensor.data<int64_t>());
@@ -180,16 +194,30 @@ void Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
         }
     }
     if (num_tasks == 0) {
-        return;
+        return std::nullopt;
     }
 
     // Call device-side kernels
     kernels::run_grad_reduce(_grad_reduce_tasks_cpu,
                              _grad_reduce_tasks_gpu,
-                             _global_task_counter_gpu,
+                             _global_tile_counter_gpu,
+                             _task_tile_offsets_gpu,
                              num_tasks,
                              comm_stream,
                              runtime::num_device_sms);
+
+    // Wait streams
+    std::optional<EventHandle> event;
+    if (async) {
+        event = EventHandle(comm_stream);
+        for (auto& t : {local_master_fc1_grad_ptr_tensor, local_master_fc2_grad_ptr_tensor}) {
+            t.record_stream(comm_stream);
+        }
+    } else {
+        stream_wait(compute_stream, comm_stream);
+    }
+
+    return event;
 }
 
 }  // namespace ultra_ep

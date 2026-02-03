@@ -1,183 +1,215 @@
+#include <vector>
+
 #include "api.cuh"
 #include "config.cuh"
 
 namespace ultra_ep::kernels {
 
-__device__ __forceinline__ void memset_zero(void* __restrict__ ptr, size_t total_bytes) {
-    size_t tid = threadIdx.x;
-    size_t stride = blockDim.x;
+// ============================================================================
+// Optimized Grad Reduce Kernel with Multi-CTA Cooperation
+// ============================================================================
+//
+// Design Goals:
+// 1. Maximize SM utilization by having multiple CTAs work on a single task
+// 2. Pipeline TMA loads with reduce operations
+// 3. Efficiently zero out replica buffers after data is consumed
+//
+// Key Optimizations:
+// - Fine-grained tile-level task distribution instead of coarse task-level
+// - All CTAs participate in processing tiles across all tasks
+// - Persistent kernel pattern with atomic tile counter
+// ============================================================================
 
-    uint8_t* base_ptr = reinterpret_cast<uint8_t*>(ptr);
-    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+// Vectorized memset for remote memory zeroing (supports up to GRAD_REDUCE_TILE_SIZE_BYTES)
+__device__ __forceinline__ void memset_zero_tile(float* __restrict__ ptr, int num_elements) {
+    // Use vectorized stores for efficiency (16 bytes = 4 floats per store)
+    int num_float4s = num_elements / 4;
+    float4* vec_ptr = reinterpret_cast<float4*>(ptr);
 
-    // Calculate alignment boundary (Target: 16-byte alignment for uint4)
-    size_t align_offset = (16 - (addr & 15)) & 15;
-
-    // Edge case: if total length is not enough to fill the aligned region, or just enough
-    if (total_bytes <= align_offset) {
-        for (size_t i = tid; i < total_bytes; i += stride) {
-            base_ptr[i] = 0;
-        }
-        return;
+    for (int i = threadIdx.x; i < num_float4s; i += blockDim.x) {
+        // Use streaming store to bypass L2 cache (data won't be reused)
+        ptx::st_global_v4_u32_streaming(&vec_ptr[i], 0, 0, 0, 0);
     }
 
-    // Divide into regions: Head (Bytes) | Body (Uint4) | Tail (Bytes)
-    uint8_t* body_start_ptr = base_ptr + align_offset;
-    size_t body_bytes = total_bytes - align_offset;
-    size_t n_vectors = body_bytes / 16;  // number of 128-bit blocks
-    size_t tail_offset = align_offset + n_vectors * 16;
-    size_t tail_bytes = total_bytes - tail_offset;
-
-    // Head: handle non-aligned bytes
-    // Only Global Thread 0 handles at most 15 bytes, avoid parallel overhead for small data
-    if (tid == 0 && align_offset > 0) {
-        for (int i = 0; i < 15; ++i) {
-            if (i < align_offset)
-                base_ptr[i] = 0;
-        }
-    }
-
-    // Body: 128-bit vectorized store
-    uint4* vec_ptr = reinterpret_cast<uint4*>(body_start_ptr);
-    for (size_t i = tid; i < n_vectors; i += stride) {
-        // Store cache streaming with L2 bypassing
-        // Equivalent to make_uint4(0, 0, 0, 0)
-        ptx::st_global_v4_u32_streaming(vec_ptr + i, 0, 0, 0, 0);
-    }
-
-    // Tail: handle remaining bytes
-    // Same as Head: Global Thread 0 handles at most 15 bytes
-    if (tid == 0 && tail_bytes > 0) {
-        for (int i = 0; i < 15; ++i) {
-            if (i < tail_bytes)
-                base_ptr[tail_offset + i] = 0;
-        }
+    // Handle remaining elements (0-3 floats)
+    int remaining_start = num_float4s * 4;
+    int remaining = num_elements - remaining_start;
+    if (threadIdx.x < remaining) {
+        ptr[remaining_start + threadIdx.x] = 0.0f;
     }
 }
 
-__global__ void grad_reduce_kernel(const int total_tasks,
-                                   const GradReduceTask* grad_reduce_tasks,
-                                   int* global_task_counter) {
-    extern __shared__ char smem_buffer[];
+// Structure describing a tile within a task (computed at runtime)
+struct TileInfo {
+    int task_idx;          // Which task this tile belongs to
+    int tile_idx_in_task;  // Tile index within the task
+    size_t global_offset;  // Offset in elements from task start
+    int num_elements;      // Number of elements in this tile (may be < GRAD_REDUCE_TILE_ELEMENTS for last tile)
+};
 
-    // Shared memory mbarriers for TMA pipelining (one per pipeline stage)
-    __shared__ __align__(8) ptx::mbarrier mbarriers[GRAD_REDUCE_PIPELINE_STAGES];
-    __shared__ ptx::arrival_phase phases[GRAD_REDUCE_PIPELINE_STAGES];
+// Compute total number of tiles across all tasks
+__device__ __forceinline__ int compute_total_tiles(const GradReduceTask* tasks, int num_tasks) {
+    int total = 0;
+    for (int i = 0; i < num_tasks; ++i) {
+        total += (tasks[i].numel + GRAD_REDUCE_TILE_ELEMENTS - 1) / GRAD_REDUCE_TILE_ELEMENTS;
+    }
+    return total;
+}
 
-    // Initialize mbarriers (thread 0 only, once per block)
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < GRAD_REDUCE_PIPELINE_STAGES; ++i) {
-            ptx::mbarrier_init(&mbarriers[i], 1);  // Expect 1 arrival (from TMA completion)
-            phases[i] = 0;
+// Map a global tile index to task and tile within task
+__device__ __forceinline__ TileInfo get_tile_info(const GradReduceTask* tasks,
+                                                  const int* task_tile_offsets,
+                                                  int num_tasks,
+                                                  int global_tile_idx) {
+    TileInfo info;
+
+    // Binary search to find which task this tile belongs to
+    int lo = 0, hi = num_tasks - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (task_tile_offsets[mid] <= global_tile_idx) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
         }
+    }
+
+    info.task_idx = lo;
+    info.tile_idx_in_task = global_tile_idx - task_tile_offsets[lo];
+    info.global_offset = (size_t)info.tile_idx_in_task * GRAD_REDUCE_TILE_ELEMENTS;
+
+    // Compute number of elements in this tile
+    size_t task_numel = tasks[info.task_idx].numel;
+    size_t remaining = task_numel - info.global_offset;
+    info.num_elements = min((size_t)GRAD_REDUCE_TILE_ELEMENTS, remaining);
+
+    return info;
+}
+
+__global__ void grad_reduce_kernel_v2(const int total_tasks,
+                                      const GradReduceTask* grad_reduce_tasks,
+                                      const int* task_tile_offsets,  // Prefix sum of tile counts
+                                      const int total_tiles,
+                                      int* global_tile_counter) {
+    extern __shared__ float smem_pool[];
+
+    // Use statically declared mbarriers in shared memory for proper alignment
+    __shared__ __align__(8) ptx::mbarrier mbarrier;
+    __shared__ ptx::arrival_phase phase;
+
+    // Initialize mbarrier (thread 0 only)
+    if (threadIdx.x == 0) {
+        ptx::mbarrier_init(&mbarrier, 1);  // Expect 1 arrival (from TMA completion)
+        phase = 0;
     }
     __syncthreads();
 
-    float* smem_pool = reinterpret_cast<float*>(smem_buffer);
-
-    // Persistent loop: fetch tasks until the task list is empty
+    // Persistent loop - each CTA grabs tiles until work is exhausted
     while (true) {
-        // Fetch task (leader thread only)
-        __shared__ int my_task_idx;
+        // Fetch next tile index (leader thread only)
+        __shared__ int my_tile_idx;
         if (threadIdx.x == 0) {
-            my_task_idx = atomicAdd(global_task_counter, 1);
+            my_tile_idx = atomicAdd(global_tile_counter, 1);
         }
         __syncthreads();
-        if (my_task_idx >= total_tasks)
+
+        if (my_tile_idx >= total_tiles)
             break;
 
-        GradReduceTask current_task = grad_reduce_tasks[my_task_idx];
-        size_t task_numel = current_task.numel;
-        size_t num_tiles = (task_numel + GRAD_REDUCE_TILE_ELEMENTS - 1) / GRAD_REDUCE_TILE_ELEMENTS;
+        // Get tile information via binary search
+        TileInfo tile = get_tile_info(grad_reduce_tasks, task_tile_offsets, total_tasks, my_tile_idx);
+        GradReduceTask task = grad_reduce_tasks[tile.task_idx];
 
-        // Prologue: issue first GRAD_REDUCE_PIPELINE_STAGES TMA loads
-        for (int i = 0; i < GRAD_REDUCE_PIPELINE_STAGES; ++i) {
-            if (i < num_tiles) {
-                size_t offset = i * GRAD_REDUCE_TILE_ELEMENTS;
-                // Round up to 16-byte alignment for TMA
-                size_t bytes = min((size_t)GRAD_REDUCE_TILE_SIZE_BYTES, (task_numel - offset) * sizeof(float));
-                bytes = (bytes + 15) & ~15;  // Align to 16 bytes
+        // Calculate TMA transfer size (must be 16-byte aligned)
+        size_t bytes = tile.num_elements * sizeof(float);
+        bytes = (bytes + 15) & ~15;
 
-                int stage = i % GRAD_REDUCE_PIPELINE_STAGES;
-                // Thread 0: set expected TX bytes and issue TMA load
-                if (threadIdx.x == 0) {
-                    ptx::mbarrier_arrive_and_set_tx(&mbarriers[stage], bytes);
-                    ptx::tma_load_1d(smem_pool + stage * GRAD_REDUCE_TILE_ELEMENTS,
-                                     current_task.replica_remote_addr + offset,
-                                     &mbarriers[stage],
-                                     bytes,
-                                     ptx::TMACacheHint::kEvictFirst);
-                }
-            }
+        // Issue TMA load for this tile (thread 0 only)
+        if (threadIdx.x == 0) {
+            ptx::mbarrier_arrive_and_set_tx(&mbarrier, bytes);
+            ptx::tma_load_1d(smem_pool,
+                             task.replica_remote_addr + tile.global_offset,
+                             &mbarrier,
+                             bytes,
+                             ptx::TMACacheHint::kEvictFirst);
         }
 
-        for (int step = 0; step < num_tiles; ++step) {
-            int stage = step % GRAD_REDUCE_PIPELINE_STAGES;
-
-            // Wait for TMA to complete on this stage
-            if (threadIdx.x == 0) {
-                ptx::mbarrier_wait_and_flip_phase(&mbarriers[stage], phases[stage]);
-            }
-            __syncthreads();
-
-            size_t offset = step * GRAD_REDUCE_TILE_ELEMENTS;
-            int count = min(GRAD_REDUCE_TILE_ELEMENTS, (int)(task_numel - offset));
-            float* curr_smem = smem_pool + stage * GRAD_REDUCE_TILE_ELEMENTS;
-
-            // Reduce with AtomicAdd for multiple replicas added to same master
-            for (int i = threadIdx.x; i < count; i += blockDim.x) {
-                atomicAdd(&current_task.master_local_addr[offset + i], curr_smem[i]);
-            }
-
-            // Zero-out remote replica grad buffer (pipelined)
-            __syncthreads();  // Sync read
-            memset_zero(current_task.replica_remote_addr + offset, count * sizeof(float));
-            __threadfence_system();  // Sync write
-
-            // Issue next TMA load (reuse this stage's mbarrier)
-            int next_step = step + GRAD_REDUCE_PIPELINE_STAGES;
-            if (next_step < num_tiles) {
-                size_t next_offset = next_step * GRAD_REDUCE_TILE_ELEMENTS;
-                // Round up to 16-byte alignment for TMA
-                size_t bytes = min((size_t)GRAD_REDUCE_TILE_SIZE_BYTES, (task_numel - next_offset) * sizeof(float));
-                bytes = (bytes + 15) & ~15;  // Align to 16 bytes
-
-                // Thread 0: set expected TX bytes and issue TMA load
-                if (threadIdx.x == 0) {
-                    ptx::mbarrier_arrive_and_set_tx(&mbarriers[stage], bytes);
-                    ptx::tma_load_1d(smem_pool + stage * GRAD_REDUCE_TILE_ELEMENTS,
-                                     current_task.replica_remote_addr + next_offset,
-                                     &mbarriers[stage],
-                                     bytes,
-                                     ptx::TMACacheHint::kEvictFirst);
-                }
-            }
+        // Wait for TMA completion (thread 0 waits, then sync all)
+        if (threadIdx.x == 0) {
+            ptx::mbarrier_wait_and_flip_phase(&mbarrier, phase);
         }
+        __syncthreads();
+
+        // Perform reduction: add loaded values to master buffer
+        // Using atomicAdd to handle potential concurrent updates from multiple replicas
+        for (int i = threadIdx.x; i < tile.num_elements; i += blockDim.x) {
+            atomicAdd(&task.master_local_addr[tile.global_offset + i], smem_pool[i]);
+        }
+        __syncthreads();
+
+        // Zero out the replica buffer region we just consumed
+        memset_zero_tile(task.replica_remote_addr + tile.global_offset, tile.num_elements);
+
+        // Memory fence to ensure remote stores are visible to other GPUs
+        __threadfence_system();
+    }
+
+    // Invalidate mbarrier before exit
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ptx::mbarrier_invalidate(&mbarrier);
     }
 }
 
 void run_grad_reduce(const GradReduceTask* grad_reduce_tasks_cpu,
                      GradReduceTask* grad_reduce_tasks_gpu,
-                     int* global_task_counter_gpu,
+                     int* global_tile_counter_gpu,
+                     int* task_tile_offsets_gpu,  // New: prefix sum of tile counts
                      const int total_tasks,
                      cudaStream_t stream,
                      const int num_device_sms) {
-    // Copy tasks from CPU to GPU to avoid kernel param overflow
+    if (total_tasks == 0)
+        return;
+
+    // Compute tile offsets on CPU (prefix sum of tile counts per task)
+    std::vector<int> task_tile_offsets(total_tasks + 1);
+    task_tile_offsets[0] = 0;
+    for (int i = 0; i < total_tasks; ++i) {
+        int num_tiles = (grad_reduce_tasks_cpu[i].numel + GRAD_REDUCE_TILE_ELEMENTS - 1) / GRAD_REDUCE_TILE_ELEMENTS;
+        task_tile_offsets[i + 1] = task_tile_offsets[i] + num_tiles;
+    }
+    int total_tiles = task_tile_offsets[total_tasks];
+
+    // Copy tasks and tile offsets from CPU to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(grad_reduce_tasks_gpu,
                                        grad_reduce_tasks_cpu,
                                        total_tasks * sizeof(GradReduceTask),
                                        cudaMemcpyHostToDevice,
                                        stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_task_counter_gpu, 0, sizeof(int), stream));
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(task_tile_offsets_gpu,
+                                       task_tile_offsets.data(),
+                                       (total_tasks + 1) * sizeof(int),
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
 
-    // Call device-side kernel
-    dim3 grid(num_device_sms * 2);
-    dim3 block(256);
-    int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES * GRAD_REDUCE_PIPELINE_STAGES;
+    // Configure kernel launch
+    // Use all SMs to maximize parallelism across tiles
+    // Each CTA will grab tiles via atomic counter
+    int num_ctas = min(num_device_sms * 2, total_tiles);  // Don't launch more CTAs than tiles
+    num_ctas = max(num_ctas, 1);
+
+    dim3 grid(num_ctas);
+    dim3 block(GRAD_REDUCE_THREADS_PER_BLOCK);
+
+    // Shared memory: one tile staging buffer (mbarrier is statically allocated)
+    int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES;
+
     CUDA_RUNTIME_CHECK(
-        cudaFuncSetAttribute(grad_reduce_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        cudaFuncSetAttribute(grad_reduce_kernel_v2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-    grad_reduce_kernel<<<grid, block, smem_size, stream>>>(total_tasks, grad_reduce_tasks_gpu, global_task_counter_gpu);
+    grad_reduce_kernel_v2<<<grid, block, smem_size, stream>>>(
+        total_tasks, grad_reduce_tasks_gpu, task_tile_offsets_gpu, total_tiles, global_tile_counter_gpu);
 }
 
 }  // namespace ultra_ep::kernels

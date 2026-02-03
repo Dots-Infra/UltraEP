@@ -137,7 +137,7 @@ def main():
         # Verify correctness at first run
         replica_grad_buffer.copy_(replica_grad_buffer_ref)
         dist.barrier()
-        manager.grad_reduce(layer_id)
+        manager.grad_reduce(layer_id, async_finish=False)
         dist.barrier()
         assert (
             (replica_grad_buffer == 0).all().item()
@@ -162,8 +162,7 @@ def main():
         for _ in range(args.warmup_iters):
             # We need to refill replica buffers because grad_reduce zeros them out
             replica_grad_buffer.copy_(replica_grad_buffer_ref)
-            manager.grad_reduce(layer_id)
-            torch.cuda.synchronize()
+            manager.grad_reduce(layer_id, async_finish=False)
 
         # Performance benchmark
         total_latency = 0
@@ -171,8 +170,7 @@ def main():
             replica_grad_buffer.copy_(replica_grad_buffer_ref)
             dist.barrier()
             start = time.perf_counter()
-            manager.grad_reduce(layer_id)
-            torch.cuda.synchronize()
+            manager.grad_reduce(layer_id, async_finish=False)
             dist.barrier()
             end = time.perf_counter()
             total_latency += end - start
