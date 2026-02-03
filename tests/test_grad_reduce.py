@@ -7,7 +7,7 @@ import ultra_ep
 from ultra_ep.util import print_rank_0
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import setup_placement
+from utils import setup_placement, bench, bench_kineto
 
 
 def main():
@@ -16,8 +16,8 @@ def main():
     parser.add_argument("--num-local-redundant-experts", type=int, default=2)
     parser.add_argument("--expert-fc1-numel", type=int, default=3072 * 4096)
     parser.add_argument("--expert-fc2-numel", type=int, default=1536 * 4096)
-    parser.add_argument("--warmup-iters", type=int, default=5)
-    parser.add_argument("--bench-iters", type=int, default=20)
+    parser.add_argument("--warmup-iters", type=int, default=20)
+    parser.add_argument("--bench-iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=33)
     parser.add_argument("--correct-tolerance", type=float, default=1e-5)
     args = parser.parse_args()
@@ -155,6 +155,7 @@ def main():
                 global_logical_expert_fc2_grad_buffer[global_log_idx, :],
                 atol=args.correct_tolerance,
             ), f"FC2 grad mismatch for logical expert {global_log_idx} on rank {rank}"
+        torch.cuda.synchronize()
         dist.barrier()
         print_rank_0("*** Correctness verification passed! ***")
 
@@ -165,36 +166,53 @@ def main():
             manager.grad_reduce(layer_id, async_finish=False)
 
         # Performance benchmark
-        total_latency = 0
-        for _ in range(args.bench_iters):
-            replica_grad_buffer.copy_(replica_grad_buffer_ref)
-            dist.barrier()
-            start = time.perf_counter()
-            manager.grad_reduce(layer_id, async_finish=False)
-            dist.barrier()
-            end = time.perf_counter()
-            total_latency += end - start
-            assert (
-                (replica_grad_buffer == 0).all().item()
-            ), f"Replica grad buffer was not zeroed out on rank {rank}"
+        grad_reduce_fn = lambda: manager.grad_reduce(layer_id, async_finish=False)
+        pre_fn = lambda: replica_grad_buffer.copy_(replica_grad_buffer_ref)
 
-        avg_latency_ms = (total_latency / args.bench_iters) * 1000
+        def grad_reduce_fn_full():
+            replica_grad_buffer.copy_(replica_grad_buffer_ref)
+            manager.grad_reduce(layer_id, async_finish=False)
+
+        avg_time, min_time, max_time = bench(
+            grad_reduce_fn,
+            num_warmups=args.warmup_iters,
+            num_tests=args.bench_iters,
+            use_barrier=True,
+            pre_fn=pre_fn,
+        )
+        avg_time_ms = avg_time * 1000
+        min_time_ms = min_time * 1000
+        max_time_ms = max_time * 1000
+
+        kernel_durations = bench_kineto(
+            grad_reduce_fn_full,
+            kernel_names=("grad_reduce_kernel_v2",),
+            barrier_comm_profiling=True,
+        )
+        print(
+            f"{"Rank " + str(rank) + " kernel duration":<{26}}: {kernel_durations[0] * 1000:.3f} ms",
+            flush=True,
+        )
+        dist.barrier()
 
         # Calculate bandwidth
-        total_data_bytes = (
-            world_size
-            * manager.num_local_redundant_experts
+        avg_data_bytes = (
+            manager.num_local_redundant_experts
             * expert_total_numel
             * replica_grad_buffer_ref.element_size()
         )
-        total_data_MB = total_data_bytes / (1024**2)
-        total_data_GB = total_data_bytes / (1024**3)
-        avg_bandwidth_GBps = total_data_GB / (avg_latency_ms / 1000.0)
+        avg_data_MB = avg_data_bytes / (1024**2)
+        avg_data_GB = avg_data_bytes / (1024**3)
+        avg_bandwidth_GBps = avg_data_GB / (avg_time_ms / 1000.0)
 
+        print_rank_0(f"-" * 80)
         print_rank_0("Performance metrics:")
-        print_rank_0(f"  - Average Latency: {avg_latency_ms:.3f} ms")
-        print_rank_0(f"  - Total Data Moved: {total_data_GB:.2f} GB")
+        print_rank_0(
+            f"  - E2E Latency: {avg_time_ms:.3f} ms (avg) | {min_time_ms:.3f} ms (min) | {max_time_ms:.3f} ms (max)"
+        )
+        print_rank_0(f"  - Average Data Moved (per-rank): {avg_data_MB} MB")
         print_rank_0(f"  - End2end Bandwidth: {avg_bandwidth_GBps:.2f} GB/s")
+        print_rank_0("\n")
 
     manager.destroy()
     dist.destroy_process_group()
