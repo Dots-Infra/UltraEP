@@ -6,8 +6,8 @@
 #include "config.hpp"
 #include "kernels/api.cuh"
 #include "runtime.hpp"
-#include "utils/exception.hpp"
-#include "utils/nvshmem.hpp"
+#include "utils/exception.cuh"
+#include "utils/nvshmem.cuh"
 #include "utils/utils.hpp"
 
 namespace ultra_ep {

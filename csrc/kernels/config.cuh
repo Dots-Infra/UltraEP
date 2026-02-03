@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 
 #include "../config.hpp"
-#include "../utils/exception.hpp"
+#include "../utils/exception.cuh"
 #include "ptx.cuh"
 
 // Grad reduce hyperparameters

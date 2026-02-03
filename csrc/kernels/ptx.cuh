@@ -41,7 +41,8 @@ __forceinline__ __device__ int elect_one_sync() {
 
 // mbarrier
 __forceinline__ __device__ void mbarrier_init(mbarrier* ptr, const int& arrive_count = 1) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::"r"(arrive_count), "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+    asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::"r"(arrive_count),
+                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 }
 
 __forceinline__ __device__ void mbarrier_invalidate(mbarrier* ptr) {
@@ -49,7 +50,8 @@ __forceinline__ __device__ void mbarrier_invalidate(mbarrier* ptr) {
 }
 
 __forceinline__ __device__ void mbarrier_arrive(mbarrier* ptr) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0]; \n\t" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+    asm volatile(
+        "mbarrier.arrive.shared::cta.b64 _, [%0]; \n\t" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 }
 
 __forceinline__ __device__ void mbarrier_arrive_and_set_tx(mbarrier* ptr, const int& num_bytes) {
@@ -85,8 +87,10 @@ __forceinline__ __device__ void tma_store_wait() {
 enum TMACacheHint : int64_t { kEvictFirst = 0x12f0000000000000ll, kEvictNormal = 0x1000000000000000ll };
 
 // __forceinline__ __device__ void tma_load_1d(
-//     const void* dst_ptr, const void* src_ptr, mbarrier* ptr, const int& num_bytes, const TMACacheHint& hint = TMACacheHint::kEvictFirst)
-//     { asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n" ::"r"(
+//     const void* dst_ptr, const void* src_ptr, mbarrier* ptr, const int& num_bytes, const TMACacheHint& hint =
+//     TMACacheHint::kEvictFirst) { asm
+//     volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3],
+//     %4;\n" ::"r"(
 //                      static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))),
 //                  "l"(src_ptr),
 //                  "r"(num_bytes),
@@ -101,13 +105,14 @@ __forceinline__ __device__ void tma_load_1d(const void* dst_ptr,
                                             void* mbarrier_ptr,
                                             const int& num_bytes,
                                             const TMACacheHint& hint = TMACacheHint::kEvictFirst) {
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;\n" ::"r"(
-                     static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))),
-                 "l"(src_ptr),
-                 "r"(num_bytes),
-                 "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbarrier_ptr))),
-                 "l"(hint)
-                 : "memory");
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], "
+        "%4;\n" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))),
+        "l"(src_ptr),
+        "r"(num_bytes),
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbarrier_ptr))),
+        "l"(hint)
+        : "memory");
 }
 
 __forceinline__ __device__ void tma_store_1d(const void* dst_ptr,
@@ -126,8 +131,10 @@ __forceinline__ __device__ void tma_store_commit() {
 }
 
 // Streaming store with EvictFirst hint
-__forceinline__ __device__ void st_global_v4_u32_streaming(const void* dst_ptr, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3) {
-    asm volatile("st.global.cs.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(dst_ptr), "r"(v0), "r"(v1), "r"(v2), "r"(v3) : "memory");
+__forceinline__ __device__ void st_global_v4_u32_streaming(
+    const void* dst_ptr, uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3) {
+    asm volatile("st.global.cs.v4.u32 [%0], {%1, %2, %3, %4};" ::"l"(dst_ptr), "r"(v0), "r"(v1), "r"(v2), "r"(v3)
+                 : "memory");
 }
 
 }  // namespace ultra_ep::kernels::ptx

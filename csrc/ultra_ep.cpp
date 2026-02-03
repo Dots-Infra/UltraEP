@@ -31,18 +31,24 @@ Manager::Manager(const int& num_local_master_experts,
     int num_ranks = runtime::num_ranks;
     int device_id = runtime::device_id;
     placement.physical_to_logical_map =
-        torch::full({num_global_physical_experts}, -1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-    placement.logical_to_physical_map = torch::full(
-        {num_global_logical_experts, num_ranks}, -1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+        torch::full({num_global_physical_experts},
+                    -1,
+                    torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+    placement.logical_to_physical_map =
+        torch::full({num_global_logical_experts, num_ranks},
+                    -1,
+                    torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
     placement.logical_replica_counts =
-        torch::zeros({num_global_logical_experts}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
+        torch::zeros({num_global_logical_experts},
+                     torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
     placement.p2l_ptr = placement.physical_to_logical_map.data<int32_t>();
     placement.l2p_ptr = placement.logical_to_physical_map.data<int32_t>();
     placement.lcnts_ptr = placement.logical_replica_counts.data<int32_t>();
 
     // Allocate local replica weight and grad buffers via NVSHMEM symmetric heap
     // This enables automatic cross-GPU access within NVL domain
-    int64_t local_replica_weight_bytes = (int64_t)num_local_redundant_experts * expert_total_numel * WEIGHT_ELEMENT_SIZE;
+    int64_t local_replica_weight_bytes =
+        (int64_t)num_local_redundant_experts * expert_total_numel * WEIGHT_ELEMENT_SIZE;
     int64_t local_replica_grad_bytes = (int64_t)num_local_redundant_experts * expert_total_numel * GRAD_ELEMENT_SIZE;
 
     // Allocate via NVSHMEM for symmetric heap (accessible from all PEs)
@@ -80,8 +86,10 @@ Manager::Manager(const int& num_local_master_experts,
     }
 
     // Allocate intermediate buffers for grad reduce tasks (regular CUDA memory)
-    CUDA_RUNTIME_CHECK(cudaMallocHost((void**)&_grad_reduce_tasks_cpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
-    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_grad_reduce_tasks_gpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
+    CUDA_RUNTIME_CHECK(
+        cudaMallocHost((void**)&_grad_reduce_tasks_cpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
+    CUDA_RUNTIME_CHECK(
+        cudaMalloc((void**)&_grad_reduce_tasks_gpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_global_task_counter_gpu, sizeof(int)));
 
     // Ready to use (no IPC handle exchange needed with NVSHMEM)
@@ -133,7 +141,8 @@ void Manager::destroy() {
     _available = false;
 }
 
-void Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor, torch::Tensor local_master_fc2_grad_ptr_tensor) {
+void Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
+                          torch::Tensor local_master_fc2_grad_ptr_tensor) {
     EP_HOST_ASSERT(is_available());
 
     void** local_master_fc1_grad_ptrs = reinterpret_cast<void**>(local_master_fc1_grad_ptr_tensor.data<int64_t>());
@@ -159,8 +168,10 @@ void Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor, torch:
             EP_HOST_ASSERT(global_replica_grad_buffer_ptrs[replica_nvl_rank_idx] != nullptr);
             int replica_local_offset = replica_global_phy_idx % num_local_physical_experts - num_local_master_experts;
             EP_HOST_ASSERT(replica_local_offset >= 0 and replica_local_offset < num_local_redundant_experts);
-            float* replica_remote_grad_buffer_ptr = reinterpret_cast<float*>(global_replica_grad_buffer_ptrs[replica_nvl_rank_idx]);
-            float* replica_remote_fc1_grad_ptr = replica_remote_grad_buffer_ptr + replica_local_offset * expert_total_numel;
+            float* replica_remote_grad_buffer_ptr =
+                reinterpret_cast<float*>(global_replica_grad_buffer_ptrs[replica_nvl_rank_idx]);
+            float* replica_remote_fc1_grad_ptr =
+                replica_remote_grad_buffer_ptr + replica_local_offset * expert_total_numel;
             float* replica_remote_fc2_grad_ptr = replica_remote_fc1_grad_ptr + expert_fc1_numel;
             _grad_reduce_tasks_cpu[num_tasks++] = {
                 local_master_fc1_grad_ptr, replica_remote_fc1_grad_ptr, static_cast<size_t>(expert_fc1_numel)};
@@ -173,8 +184,12 @@ void Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor, torch:
     }
 
     // Call device-side kernels
-    kernels::run_grad_reduce(
-        _grad_reduce_tasks_cpu, _grad_reduce_tasks_gpu, _global_task_counter_gpu, num_tasks, comm_stream, runtime::num_device_sms);
+    kernels::run_grad_reduce(_grad_reduce_tasks_cpu,
+                             _grad_reduce_tasks_gpu,
+                             _global_task_counter_gpu,
+                             num_tasks,
+                             comm_stream,
+                             runtime::num_device_sms);
 }
 
 }  // namespace ultra_ep

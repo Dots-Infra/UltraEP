@@ -55,7 +55,9 @@ __device__ __forceinline__ void memset_zero(void* __restrict__ ptr, size_t total
     }
 }
 
-__global__ void grad_reduce_kernel(const int total_tasks, const GradReduceTask* grad_reduce_tasks, int* global_task_counter) {
+__global__ void grad_reduce_kernel(const int total_tasks,
+                                   const GradReduceTask* grad_reduce_tasks,
+                                   int* global_task_counter) {
     extern __shared__ char smem_buffer[];
 
     // Shared memory mbarriers for TMA pipelining (one per pipeline stage)
@@ -161,15 +163,19 @@ void run_grad_reduce(const GradReduceTask* grad_reduce_tasks_cpu,
                      cudaStream_t stream,
                      const int num_device_sms) {
     // Copy tasks from CPU to GPU to avoid kernel param overflow
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
-        grad_reduce_tasks_gpu, grad_reduce_tasks_cpu, total_tasks * sizeof(GradReduceTask), cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(grad_reduce_tasks_gpu,
+                                       grad_reduce_tasks_cpu,
+                                       total_tasks * sizeof(GradReduceTask),
+                                       cudaMemcpyHostToDevice,
+                                       stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_task_counter_gpu, 0, sizeof(int), stream));
 
     // Call device-side kernel
     dim3 grid(num_device_sms * 2);
     dim3 block(256);
     int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES * GRAD_REDUCE_PIPELINE_STAGES;
-    CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(grad_reduce_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    CUDA_RUNTIME_CHECK(
+        cudaFuncSetAttribute(grad_reduce_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     grad_reduce_kernel<<<grid, block, smem_size, stream>>>(total_tasks, grad_reduce_tasks_gpu, global_task_counter_gpu);
 }

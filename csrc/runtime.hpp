@@ -5,8 +5,8 @@
 #include <torch/extension.h>
 
 #include "config.hpp"
-#include "utils/exception.hpp"
-#include "utils/nvshmem.hpp"
+#include "utils/exception.cuh"
+#include "utils/nvshmem.cuh"
 
 namespace ultra_ep::runtime {
 
@@ -20,7 +20,10 @@ at::cuda::CUDAStream get_global_comm_stream();
 
 pybind11::bytes get_local_nvshmem_unique_id(const int& rank);
 
-void init_runtime(const int& rank_idx_, const int& num_ranks_, const int& max_nvl_peers_, const pybind11::bytes& root_unique_id);
+void init_runtime(const int& rank_idx_,
+                  const int& num_ranks_,
+                  const int& max_nvl_peers_,
+                  const pybind11::bytes& root_unique_id);
 
 void destroy();
 

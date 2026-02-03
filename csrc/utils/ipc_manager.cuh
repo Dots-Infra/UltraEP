@@ -14,7 +14,7 @@
 
 #include <cstring>
 
-#include "exception.hpp"
+#include "exception.cuh"
 
 namespace ultra_ep::ipc {
 

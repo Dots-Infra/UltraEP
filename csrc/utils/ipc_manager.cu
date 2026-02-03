@@ -29,7 +29,8 @@ IpcManager::IpcManager() {
         fabric_prop_.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         fabric_prop_.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
         fabric_prop_.location.id = device_;
-        CUDA_DRIVER_CHECK(cuMemGetAllocationGranularity(&fabric_granularity_, &fabric_prop_, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        CUDA_DRIVER_CHECK(
+            cuMemGetAllocationGranularity(&fabric_granularity_, &fabric_prop_, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
         access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         access_desc.location.id = device_;
         access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
@@ -110,7 +111,8 @@ void IpcManager::get_handle(MemHandle* mem_handle, void* ptr) {
     if (support_fabric_) {
         CUmemGenericAllocationHandle handle;
         CUDA_DRIVER_CHECK(cuMemRetainAllocationHandle(&handle, ptr));
-        CUDA_DRIVER_CHECK(cuMemExportToShareableHandle(&mem_handle->inner.cu_mem_fabric_handle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+        CUDA_DRIVER_CHECK(cuMemExportToShareableHandle(
+            &mem_handle->inner.cu_mem_fabric_handle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
     } else {
         CUDA_RUNTIME_CHECK(cudaIpcGetMemHandle(&mem_handle->inner.cuda_ipc_mem_handle, ptr));
     }
@@ -123,12 +125,14 @@ void IpcManager::open_handle(void** ptr, MemHandle* mem_handle) {
     if (support_fabric_) {
         size_t size = mem_handle->size;
         CUmemGenericAllocationHandle handle;
-        CUDA_DRIVER_CHECK(cuMemImportFromShareableHandle(&handle, &mem_handle->inner.cu_mem_fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC));
+        CUDA_DRIVER_CHECK(cuMemImportFromShareableHandle(
+            &handle, &mem_handle->inner.cu_mem_fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC));
         CUDA_DRIVER_CHECK(cuMemAddressReserve((CUdeviceptr*)ptr, size, 0, 0, 0));
         CUDA_DRIVER_CHECK(cuMemMap((CUdeviceptr)*ptr, size, 0, handle, 0));
         CUDA_DRIVER_CHECK(cuMemSetAccess((CUdeviceptr)*ptr, size, &access_desc, 1));
     } else {
-        CUDA_RUNTIME_CHECK(cudaIpcOpenMemHandle(ptr, mem_handle->inner.cuda_ipc_mem_handle, cudaIpcMemLazyEnablePeerAccess));
+        CUDA_RUNTIME_CHECK(
+            cudaIpcOpenMemHandle(ptr, mem_handle->inner.cuda_ipc_mem_handle, cudaIpcMemLazyEnablePeerAccess));
     }
 }
 
@@ -147,7 +151,8 @@ bool IpcManager::is_accessible(MemHandle* mem_handle) {
     bool accessible = false;
     if (support_fabric_) {
         CUmemGenericAllocationHandle handle;
-        auto ret = cuMemImportFromShareableHandle(&handle, &mem_handle->inner.cu_mem_fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC);
+        auto ret =
+            cuMemImportFromShareableHandle(&handle, &mem_handle->inner.cu_mem_fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC);
         accessible = ret == CUDA_SUCCESS;
         if (accessible) {
             cuMemRelease(handle);
@@ -175,7 +180,8 @@ int IpcManager::detect_accessible_ranks(pybind11::object process_group) {
     // Put the test memory handle on a CUDA tensor
     auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
     torch::Tensor test_tensor = torch::empty({static_cast<long>(sizeof(MemHandle))}, opts);
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(test_tensor.data_ptr(), &test_mem_handle_, sizeof(MemHandle), cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemcpyAsync(test_tensor.data_ptr(), &test_mem_handle_, sizeof(MemHandle), cudaMemcpyHostToDevice, stream));
 
     // All gather the test memory
     py::list test_handle_list;
@@ -190,7 +196,8 @@ int IpcManager::detect_accessible_ranks(pybind11::object process_group) {
         if (i != current_rank) {
             MemHandle test_handle;
             torch::Tensor gathered = test_handle_list[i].cast<torch::Tensor>();
-            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(&test_handle, gathered.data_ptr(), sizeof(MemHandle), cudaMemcpyDeviceToHost, stream));
+            CUDA_RUNTIME_CHECK(
+                cudaMemcpyAsync(&test_handle, gathered.data_ptr(), sizeof(MemHandle), cudaMemcpyDeviceToHost, stream));
             CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
             if (is_accessible(&test_handle)) {
                 num_accessible_ranks++;

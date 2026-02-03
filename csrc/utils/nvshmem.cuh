@@ -9,7 +9,7 @@
 #include <optional>
 #include <vector>
 
-#include "exception.hpp"
+#include "exception.cuh"
 
 namespace ultra_ep::nvshmem {
 
@@ -55,7 +55,10 @@ inline void barrier(const bool with_cpu_sync = false, const std::optional<cudaSt
         CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
 }
 
-inline int init(const std::vector<uint8_t>& root_unique_id_val, const int& rank, const int& num_ranks, const int& team_split_stride) {
+inline int init(const std::vector<uint8_t>& root_unique_id_val,
+                const int& rank,
+                const int& num_ranks,
+                const int& team_split_stride) {
     nvshmemx_uniqueid_t root_unique_id;
     nvshmemx_init_attr_t attr;
     std::memcpy(&root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
