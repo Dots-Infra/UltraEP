@@ -32,6 +32,12 @@ inline void free(void* ptr) {
     nvshmem_free(ptr);
 }
 
+// Get pointer to symmetric memory on a remote PE
+// Returns nullptr if the remote PE is not in the same NVL domain (e.g., RDMA)
+inline void* ptr(void* local_ptr, int pe) {
+    return nvshmem_ptr(local_ptr, pe);
+}
+
 inline void barrier(const bool with_cpu_sync = false, const std::optional<cudaStream_t>& stream_opt = std::nullopt) {
     // Wait all streams to finish on this GPU
     if (with_cpu_sync)

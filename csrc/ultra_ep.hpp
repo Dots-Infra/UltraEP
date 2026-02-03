@@ -6,7 +6,7 @@
 #include "config.hpp"
 #include "kernels/api.cuh"
 #include "runtime.hpp"
-#include "utils/mem_alloc.hpp"
+#include "utils/exception.hpp"
 #include "utils/nvshmem.hpp"
 #include "utils/utils.hpp"
 
@@ -60,7 +60,7 @@ class Manager {
     // Placement (on CPU)
     GlobalExpertPlacement placement;
 
-    // After IPC/NVSHMEM synchronization, this flag will be true
+    // After NVSHMEM synchronization, this flag will be true
     bool _available = false;
 
     // Destructor settings
@@ -71,21 +71,17 @@ class Manager {
     at::cuda::CUDAStream comm_stream;
 
     // Device-side local replica weight (bf16)/grad (fp32) buffers, shared by layers
+    // Allocated via NVSHMEM symmetric heap for cross-GPU access
     // Shape (before flattened): [num_local_redundant_experts, expert_total_numel]
     void* local_replica_weight_buffer = nullptr;
     void* local_replica_grad_buffer = nullptr;
     torch::Tensor local_replica_weight_buffer_tensor;
     torch::Tensor local_replica_grad_buffer_tensor;
 
-    // Host-side remote memory pointers with cudaIPC access of replica buffers of NVL ranks
+    // Host-side remote memory pointers obtained via nvshmem_ptr() for NVL ranks
     // Shape: [num_nvl_ranks,]
     void* global_replica_weight_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
     void* global_replica_grad_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
-
-    // Host-side IPC manager for intra-NVL domain communication
-    ipc::RemoteMemAllocator mem_allocator;
-    ipc::MemHandle weight_ipc_handles[MAX_NVL_DOMAIN_SIZE];
-    ipc::MemHandle grad_ipc_handles[MAX_NVL_DOMAIN_SIZE];
 
     // Intermediate buffers for grad reduce tasks
     kernels::GradReduceTask* _grad_reduce_tasks_cpu = nullptr;
@@ -109,10 +105,6 @@ public:
     // - local_master_fc2_grad_ptr_tensor: [num_local_master_experts]
     void grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor, torch::Tensor local_master_fc2_grad_ptr_tensor);
 
-    pybind11::bytes get_local_weight_ipc_handle() const;
-    pybind11::bytes get_local_grad_ipc_handle() const;
-    void sync_global_ipc_handles(const std::vector<std::optional<pybind11::bytes>>& all_gathered_weight_handles,
-                                 const std::vector<std::optional<pybind11::bytes>>& all_gathered_grad_handles);
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
     torch::Tensor get_local_replica_grad_buffer_tensor() const { return local_replica_grad_buffer_tensor; }
     torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
@@ -126,9 +118,6 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("grad_reduce", &Manager::grad_reduce)
-        .def("get_local_weight_ipc_handle", &Manager::get_local_weight_ipc_handle)
-        .def("get_local_grad_ipc_handle", &Manager::get_local_grad_ipc_handle)
-        .def("sync_global_ipc_handles", &Manager::sync_global_ipc_handles)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
         .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)
         .def("get_physical_to_logical_map_tensor", &Manager::get_physical_to_logical_map_tensor)

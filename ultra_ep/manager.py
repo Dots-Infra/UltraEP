@@ -1,10 +1,9 @@
-import os
 import torch
 import torch.distributed as dist
-from typing import Any, List, Optional, Dict
+from typing import List
 
 import ultra_ep._C as _C
-from .runtime import init_runtime, sync_ipc_handles
+from .runtime import init_runtime
 
 MAX_MODEL_LAYERS = 200
 
@@ -56,7 +55,6 @@ class Manager:
             expert_fc2_numel,
             explicitly_destroy,
         )
-        sync_ipc_handles(self.runtime)
         assert self.runtime.is_available()
 
         # Placement on CPU

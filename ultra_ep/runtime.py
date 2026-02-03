@@ -29,9 +29,11 @@ def init_runtime(group: dist.ProcessGroup):
     root_unique_id = nvshmem_unique_ids[0]
 
     # Support both MNNVL and RDMA by setting MAX_NVL_PEERS
-    allocator = _C.RemoteMemAllocator()
-    print_rank_0(f"[INFO] Use MNNVL fabric: {allocator.is_fabric_supported()}")
-    detected_ranks = allocator.detect_accessible_ranks(group)
+    _ipc_manager = _C.IpcManager()
+    print_rank_0(f"[INFO] Use MNNVL fabric: {_ipc_manager.is_fabric_supported()}")
+    detected_ranks = _ipc_manager.detect_accessible_ranks(group)
+    del _ipc_manager
+
     max_nvl_peers = os.getenv("MAX_NUM_NVL_PEERS")
     if max_nvl_peers is not None:
         max_nvl_peers = int(max_nvl_peers)
@@ -45,32 +47,10 @@ def init_runtime(group: dist.ProcessGroup):
             f"[WARN] MAX_NUM_NVL_PEERS is not set. Using detected value {detected_ranks}."
         )
 
-    # Initialize CPP runtime
+    # Initialize CPP runtime with NVSHMEM
     _C.init_runtime(group.rank(), group.size(), max_nvl_peers, root_unique_id)
 
     # Remember the EP group, which can not be changed anymore
     _group = group
 
     return max_nvl_peers
-
-
-def sync_ipc_handles(runtime):
-    global _group
-    assert (
-        _C.is_runtime_initialized()
-    ), "Runtime must be initialized before syncing IPC handles"
-    assert _group is not None
-
-    # Synchronize IPC handles
-    all_gathered_weight_handles = [None] * _group.size()
-    all_gathered_grad_handles = [None] * _group.size()
-    dist.all_gather_object(
-        all_gathered_weight_handles, runtime.get_local_weight_ipc_handle(), _group
-    )
-    dist.all_gather_object(
-        all_gathered_grad_handles, runtime.get_local_grad_ipc_handle(), _group
-    )
-
-    runtime.sync_global_ipc_handles(
-        all_gathered_weight_handles, all_gathered_grad_handles
-    )

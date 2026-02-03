@@ -3,7 +3,7 @@
 
 #include "runtime.hpp"
 #include "ultra_ep.hpp"
-#include "utils/mem_alloc.hpp"
+#include "utils/ipc_manager.cuh"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C

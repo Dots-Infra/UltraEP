@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
+// Deprecated for remote memory management
+// Use NVSHMEM symmetric heap instead
 
 #pragma once
 
@@ -29,19 +29,14 @@ struct MemHandle {
 
 constexpr size_t HANDLE_SIZE = sizeof(MemHandle);
 
-// Remote memory allocator, allocate memory which can be accessed by remote devices.
-class RemoteMemAllocator {
+class IpcManager {
 public:
-    RemoteMemAllocator();
-    ~RemoteMemAllocator();
+    IpcManager();
+    ~IpcManager();
 
     void malloc(void** ptr, size_t size_raw);
 
     void free(void* ptr);
-
-    void malloc_pinned(void** ptr, size_t size_raw);
-
-    void free_pinned(void* ptr);
 
     void get_handle(MemHandle* mem_handle, void* ptr);
 
@@ -77,10 +72,10 @@ private:
 };
 
 static void register_apis(pybind11::module_& m) {
-    pybind11::class_<RemoteMemAllocator>(m, "RemoteMemAllocator")
+    pybind11::class_<IpcManager>(m, "IpcManager")
         .def(pybind11::init<>())
-        .def("detect_accessible_ranks", &RemoteMemAllocator::detect_accessible_ranks, py::arg("process_group"))
-        .def("is_fabric_supported", &RemoteMemAllocator::is_fabric_supported);
+        .def("detect_accessible_ranks", &IpcManager::detect_accessible_ranks, py::arg("process_group"))
+        .def("is_fabric_supported", &IpcManager::is_fabric_supported);
 }
 
 }  // namespace ultra_ep::ipc

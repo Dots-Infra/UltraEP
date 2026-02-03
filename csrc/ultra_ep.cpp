@@ -19,8 +19,7 @@ Manager::Manager(const int& num_local_master_experts,
       expert_fc2_numel(expert_fc2_numel),
       expert_total_numel(expert_fc1_numel + expert_fc2_numel),
       explicitly_destroy(explicitly_destroy),
-      comm_stream(at::cuda::getStreamFromPool(true)),
-      mem_allocator()
+      comm_stream(at::cuda::getStreamFromPool(true))
 
 {
     // Common checks
@@ -41,16 +40,16 @@ Manager::Manager(const int& num_local_master_experts,
     placement.l2p_ptr = placement.logical_to_physical_map.data<int32_t>();
     placement.lcnts_ptr = placement.logical_replica_counts.data<int32_t>();
 
-    // Allocate local replica weight and grad buffers, and ptr buffers on GPU
-    // then set local IPC handles
+    // Allocate local replica weight and grad buffers via NVSHMEM symmetric heap
+    // This enables automatic cross-GPU access within NVL domain
     int64_t local_replica_weight_bytes = (int64_t)num_local_redundant_experts * expert_total_numel * WEIGHT_ELEMENT_SIZE;
     int64_t local_replica_grad_bytes = (int64_t)num_local_redundant_experts * expert_total_numel * GRAD_ELEMENT_SIZE;
-    int64_t global_replica_buffer_ptrs_bytes = (int64_t)runtime::num_nvl_ranks * num_local_redundant_experts * sizeof(void*);
 
-    mem_allocator.malloc(&local_replica_weight_buffer, local_replica_weight_bytes);
-    mem_allocator.malloc(&local_replica_grad_buffer, local_replica_grad_bytes);
-    mem_allocator.get_handle(&weight_ipc_handles[runtime::nvl_rank_idx], local_replica_weight_buffer);
-    mem_allocator.get_handle(&grad_ipc_handles[runtime::nvl_rank_idx], local_replica_grad_buffer);
+    // Allocate via NVSHMEM for symmetric heap (accessible from all PEs)
+    local_replica_weight_buffer = nvshmem::alloc(local_replica_weight_bytes, NVSHMEM_ALIGNMENT);
+    local_replica_grad_buffer = nvshmem::alloc(local_replica_grad_bytes, NVSHMEM_ALIGNMENT);
+    EP_HOST_ASSERT(local_replica_weight_buffer != nullptr && "Failed to allocate NVSHMEM weight buffer");
+    EP_HOST_ASSERT(local_replica_grad_buffer != nullptr && "Failed to allocate NVSHMEM grad buffer");
 
     // Initialize local replica weight and grad buffer tensors
     local_replica_weight_buffer_tensor = make_tensor_from_buffer(local_replica_weight_buffer,
@@ -61,9 +60,32 @@ Manager::Manager(const int& num_local_master_experts,
                                                                {num_local_redundant_experts, expert_total_numel},
                                                                torch::kFloat32,
                                                                torch::Device(torch::kCUDA, device_id));
-    mem_allocator.malloc_pinned((void**)&_grad_reduce_tasks_cpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask));
-    mem_allocator.malloc((void**)&_grad_reduce_tasks_gpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask));
-    mem_allocator.malloc((void**)&_global_task_counter_gpu, sizeof(int));
+
+    // Synchronize all PEs to ensure buffers are allocated on all ranks
+    nvshmem::barrier(true);
+
+    // Obtain remote pointers via nvshmem_ptr() for all NVL ranks
+    // nvshmem_ptr() returns a pointer that can be used to directly access
+    // the symmetric memory on the specified PE from the local PE
+    int num_nvl_ranks = runtime::num_nvl_ranks;
+    int rdma_rank_idx = runtime::rdma_rank_idx;
+    for (int i = 0; i < num_nvl_ranks; ++i) {
+        int target_rank = rdma_rank_idx * num_nvl_ranks + i;
+        global_replica_weight_buffer_ptrs[i] = nvshmem::ptr(local_replica_weight_buffer, target_rank);
+        global_replica_grad_buffer_ptrs[i] = nvshmem::ptr(local_replica_grad_buffer, target_rank);
+        EP_HOST_ASSERT(global_replica_weight_buffer_ptrs[i] != nullptr &&
+                       "nvshmem_ptr failed for weight buffer - target PE may not be in same NVL domain");
+        EP_HOST_ASSERT(global_replica_grad_buffer_ptrs[i] != nullptr &&
+                       "nvshmem_ptr failed for grad buffer - target PE may not be in same NVL domain");
+    }
+
+    // Allocate intermediate buffers for grad reduce tasks (regular CUDA memory)
+    CUDA_RUNTIME_CHECK(cudaMallocHost((void**)&_grad_reduce_tasks_cpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_grad_reduce_tasks_gpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_global_task_counter_gpu, sizeof(int)));
+
+    // Ready to use (no IPC handle exchange needed with NVSHMEM)
+    _available = true;
 }
 
 Manager::~Manager() noexcept(false) {
@@ -77,69 +99,34 @@ Manager::~Manager() noexcept(false) {
     }
 }
 
-pybind11::bytes Manager::get_local_weight_ipc_handle() const {
-    const ipc::MemHandle& handle = weight_ipc_handles[runtime::nvl_rank_idx];
-    return pybind11::bytes(reinterpret_cast<const char*>(&handle), sizeof(handle));
-}
-
-pybind11::bytes Manager::get_local_grad_ipc_handle() const {
-    const ipc::MemHandle& handle = grad_ipc_handles[runtime::nvl_rank_idx];
-    return pybind11::bytes(reinterpret_cast<const char*>(&handle), sizeof(handle));
-}
-
-void Manager::sync_global_ipc_handles(const std::vector<std::optional<pybind11::bytes>>& all_gathered_weight_handles,
-                                      const std::vector<std::optional<pybind11::bytes>>& all_gathered_grad_handles) {
-    EP_HOST_ASSERT(not is_available());
-
-    // Sync IPC handles
-    int rdma_rank_idx = runtime::rdma_rank_idx;
-    int num_nvl_ranks = runtime::num_nvl_ranks;
-    int rank_idx = runtime::rank_idx;
-    for (int i = 0, offset = rdma_rank_idx * num_nvl_ranks; i < num_nvl_ranks; ++i) {
-        EP_HOST_ASSERT(all_gathered_weight_handles[offset + i].has_value());
-        EP_HOST_ASSERT(all_gathered_grad_handles[offset + i].has_value());
-        std::string weight_handle_str = all_gathered_weight_handles[offset + i].value();
-        std::string grad_handle_str = all_gathered_grad_handles[offset + i].value();
-        EP_HOST_ASSERT(weight_handle_str.size() == ipc::HANDLE_SIZE);
-        EP_HOST_ASSERT(grad_handle_str.size() == ipc::HANDLE_SIZE);
-        if (offset + i != rank_idx) {
-            std::memcpy(&weight_ipc_handles[i], weight_handle_str.data(), ipc::HANDLE_SIZE);
-            mem_allocator.open_handle(&global_replica_weight_buffer_ptrs[i], &weight_ipc_handles[i]);
-            std::memcpy(&grad_ipc_handles[i], grad_handle_str.data(), ipc::HANDLE_SIZE);
-            mem_allocator.open_handle(&global_replica_grad_buffer_ptrs[i], &grad_ipc_handles[i]);
-        } else {
-            EP_HOST_ASSERT(std::memcmp(&weight_ipc_handles[i], weight_handle_str.data(), ipc::HANDLE_SIZE) == 0);
-            EP_HOST_ASSERT(std::memcmp(&grad_ipc_handles[i], grad_handle_str.data(), ipc::HANDLE_SIZE) == 0);
-        }
-    }
-
-    nvshmem::barrier(true);
-    // Ready to use
-    _available = true;
-}
-
 void Manager::destroy() {
     EP_HOST_ASSERT(is_available());
 
-    // Synchronize
+    // Synchronize all PEs before cleanup
     nvshmem::barrier(true);
 
-    // Close remote IPC
+    // Free NVSHMEM symmetric heap buffers
+    // No need to close remote handles - nvshmem_ptr pointers are automatically invalidated
+    nvshmem::free(local_replica_weight_buffer);
+    nvshmem::free(local_replica_grad_buffer);
+    local_replica_weight_buffer = nullptr;
+    local_replica_grad_buffer = nullptr;
+
+    // Clear remote pointers
     for (int i = 0; i < runtime::num_nvl_ranks; ++i) {
-        if (i != runtime::nvl_rank_idx) {
-            mem_allocator.close_handle(global_replica_weight_buffer_ptrs[i]);
-            mem_allocator.close_handle(global_replica_grad_buffer_ptrs[i]);
-        }
+        global_replica_weight_buffer_ptrs[i] = nullptr;
+        global_replica_grad_buffer_ptrs[i] = nullptr;
     }
 
-    // Free local buffer and error flag
-    mem_allocator.free(local_replica_weight_buffer);
-    mem_allocator.free(local_replica_grad_buffer);
-    mem_allocator.free_pinned(_grad_reduce_tasks_cpu);
-    mem_allocator.free(_grad_reduce_tasks_gpu);
-    mem_allocator.free(_global_task_counter_gpu);
+    // Free intermediate CUDA buffers
+    CUDA_RUNTIME_CHECK(cudaFreeHost(_grad_reduce_tasks_cpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_grad_reduce_tasks_gpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_global_task_counter_gpu));
+    _grad_reduce_tasks_cpu = nullptr;
+    _grad_reduce_tasks_gpu = nullptr;
+    _global_task_counter_gpu = nullptr;
 
-    // Free NVSHMEM
+    // Free NVSHMEM runtime
     runtime::destroy();
 
     // Ready to destroy

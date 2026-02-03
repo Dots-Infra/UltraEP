@@ -6,6 +6,9 @@
 // Equal to max #experts per layer of a model
 #define MAX_GRAD_REDUCE_TASK_NUM 256
 
+// NVSHMEM alignment for symmetric heap
+#define NVSHMEM_ALIGNMENT 16
+
 // Suppose BF16 weight data
 #define WEIGHT_ELEMENT_SIZE 2
 // Suppose FP32 grad data

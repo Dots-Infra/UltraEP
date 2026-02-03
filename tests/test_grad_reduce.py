@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--warmup-iters", type=int, default=5)
     parser.add_argument("--bench-iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=33)
+    parser.add_argument("--correct-tolerance", type=float, default=1e-5)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -147,12 +148,12 @@ def main():
             assert torch.allclose(
                 fc1_grads[i],
                 global_logical_expert_fc1_grad_buffer[global_log_idx, :],
-                atol=1e-5,
+                atol=args.correct_tolerance,
             ), f"FC1 grad mismatch for logical expert {global_log_idx} on rank {rank}"
             assert torch.allclose(
                 fc2_grads[i],
                 global_logical_expert_fc2_grad_buffer[global_log_idx, :],
-                atol=1e-5,
+                atol=args.correct_tolerance,
             ), f"FC2 grad mismatch for logical expert {global_log_idx} on rank {rank}"
         dist.barrier()
         print_rank_0("*** Correctness verification passed! ***")

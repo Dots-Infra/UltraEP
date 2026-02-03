@@ -1,7 +1,4 @@
-// SPDX-License-Identifier: MIT
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-#include "mem_alloc.hpp"
+#include "ipc_manager.cuh"
 
 namespace ultra_ep::ipc {
 
@@ -13,7 +10,7 @@ size_t inline get_size_align_to_granularity(size_t size_raw, size_t granularity)
     return size;
 }
 
-RemoteMemAllocator::RemoteMemAllocator() {
+IpcManager::IpcManager() {
     this->support_fabric_ = support_fabric();
     if (gethostname(hostname_, sizeof(hostname_)) != 0) {
         perror("gethostname");
@@ -55,13 +52,13 @@ RemoteMemAllocator::RemoteMemAllocator() {
     this->get_handle(&test_mem_handle_, test_memory_);
 }
 
-RemoteMemAllocator::~RemoteMemAllocator() {
+IpcManager::~IpcManager() {
     this->free((void*)test_memory_);
     test_memory_ = nullptr;
 }
 
 // Check if the current device supports fabric.
-bool RemoteMemAllocator::support_fabric() {
+bool IpcManager::support_fabric() {
     int device_count;
     CUDA_RUNTIME_CHECK(cudaGetDeviceCount(&device_count));
 
@@ -75,7 +72,7 @@ bool RemoteMemAllocator::support_fabric() {
     return true;
 }
 
-void RemoteMemAllocator::malloc(void** ptr, size_t size_raw) {
+void IpcManager::malloc(void** ptr, size_t size_raw) {
     if (support_fabric_) {
         size_t size = get_size_align_to_granularity(size_raw, fabric_granularity_);
         CUmemGenericAllocationHandle handle;
@@ -88,7 +85,7 @@ void RemoteMemAllocator::malloc(void** ptr, size_t size_raw) {
     }
 }
 
-void RemoteMemAllocator::free(void* ptr) {
+void IpcManager::free(void* ptr) {
     if (ptr == nullptr) {
         return;
     }
@@ -105,15 +102,7 @@ void RemoteMemAllocator::free(void* ptr) {
     }
 }
 
-void RemoteMemAllocator::malloc_pinned(void** ptr, size_t size_raw) {
-    CUDA_RUNTIME_CHECK(cudaMallocHost(ptr, size_raw));
-}
-
-void RemoteMemAllocator::free_pinned(void* ptr) {
-    CUDA_RUNTIME_CHECK(cudaFreeHost(ptr));
-}
-
-void RemoteMemAllocator::get_handle(MemHandle* mem_handle, void* ptr) {
+void IpcManager::get_handle(MemHandle* mem_handle, void* ptr) {
     size_t size = 0;
     CUDA_DRIVER_CHECK(cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr));
 
@@ -130,7 +119,7 @@ void RemoteMemAllocator::get_handle(MemHandle* mem_handle, void* ptr) {
     strncpy(mem_handle->src_hostname, hostname_, sizeof(mem_handle->src_hostname));
 }
 
-void RemoteMemAllocator::open_handle(void** ptr, MemHandle* mem_handle) {
+void IpcManager::open_handle(void** ptr, MemHandle* mem_handle) {
     if (support_fabric_) {
         size_t size = mem_handle->size;
         CUmemGenericAllocationHandle handle;
@@ -143,7 +132,7 @@ void RemoteMemAllocator::open_handle(void** ptr, MemHandle* mem_handle) {
     }
 }
 
-void RemoteMemAllocator::close_handle(void* ptr) {
+void IpcManager::close_handle(void* ptr) {
     if (support_fabric_) {
         size_t size = 0;
         CUDA_DRIVER_CHECK(cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr));
@@ -154,7 +143,7 @@ void RemoteMemAllocator::close_handle(void* ptr) {
     }
 }
 
-bool RemoteMemAllocator::is_accessible(MemHandle* mem_handle) {
+bool IpcManager::is_accessible(MemHandle* mem_handle) {
     bool accessible = false;
     if (support_fabric_) {
         CUmemGenericAllocationHandle handle;
@@ -177,7 +166,7 @@ bool RemoteMemAllocator::is_accessible(MemHandle* mem_handle) {
     return accessible;
 }
 
-int RemoteMemAllocator::detect_accessible_ranks(pybind11::object process_group) {
+int IpcManager::detect_accessible_ranks(pybind11::object process_group) {
     auto torch_distributed = py::module_::import("torch.distributed");
     int world_size = process_group.attr("size")().cast<int>();
     int current_rank = process_group.attr("rank")().cast<int>();
