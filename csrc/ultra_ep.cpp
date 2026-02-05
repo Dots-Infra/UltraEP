@@ -1,5 +1,7 @@
 #include "ultra_ep.hpp"
 
+#include <cuda_bf16.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -94,6 +96,13 @@ Manager::Manager(const int& num_local_master_experts,
     // +1 for the final offset (total tile count)
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_tile_offsets_gpu, (MAX_GRAD_REDUCE_TASK_NUM + 1) * sizeof(int)));
 
+    // Allocate intermediate buffers for weight sync tasks
+    // For weight sync, each local master expert creates one broadcast task
+    CUDA_RUNTIME_CHECK(
+        cudaMallocHost((void**)&_weight_sync_tasks_cpu, MAX_WEIGHT_SYNC_TASK_NUM * sizeof(kernels::WeightSyncTask)));
+    CUDA_RUNTIME_CHECK(
+        cudaMalloc((void**)&_weight_sync_tasks_gpu, MAX_WEIGHT_SYNC_TASK_NUM * sizeof(kernels::WeightSyncTask)));
+
     // Ready to use (no IPC handle exchange needed with NVSHMEM)
     _available = true;
 }
@@ -138,6 +147,12 @@ void Manager::destroy() {
     _global_task_or_tile_counter_gpu = nullptr;
     _task_tile_offsets_gpu = nullptr;
 
+    // Free weight sync buffers
+    CUDA_RUNTIME_CHECK(cudaFreeHost(_weight_sync_tasks_cpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_weight_sync_tasks_gpu));
+    _weight_sync_tasks_cpu = nullptr;
+    _weight_sync_tasks_gpu = nullptr;
+
     // Free NVSHMEM runtime
     runtime::destroy();
 
@@ -145,8 +160,8 @@ void Manager::destroy() {
     _available = false;
 }
 
-std::optional<EventHandle> Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
-                                                torch::Tensor local_master_fc2_grad_ptr_tensor,
+std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_grad_ptr_tensor,
+                                                torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                                 std::string& mode,
                                                 std::optional<EventHandle>& previous_event,
                                                 bool async) {
@@ -223,6 +238,105 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor local_master_fc1_g
     if (async) {
         event = EventHandle(comm_stream);
         for (auto& t : {local_master_fc1_grad_ptr_tensor, local_master_fc2_grad_ptr_tensor}) {
+            t.record_stream(comm_stream);
+        }
+    } else {
+        stream_wait(compute_stream, comm_stream);
+    }
+
+    return event;
+}
+
+std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_weight_ptr_tensor,
+                                                torch::Tensor& local_master_fc2_weight_ptr_tensor,
+                                                std::optional<EventHandle>& previous_event,
+                                                bool async) {
+    EP_HOST_ASSERT(is_available());
+
+    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    // Wait for previous event to be finished
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
+    }
+
+    void** local_master_fc1_weight_ptrs = reinterpret_cast<void**>(local_master_fc1_weight_ptr_tensor.data<int64_t>());
+    void** local_master_fc2_weight_ptrs = reinterpret_cast<void**>(local_master_fc2_weight_ptr_tensor.data<int64_t>());
+
+    // Build broadcast tasks: each local master broadcasts to all its replicas
+    // Each master creates two tasks: one for FC1, one for FC2
+    int num_tasks = 0;
+    for (int i = 0; i < num_local_master_experts; ++i) {
+        int master_global_phy_idx = runtime::rank_idx * num_local_physical_experts + i;
+        int master_global_log_idx = placement.p2l_ptr[master_global_phy_idx];
+        int num_replicas = placement.lcnts_ptr[master_global_log_idx] - 1;  // Exclude master itself
+
+        if (num_replicas == 0) {
+            continue;  // No replicas to sync to
+        }
+
+        __nv_bfloat16* local_master_fc1_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc1_weight_ptrs[i]);
+        __nv_bfloat16* local_master_fc2_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc2_weight_ptrs[i]);
+
+        // Create FC1 task
+        kernels::WeightSyncTask& fc1_task = _weight_sync_tasks_cpu[num_tasks];
+        fc1_task.master_local_addr = local_master_fc1_weight_ptr;
+        fc1_task.num_replicas = num_replicas;
+        fc1_task.numel = static_cast<size_t>(expert_fc1_numel);
+
+        // Create FC2 task
+        kernels::WeightSyncTask& fc2_task = _weight_sync_tasks_cpu[num_tasks + 1];
+        fc2_task.master_local_addr = local_master_fc2_weight_ptr;
+        fc2_task.num_replicas = num_replicas;
+        fc2_task.numel = static_cast<size_t>(expert_fc2_numel);
+
+        // Fill replica addresses for both tasks
+        for (int j = 0; j < num_replicas; ++j) {
+            // j+1 because index 0 is the master itself in logical_to_physical_map
+            int replica_global_phy_idx = placement.l2p_ptr[master_global_log_idx * runtime::num_ranks + j + 1];
+            int replica_global_rank_idx = replica_global_phy_idx / num_local_physical_experts;
+            EP_HOST_ASSERT(is_in_same_nvl_domain(runtime::rank_idx, replica_global_rank_idx, runtime::num_nvl_ranks) &&
+                           "Replica rank is not in the same NVL domain as the master rank");
+            int replica_nvl_rank_idx = replica_global_rank_idx % runtime::num_nvl_ranks;
+            EP_HOST_ASSERT(replica_nvl_rank_idx != runtime::nvl_rank_idx &&
+                           "Replica rank is the same as the master rank, which is not allowed");
+            EP_HOST_ASSERT(global_replica_weight_buffer_ptrs[replica_nvl_rank_idx] != nullptr);
+
+            int replica_local_offset = replica_global_phy_idx % num_local_physical_experts - num_local_master_experts;
+            EP_HOST_ASSERT(replica_local_offset >= 0 && replica_local_offset < num_local_redundant_experts);
+
+            __nv_bfloat16* replica_remote_weight_buffer_ptr =
+                reinterpret_cast<__nv_bfloat16*>(global_replica_weight_buffer_ptrs[replica_nvl_rank_idx]);
+            __nv_bfloat16* replica_remote_fc1_weight_ptr =
+                replica_remote_weight_buffer_ptr + replica_local_offset * expert_total_numel;
+            __nv_bfloat16* replica_remote_fc2_weight_ptr = replica_remote_fc1_weight_ptr + expert_fc1_numel;
+
+            fc1_task.replica_remote_addrs[j] = replica_remote_fc1_weight_ptr;
+            fc2_task.replica_remote_addrs[j] = replica_remote_fc2_weight_ptr;
+        }
+
+        num_tasks += 2;
+    }
+
+    if (num_tasks == 0) {
+        return std::nullopt;
+    }
+
+    // Call device-side kernel
+    kernels::run_weight_sync(_weight_sync_tasks_cpu,
+                             _weight_sync_tasks_gpu,
+                             _global_task_or_tile_counter_gpu,
+                             _task_tile_offsets_gpu,
+                             num_tasks,
+                             comm_stream,
+                             runtime::num_device_sms);
+
+    // Wait streams
+    std::optional<EventHandle> event;
+    if (async) {
+        event = EventHandle(comm_stream);
+        for (auto& t : {local_master_fc1_weight_ptr_tensor, local_master_fc2_weight_ptr_tensor}) {
             t.record_stream(comm_stream);
         }
     } else {

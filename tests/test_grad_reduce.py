@@ -197,8 +197,28 @@ def main():
                 kernel_names=kernel_names,
                 barrier_comm_profiling=True,
             )
+            kernel_dur_second_this_rank = kernel_durations[0]
+            kernel_dur_ms_this_rank = kernel_dur_second_this_rank * 1000
+
+            bytes_recv_this_rank = 0
+            for i in range(args.num_local_master_experts):
+                global_phys_idx = rank * manager.num_local_physical_experts + i
+                global_log_idx = manager.physical_to_logical_map[global_phys_idx].item()
+                num_replicas = manager.logical_replica_counts[global_log_idx].item() - 1
+                bytes_recv_this_rank += (
+                    num_replicas
+                    * expert_total_numel
+                    * replica_grad_buffer_ref.element_size()
+                )
+            data_recv_GB_this_rank = bytes_recv_this_rank / (1024**3)
+            bandwidth_GBps_this_rank = (
+                data_recv_GB_this_rank / kernel_dur_second_this_rank
+                if kernel_dur_second_this_rank > 1e-6
+                else 0
+            )
+
             print(
-                f"{"Rank " + str(rank) + " kernel duration":<{26}}: {kernel_durations[0] * 1000:.3f} ms",
+                f"[Rank {rank}] kernel duration: {kernel_dur_ms_this_rank:.3f} ms, data recv: {data_recv_GB_this_rank:.3f} GB, bandwidth: {bandwidth_GBps_this_rank:.2f} GB/s",
                 flush=True,
             )
             dist.barrier()

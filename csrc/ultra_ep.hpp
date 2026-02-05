@@ -93,6 +93,11 @@ class Manager {
     int* _global_task_or_tile_counter_gpu = nullptr;
     int* _task_tile_offsets_gpu = nullptr;
 
+    // Intermediate buffers for weight sync tasks
+    kernels::WeightSyncTask* _weight_sync_tasks_cpu = nullptr;
+    kernels::WeightSyncTask* _weight_sync_tasks_gpu = nullptr;
+    // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
+
 public:
     Manager(const int& num_local_master_experts,
             const int& num_local_redundant_experts,
@@ -108,9 +113,17 @@ public:
     // Parameters (ptr tensor of local master grad buffers, for the current layer):
     // - local_master_fc1_grad_ptr_tensor: [num_local_master_experts]
     // - local_master_fc2_grad_ptr_tensor: [num_local_master_experts]
-    std::optional<EventHandle> grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
-                                           torch::Tensor local_master_fc2_grad_ptr_tensor,
+    std::optional<EventHandle> grad_reduce(torch::Tensor& local_master_fc1_grad_ptr_tensor,
+                                           torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                            std::string& mode,
+                                           std::optional<EventHandle>& previous_event,
+                                           bool async);
+    // Sync replica weights with masters
+    // Parameters (ptr tensor of local master weight buffers, for the current layer):
+    // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
+    // - local_master_fc2_weight_ptr_tensor: [num_local_master_experts]
+    std::optional<EventHandle> weight_sync(torch::Tensor& local_master_fc1_weight_ptr_tensor,
+                                           torch::Tensor& local_master_fc2_weight_ptr_tensor,
                                            std::optional<EventHandle>& previous_event,
                                            bool async);
 
@@ -129,6 +142,7 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("grad_reduce", &Manager::grad_reduce)
+        .def("weight_sync", &Manager::weight_sync)
         .def("get_comm_stream", &Manager::get_comm_stream)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
         .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)

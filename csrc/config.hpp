@@ -5,6 +5,7 @@
 
 // Equal to max #experts per layer of a model
 #define MAX_GRAD_REDUCE_TASK_NUM 256
+#define MAX_WEIGHT_SYNC_TASK_NUM 256
 
 // NVSHMEM alignment for symmetric heap
 #define NVSHMEM_ALIGNMENT 16

@@ -237,6 +237,8 @@ def bench(
     times = np.array(
         [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
     )[1:]
+    # remove max and min from times
+    times = times[np.argsort(times)][1:-1]
     return np.average(times), np.min(times), np.max(times)
 
 

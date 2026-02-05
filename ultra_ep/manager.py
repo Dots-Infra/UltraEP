@@ -100,6 +100,17 @@ class Manager:
         assert len(fc1_grads) == self.num_local_master_experts
         assert len(fc2_grads) == self.num_local_master_experts
 
+        def check_tensors_dtype(tensors: List[torch.Tensor], dtype: torch.dtype):
+            for t in tensors:
+                assert (
+                    t.dtype == dtype
+                ), f"Expected weight/grad dtype {dtype}, got {t.dtype}"
+
+        check_tensors_dtype(fc1_weights, torch.bfloat16)
+        check_tensors_dtype(fc2_weights, torch.bfloat16)
+        check_tensors_dtype(fc1_grads, torch.float32)
+        check_tensors_dtype(fc2_grads, torch.float32)
+
         def _to_dataptr_tensor(tensors: List[torch.Tensor]) -> torch.Tensor:
             return torch.tensor(
                 [t.data_ptr() for t in tensors], dtype=torch.int64, device="cpu"
@@ -126,6 +137,41 @@ class Manager:
             self.local_master_fc1_grad_pool[layer_id],
             self.local_master_fc2_grad_pool[layer_id],
             mode,
+            getattr(previous_event, "event", None),
+            async_finish,
+        )
+        return EventOverlap(event)
+
+    def weight_sync(
+        self,
+        layer_id: int,
+        previous_event: Optional[EventOverlap] = None,
+        async_finish: bool = False,
+    ):
+        """
+        Synchronize master weights to replicas.
+
+        Each local master broadcasts its weight to all corresponding remote replicas.
+        This is optimized for hot masters with multiple replicas - the weight is loaded
+        to shared memory once and then TMA stored to all replica destinations.
+
+        Args:
+            layer_id: Layer index for which to sync weights
+            previous_event: Optional event to wait for before starting
+            async_finish: If True, return immediately with an event handle
+                         If False, wait for completion before returning
+
+        Returns:
+            EventOverlap handle if async_finish=True, else None
+        """
+        assert layer_id < MAX_MODEL_LAYERS
+        assert (
+            self.local_master_fc1_weight_pool[layer_id] is not None
+            and self.local_master_fc2_weight_pool[layer_id] is not None
+        )
+        event = self.runtime.weight_sync(
+            self.local_master_fc1_weight_pool[layer_id],
+            self.local_master_fc2_weight_pool[layer_id],
             getattr(previous_event, "event", None),
             async_finish,
         )
