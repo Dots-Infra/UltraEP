@@ -19,12 +19,18 @@ struct GradReduceTask {
 //   total_tasks: Number of tasks
 //   stream: CUDA stream for async execution
 //   num_device_sms: Number of SMs on the device
-void run_grad_reduce(const GradReduceTask* grad_reduce_tasks_cpu,
-                     GradReduceTask* grad_reduce_tasks_gpu,
-                     int* global_tile_counter_gpu,
-                     int* task_tile_offsets_gpu,
-                     const int total_tasks,
-                     cudaStream_t stream,
-                     const int num_device_sms);
+void run_grad_reduce_low_sm(const GradReduceTask* grad_reduce_tasks_cpu,
+                            GradReduceTask* grad_reduce_tasks_gpu,
+                            int* global_task_counter_gpu,
+                            const int total_tasks,
+                            cudaStream_t stream,
+                            const int num_device_sms);
+void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
+                             GradReduceTask* grad_reduce_tasks_gpu,
+                             int* global_tile_counter_gpu,
+                             int* task_tile_offsets_gpu,
+                             const int total_tasks,
+                             cudaStream_t stream,
+                             const int num_device_sms);
 
 }  // namespace ultra_ep::kernels

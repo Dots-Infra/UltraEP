@@ -90,7 +90,7 @@ Manager::Manager(const int& num_local_master_experts,
         cudaMallocHost((void**)&_grad_reduce_tasks_cpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
     CUDA_RUNTIME_CHECK(
         cudaMalloc((void**)&_grad_reduce_tasks_gpu, MAX_GRAD_REDUCE_TASK_NUM * sizeof(kernels::GradReduceTask)));
-    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_global_tile_counter_gpu, sizeof(int)));
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_global_task_or_tile_counter_gpu, sizeof(int)));
     // +1 for the final offset (total tile count)
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_tile_offsets_gpu, (MAX_GRAD_REDUCE_TASK_NUM + 1) * sizeof(int)));
 
@@ -131,11 +131,11 @@ void Manager::destroy() {
     // Free intermediate CUDA buffers
     CUDA_RUNTIME_CHECK(cudaFreeHost(_grad_reduce_tasks_cpu));
     CUDA_RUNTIME_CHECK(cudaFree(_grad_reduce_tasks_gpu));
-    CUDA_RUNTIME_CHECK(cudaFree(_global_tile_counter_gpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_global_task_or_tile_counter_gpu));
     CUDA_RUNTIME_CHECK(cudaFree(_task_tile_offsets_gpu));
     _grad_reduce_tasks_cpu = nullptr;
     _grad_reduce_tasks_gpu = nullptr;
-    _global_tile_counter_gpu = nullptr;
+    _global_task_or_tile_counter_gpu = nullptr;
     _task_tile_offsets_gpu = nullptr;
 
     // Free NVSHMEM runtime
@@ -147,6 +147,7 @@ void Manager::destroy() {
 
 std::optional<EventHandle> Manager::grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor local_master_fc2_grad_ptr_tensor,
+                                                std::string& mode,
                                                 std::optional<EventHandle>& previous_event,
                                                 bool async) {
     EP_HOST_ASSERT(is_available());
@@ -198,13 +199,24 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor local_master_fc1_g
     }
 
     // Call device-side kernels
-    kernels::run_grad_reduce(_grad_reduce_tasks_cpu,
-                             _grad_reduce_tasks_gpu,
-                             _global_tile_counter_gpu,
-                             _task_tile_offsets_gpu,
-                             num_tasks,
-                             comm_stream,
-                             runtime::num_device_sms);
+    if (mode == "low_sm") {
+        kernels::run_grad_reduce_low_sm(_grad_reduce_tasks_cpu,
+                                        _grad_reduce_tasks_gpu,
+                                        _global_task_or_tile_counter_gpu,
+                                        num_tasks,
+                                        comm_stream,
+                                        runtime::num_device_sms);
+    } else if (mode == "high_sm") {
+        kernels::run_grad_reduce_high_sm(_grad_reduce_tasks_cpu,
+                                         _grad_reduce_tasks_gpu,
+                                         _global_task_or_tile_counter_gpu,
+                                         _task_tile_offsets_gpu,
+                                         num_tasks,
+                                         comm_stream,
+                                         runtime::num_device_sms);
+    } else {
+        EP_HOST_ASSERT(false && "Invalid grad reduce mode");
+    }
 
     // Wait streams
     std::optional<EventHandle> event;

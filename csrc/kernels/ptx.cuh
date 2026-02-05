@@ -40,6 +40,17 @@ __forceinline__ __device__ int elect_one_sync() {
 }
 
 // mbarrier
+__forceinline__ __device__ mbarrier* create_mbarrier() {
+    __shared__ __align__(8) uint64_t mbarrier_storage;
+    return reinterpret_cast<mbarrier*>(&mbarrier_storage);
+}
+
+template <int kNumBuffers>
+__forceinline__ __device__ mbarrier* create_mbarriers() {
+    __shared__ __align__(8) uint64_t mbarrier_storage[kNumBuffers];
+    return reinterpret_cast<mbarrier*>(mbarrier_storage);
+}
+
 __forceinline__ __device__ void mbarrier_init(mbarrier* ptr, const int& arrive_count = 1) {
     asm volatile("mbarrier.init.shared::cta.b64 [%1], %0;" ::"r"(arrive_count),
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
@@ -86,23 +97,9 @@ __forceinline__ __device__ void tma_store_wait() {
 
 enum TMACacheHint : int64_t { kEvictFirst = 0x12f0000000000000ll, kEvictNormal = 0x1000000000000000ll };
 
-// __forceinline__ __device__ void tma_load_1d(
-//     const void* dst_ptr, const void* src_ptr, mbarrier* ptr, const int& num_bytes, const TMACacheHint& hint =
-//     TMACacheHint::kEvictFirst) { asm
-//     volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3],
-//     %4;\n" ::"r"(
-//                      static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))),
-//                  "l"(src_ptr),
-//                  "r"(num_bytes),
-//                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
-//                  "l"(hint)
-//                  : "memory");
-// }
-
-// hack: convert pipe ptr for mbarrier to void*
 __forceinline__ __device__ void tma_load_1d(const void* dst_ptr,
                                             const void* src_ptr,
-                                            void* mbarrier_ptr,
+                                            mbarrier* ptr,
                                             const int& num_bytes,
                                             const TMACacheHint& hint = TMACacheHint::kEvictFirst) {
     asm volatile(
@@ -110,7 +107,7 @@ __forceinline__ __device__ void tma_load_1d(const void* dst_ptr,
         "%4;\n" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst_ptr))),
         "l"(src_ptr),
         "r"(num_bytes),
-        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(mbarrier_ptr))),
+        "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))),
         "l"(hint)
         : "memory");
 }

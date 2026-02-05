@@ -4,6 +4,7 @@
 #include <torch/extension.h>
 
 #include <optional>
+#include <string>
 
 #include "config.hpp"
 #include "kernels/api.cuh"
@@ -89,7 +90,7 @@ class Manager {
     // Intermediate buffers for grad reduce tasks
     kernels::GradReduceTask* _grad_reduce_tasks_cpu = nullptr;
     kernels::GradReduceTask* _grad_reduce_tasks_gpu = nullptr;
-    int* _global_tile_counter_gpu = nullptr;
+    int* _global_task_or_tile_counter_gpu = nullptr;
     int* _task_tile_offsets_gpu = nullptr;
 
 public:
@@ -109,6 +110,7 @@ public:
     // - local_master_fc2_grad_ptr_tensor: [num_local_master_experts]
     std::optional<EventHandle> grad_reduce(torch::Tensor local_master_fc1_grad_ptr_tensor,
                                            torch::Tensor local_master_fc2_grad_ptr_tensor,
+                                           std::string& mode,
                                            std::optional<EventHandle>& previous_event,
                                            bool async);
 

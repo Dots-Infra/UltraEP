@@ -113,6 +113,7 @@ class Manager:
     def grad_reduce(
         self,
         layer_id: int,
+        mode: str = "low_sm",
         previous_event: Optional[EventOverlap] = None,
         async_finish: bool = False,
     ):
@@ -124,6 +125,7 @@ class Manager:
         event = self.runtime.grad_reduce(
             self.local_master_fc1_grad_pool[layer_id],
             self.local_master_fc2_grad_pool[layer_id],
+            mode,
             getattr(previous_event, "event", None),
             async_finish,
         )
