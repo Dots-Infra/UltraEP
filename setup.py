@@ -89,6 +89,7 @@ if __name__ == "__main__":
             f"-l:{nvshmem_host_lib}",
             "-l:libnvshmem_device.a",
             f"-Wl,-rpath,{nvshmem_dir}/lib",
+            "-Wl,--allow-multiple-definition",
         ]
     )
 

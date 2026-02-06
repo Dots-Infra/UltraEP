@@ -41,18 +41,29 @@ def main():
     )
 
     num_nvl_ranks = manager.nvl_domain_size
-    print_rank_0(
+    # Print meta info on first rank of each NVL domain
+    ranks_to_print = [
+        nvl_domain * num_nvl_ranks for nvl_domain in range(world_size // num_nvl_ranks)
+    ]
+
+    def print_on_leader_ranks(msg: str):
+        if rank in ranks_to_print:
+            print(msg, flush=True)
+
+    print_on_leader_ranks(
         f"Running weight_sync test with {world_size} ranks, {num_nvl_ranks} NVL ranks"
     )
-    print_rank_0(
+    print_on_leader_ranks(
         f"Local experts: {args.num_local_master_experts} master, {args.num_local_redundant_experts} redundant"
     )
-    print_rank_0(f"Numel: FC1={args.expert_fc1_numel}, FC2={args.expert_fc2_numel}")
+    print_on_leader_ranks(
+        f"Numel: FC1={args.expert_fc1_numel}, FC2={args.expert_fc2_numel}"
+    )
 
     for replica_distrib in ["uniform", "skewed"]:
-        print_rank_0(f"=" * 80)
-        print_rank_0(f"Test weight_sync with {replica_distrib} distribution")
-        print_rank_0(f"=" * 80)
+        print_on_leader_ranks(f"=" * 80)
+        print_on_leader_ranks(f"Test weight_sync with {replica_distrib} distribution")
+        print_on_leader_ranks(f"=" * 80)
 
         setup_placement(
             world_size,
@@ -82,10 +93,10 @@ def main():
         max_replicas_tensor = torch.tensor([max_replicas], device="cuda")
         dist.all_reduce(total_replicas_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(max_replicas_tensor, op=dist.ReduceOp.MAX)
-        print_rank_0(
+        print_on_leader_ranks(
             f"Total replica tasks across all ranks: {total_replicas_tensor.item()}"
         )
-        print_rank_0(f"Max replicas per master: {max_replicas_tensor.item()}")
+        print_on_leader_ranks(f"Max replicas per master: {max_replicas_tensor.item()}")
 
         # Prepare data
         layer_id = 0
@@ -235,7 +246,7 @@ def main():
 
         torch.cuda.synchronize()
         dist.barrier()
-        print_rank_0("*** Correctness verification passed! ***")
+        print_on_leader_ranks("*** Correctness verification passed! ***")
 
         # Performance benchmark
         def weight_sync_fn():
@@ -288,7 +299,9 @@ def main():
         )
 
         print(
-            f"[Rank {rank}] kernel duration: {kernel_dur_ms_this_rank:.3f} ms, data sent: {data_sent_GB_this_rank:.3f} GB, bandwidth: {bandwidth_GBps_this_rank:.2f} GB/s",
+            f"[Rank {rank}] kernel duration: {kernel_dur_ms_this_rank:.3f} ms, "
+            f"data sent: {data_sent_GB_this_rank:.3f} GB, "
+            f"bandwidth: {bandwidth_GBps_this_rank:.2f} GB/s",
             flush=True,
         )
         dist.barrier()
@@ -301,13 +314,15 @@ def main():
         avg_data_GB = avg_data_bytes / (1024**3)
         avg_bandwidth_GBps = avg_data_GB / (avg_time_ms / 1000.0)
 
-        print_rank_0(f"-" * 80)
-        print_rank_0("Performance metrics:")
-        print_rank_0(
+        print_on_leader_ranks(f"-" * 80)
+        print_on_leader_ranks("Performance metrics:")
+        print_on_leader_ranks(
             f"  - E2E Latency: {avg_time_ms:.3f} ms (avg) | {min_time_ms:.3f} ms (min) | {max_time_ms:.3f} ms (max)"
         )
-        print_rank_0(f"  - Average Data Sent (all ranks): {avg_data_GB:.3f} GB")
-        print_rank_0(
+        print_on_leader_ranks(
+            f"  - Average Data Sent (all ranks): {avg_data_GB:.3f} GB"
+        )
+        print_on_leader_ranks(
             f"  - Average Bandwidth (all ranks): {avg_bandwidth_GBps:.2f} GB/s\n"
         )
 

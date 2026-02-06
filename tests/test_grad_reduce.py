@@ -41,19 +41,31 @@ def main():
     )
 
     num_nvl_ranks = manager.nvl_domain_size
-    print_rank_0(f"Running test with {world_size} ranks, {num_nvl_ranks} NVL ranks")
-    print_rank_0(
+    ranks_to_print = [
+        nvl_domain * num_nvl_ranks for nvl_domain in range(world_size // num_nvl_ranks)
+    ]
+
+    def print_on_leader_ranks(msg: str):
+        if rank in ranks_to_print:
+            print(msg, flush=True)
+
+    print_on_leader_ranks(
+        f"Running test with {world_size} ranks, {num_nvl_ranks} NVL ranks"
+    )
+    print_on_leader_ranks(
         f"Local experts: {args.num_local_master_experts} master, {args.num_local_redundant_experts} redundant"
     )
-    print_rank_0(f"Numel: FC1={args.expert_fc1_numel}, FC2={args.expert_fc2_numel}")
+    print_on_leader_ranks(
+        f"Numel: FC1={args.expert_fc1_numel}, FC2={args.expert_fc2_numel}"
+    )
 
     for mode in ["low_sm", "high_sm"]:
         for replica_distrib in ["uniform", "skewed"]:
-            print_rank_0(f"=" * 80)
-            print_rank_0(
+            print_on_leader_ranks(f"=" * 80)
+            print_on_leader_ranks(
                 f"Test expert placement with {mode} mode, {replica_distrib} distribution"
             )
-            print_rank_0(f"=" * 80)
+            print_on_leader_ranks(f"=" * 80)
             setup_placement(
                 world_size,
                 args.num_local_master_experts,
@@ -164,7 +176,7 @@ def main():
                 ), f"FC2 grad mismatch for logical expert {global_log_idx} on rank {rank}"
             torch.cuda.synchronize()
             dist.barrier()
-            print_rank_0("*** Correctness verification passed! ***")
+            print_on_leader_ranks("*** Correctness verification passed! ***")
 
             # Performance benchmark
             grad_reduce_fn = lambda: manager.grad_reduce(
@@ -218,7 +230,9 @@ def main():
             )
 
             print(
-                f"[Rank {rank}] kernel duration: {kernel_dur_ms_this_rank:.3f} ms, data recv: {data_recv_GB_this_rank:.3f} GB, bandwidth: {bandwidth_GBps_this_rank:.2f} GB/s",
+                f"[Rank {rank}] kernel duration: {kernel_dur_ms_this_rank:.3f} ms, "
+                f"data recv: {data_recv_GB_this_rank:.3f} GB, "
+                f"bandwidth: {bandwidth_GBps_this_rank:.2f} GB/s",
                 flush=True,
             )
             dist.barrier()
@@ -233,14 +247,18 @@ def main():
             avg_data_GB = avg_data_bytes / (1024**3)
             avg_bandwidth_GBps = avg_data_GB / (avg_time_ms / 1000.0)
 
-            print_rank_0(f"-" * 80)
-            print_rank_0("Performance metrics:")
-            print_rank_0(
+            print_on_leader_ranks(f"-" * 80)
+            print_on_leader_ranks("Performance metrics:")
+            print_on_leader_ranks(
                 f"  - E2E Latency: {avg_time_ms:.3f} ms (avg) | {min_time_ms:.3f} ms (min) | {max_time_ms:.3f} ms (max)"
             )
-            print_rank_0(f"  - Average Data Moved (per-rank): {avg_data_MB} MB")
-            print_rank_0(f"  - End2end Bandwidth: {avg_bandwidth_GBps:.2f} GB/s")
-            print_rank_0("\n")
+            print_on_leader_ranks(
+                f"  - Average Data Moved (per-rank): {avg_data_MB} MB"
+            )
+            print_on_leader_ranks(
+                f"  - End2end Bandwidth: {avg_bandwidth_GBps:.2f} GB/s"
+            )
+            print_on_leader_ranks("\n")
 
     manager.destroy()
     dist.destroy_process_group()
