@@ -8,4 +8,4 @@ from .event import EventOverlap
 
 __all__ = ["Manager", "init_runtime", "EventOverlap"]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
