@@ -237,9 +237,6 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_
     std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
-        for (auto& t : {local_master_fc1_grad_ptr_tensor, local_master_fc2_grad_ptr_tensor}) {
-            t.record_stream(comm_stream);
-        }
     } else {
         stream_wait(compute_stream, comm_stream);
     }
@@ -336,9 +333,6 @@ std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_
     std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
-        for (auto& t : {local_master_fc1_weight_ptr_tensor, local_master_fc2_weight_ptr_tensor}) {
-            t.record_stream(comm_stream);
-        }
     } else {
         stream_wait(compute_stream, comm_stream);
     }
