@@ -168,6 +168,7 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_
     EP_HOST_ASSERT(is_available());
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
+    std::optional<EventHandle> event;
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
@@ -210,7 +211,10 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_
         }
     }
     if (num_tasks == 0) {
-        return std::nullopt;
+        if (async) {
+            event = EventHandle(comm_stream);
+        }
+        return event;
     }
 
     // Call device-side kernels
@@ -234,7 +238,6 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_
     }
 
     // Wait streams
-    std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
     } else {
@@ -251,6 +254,7 @@ std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_
     EP_HOST_ASSERT(is_available());
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
+    std::optional<EventHandle> event;
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
@@ -317,7 +321,10 @@ std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_
     }
 
     if (num_tasks == 0) {
-        return std::nullopt;
+        if (async) {
+            event = EventHandle(comm_stream);
+        }
+        return event;
     }
 
     // Call device-side kernel
@@ -330,7 +337,6 @@ std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_
                              runtime::num_device_sms);
 
     // Wait streams
-    std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
     } else {
