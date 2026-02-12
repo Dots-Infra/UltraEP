@@ -4,7 +4,7 @@ from typing import List, Optional
 
 import ultra_ep._C as _C
 from .runtime import init_runtime
-from .event import EventOverlap
+from .event import EventHandle
 
 MAX_MODEL_LAYERS = 200
 
@@ -125,7 +125,7 @@ class Manager:
         self,
         layer_id: int,
         mode: str = "low_sm",
-        previous_event: Optional[EventOverlap] = None,
+        previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
     ):
         assert layer_id < MAX_MODEL_LAYERS
@@ -140,12 +140,12 @@ class Manager:
             getattr(previous_event, "event", None),
             async_finish,
         )
-        return EventOverlap(event)
+        return EventHandle(event)
 
     def weight_sync(
         self,
         layer_id: int,
-        previous_event: Optional[EventOverlap] = None,
+        previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
     ):
         """
@@ -162,7 +162,7 @@ class Manager:
                          If False, wait for completion before returning
 
         Returns:
-            EventOverlap handle if async_finish=True, else None
+            EventHandle handle if async_finish=True, else None
         """
         assert layer_id < MAX_MODEL_LAYERS
         assert (
@@ -175,7 +175,7 @@ class Manager:
             getattr(previous_event, "event", None),
             async_finish,
         )
-        return EventOverlap(event)
+        return EventHandle(event)
 
     def check_tensors_blob_from_cpp(self):
         assert (

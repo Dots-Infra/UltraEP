@@ -2,12 +2,11 @@ import torch
 import torch.distributed as dist
 import os, sys
 import argparse
-import time
 import ultra_ep
-from ultra_ep.util import print_rank_0
+from ultra_ep.util import setup_placement_random
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import setup_placement, bench, bench_kineto
+from utils import bench, bench_kineto
 
 
 def main():
@@ -65,7 +64,7 @@ def main():
         print_on_leader_ranks(f"Test weight_sync with {replica_distrib} distribution")
         print_on_leader_ranks(f"=" * 80)
 
-        setup_placement(
+        setup_placement_random(
             world_size,
             args.num_local_master_experts,
             args.num_local_redundant_experts,

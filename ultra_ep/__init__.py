@@ -4,8 +4,8 @@ import ultra_ep._C as _C
 
 from .manager import Manager
 from .runtime import init_runtime
-from .event import EventOverlap
+from .event import EventHandle
 
-__all__ = ["Manager", "init_runtime", "EventOverlap"]
+__all__ = ["Manager", "init_runtime", "EventHandle"]
 
 __version__ = "0.1.1"

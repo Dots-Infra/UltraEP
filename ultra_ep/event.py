@@ -4,10 +4,10 @@ import torch
 from typing import Any, Optional, Tuple
 
 # noinspection PyUnresolvedReferences
-from ultra_ep._C import EventHandle
+from ultra_ep._C import EventHandle as EventHandle_C
 
 
-class EventOverlap:
+class EventHandle:
     """
     A wrapper class to manage CUDA events, also for better overlapping convenience.
 
@@ -18,7 +18,7 @@ class EventOverlap:
 
     def __init__(
         self,
-        event: Optional[EventHandle] = None,
+        event: Optional[EventHandle_C] = None,
         extra_tensors: Optional[Tuple[torch.Tensor]] = None,
     ) -> None:
         """
