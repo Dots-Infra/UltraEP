@@ -9,12 +9,14 @@
 
 namespace ultra_ep {
 
-Manager::Manager(const int& num_local_master_experts,
+Manager::Manager(const int& num_layers,
+                 const int& num_local_master_experts,
                  const int& num_local_redundant_experts,
                  const int64_t& expert_fc1_numel,
                  const int64_t& expert_fc2_numel,
                  const bool& explicitly_destroy)
-    : num_local_master_experts(num_local_master_experts),
+    : num_layers(num_layers),
+      num_local_master_experts(num_local_master_experts),
       num_local_redundant_experts(num_local_redundant_experts),
       num_local_physical_experts(num_local_master_experts + num_local_redundant_experts),
       expert_fc1_numel(expert_fc1_numel),
@@ -33,19 +35,16 @@ Manager::Manager(const int& num_local_master_experts,
     int num_ranks = runtime::num_ranks;
     int device_id = runtime::device_id;
     placement.physical_to_logical_map =
-        torch::full({num_global_physical_experts},
+        torch::full({num_layers, num_global_physical_experts},
                     -1,
                     torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
     placement.logical_to_physical_map =
-        torch::full({num_global_logical_experts, num_ranks},
+        torch::full({num_layers, num_global_logical_experts, num_ranks},
                     -1,
                     torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
     placement.logical_replica_counts =
-        torch::zeros({num_global_logical_experts},
+        torch::zeros({num_layers, num_global_logical_experts},
                      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-    placement.p2l_ptr = placement.physical_to_logical_map.data<int32_t>();
-    placement.l2p_ptr = placement.logical_to_physical_map.data<int32_t>();
-    placement.lcnts_ptr = placement.logical_replica_counts.data<int32_t>();
 
     // Allocate local replica weight and grad buffers via NVSHMEM symmetric heap
     // This enables automatic cross-GPU access within NVL domain
@@ -160,7 +159,18 @@ void Manager::destroy() {
     _available = false;
 }
 
-std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_grad_ptr_tensor,
+std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_map_ptrs(const int& layer_id) const {
+    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
+    int p2l_offset = layer_id * num_global_physical_experts;
+    int l2p_offset = layer_id * num_global_logical_experts * runtime::num_ranks;
+    int lcnts_offset = layer_id * num_global_logical_experts;
+    return std::make_tuple(placement.physical_to_logical_map.data<int32_t>() + p2l_offset,
+                           placement.logical_to_physical_map.data<int32_t>() + l2p_offset,
+                           placement.logical_replica_counts.data<int32_t>() + lcnts_offset);
+}
+
+std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
+                                                torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                                 std::string& mode,
                                                 std::optional<EventHandle>& previous_event,
@@ -181,15 +191,16 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_
 
     // Flatten task list (host-side)
     int num_tasks = 0;
+    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = get_placement_map_ptrs(layer_id);
     for (int i = 0; i < num_local_master_experts; ++i) {
         int master_global_phy_idx = runtime::rank_idx * num_local_physical_experts + i;
-        int master_global_log_idx = placement.p2l_ptr[master_global_phy_idx];
-        int num_replicas = placement.lcnts_ptr[master_global_log_idx];
+        int master_global_log_idx = p2l_ptr[master_global_phy_idx];
+        int num_replicas = lcnts_ptr[master_global_log_idx];
         float* local_master_fc1_grad_ptr = reinterpret_cast<float*>(local_master_fc1_grad_ptrs[i]);
         float* local_master_fc2_grad_ptr = reinterpret_cast<float*>(local_master_fc2_grad_ptrs[i]);
 
         for (int j = 1; j < num_replicas; ++j) {  // skip the master itself
-            int replica_global_phy_idx = placement.l2p_ptr[master_global_log_idx * runtime::num_ranks + j];
+            int replica_global_phy_idx = l2p_ptr[master_global_log_idx * runtime::num_ranks + j];
             int replica_global_rank_idx = replica_global_phy_idx / num_local_physical_experts;
             EP_HOST_ASSERT(is_in_same_nvl_domain(runtime::rank_idx, replica_global_rank_idx, runtime::num_nvl_ranks) &&
                            "Replica rank is not in the same NVL domain as the master rank");
@@ -247,7 +258,8 @@ std::optional<EventHandle> Manager::grad_reduce(torch::Tensor& local_master_fc1_
     return event;
 }
 
-std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_weight_ptr_tensor,
+std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
+                                                torch::Tensor& local_master_fc1_weight_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_weight_ptr_tensor,
                                                 std::optional<EventHandle>& previous_event,
                                                 bool async) {
@@ -268,10 +280,11 @@ std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_
     // Build broadcast tasks: each local master broadcasts to all its replicas
     // Each master creates two tasks: one for FC1, one for FC2
     int num_tasks = 0;
+    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = get_placement_map_ptrs(layer_id);
     for (int i = 0; i < num_local_master_experts; ++i) {
         int master_global_phy_idx = runtime::rank_idx * num_local_physical_experts + i;
-        int master_global_log_idx = placement.p2l_ptr[master_global_phy_idx];
-        int num_replicas = placement.lcnts_ptr[master_global_log_idx] - 1;  // Exclude master itself
+        int master_global_log_idx = p2l_ptr[master_global_phy_idx];
+        int num_replicas = lcnts_ptr[master_global_log_idx] - 1;  // Exclude master itself
 
         if (num_replicas == 0) {
             continue;  // No replicas to sync to
@@ -295,7 +308,7 @@ std::optional<EventHandle> Manager::weight_sync(torch::Tensor& local_master_fc1_
         // Fill replica addresses for both tasks
         for (int j = 0; j < num_replicas; ++j) {
             // j+1 because index 0 is the master itself in logical_to_physical_map
-            int replica_global_phy_idx = placement.l2p_ptr[master_global_log_idx * runtime::num_ranks + j + 1];
+            int replica_global_phy_idx = l2p_ptr[master_global_log_idx * runtime::num_ranks + j + 1];
             int replica_global_rank_idx = replica_global_phy_idx / num_local_physical_experts;
             EP_HOST_ASSERT(is_in_same_nvl_domain(runtime::rank_idx, replica_global_rank_idx, runtime::num_nvl_ranks) &&
                            "Replica rank is not in the same NVL domain as the master rank");

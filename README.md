@@ -26,7 +26,7 @@ In MoE models, token distribution across experts can be highly skewed, leading t
 
 ### Data Structures
 
-UltraEP uses mappings to delineate the state of expert placement:
+UltraEP uses layer-wise mappings to delineate the state of expert placement:
 - `physical_to_logical_map`: Maps each physical expert on a GPU to its corresponding logical expert ID.
 - `logical_to_physical_map`: Maps each logical expert to its master and replica physical locations.
 - `logical_replica_counts`: Tracks the total number of physical instances (master + replicas) for each logical expert.
@@ -76,6 +76,7 @@ import ultra_ep
 # Initialize Manager
 manager = ultra_ep.Manager(
     group=dist.group.WORLD,
+    num_layers=48,
     num_local_master_experts=4,
     num_local_redundant_experts=2,
     expert_fc1_numel=3072 * 4096,

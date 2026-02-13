@@ -8,6 +8,8 @@ from ultra_ep.util import setup_placement_random
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import bench, bench_kineto
 
+NUM_LAYERS = 48
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -32,6 +34,7 @@ def main():
 
     manager = ultra_ep.Manager(
         group=dist.group.WORLD,
+        num_layers=NUM_LAYERS,
         num_local_master_experts=args.num_local_master_experts,
         num_local_redundant_experts=args.num_local_redundant_experts,
         expert_fc1_numel=args.expert_fc1_numel,
@@ -77,13 +80,18 @@ def main():
             seed=args.seed,
         )
 
+        layer_id = 3
         # Count replicas for debugging
         total_replicas = 0
         max_replicas = 0
         for i in range(args.num_local_master_experts):
             global_phys_idx = rank * manager.num_local_physical_experts + i
-            global_log_idx = manager.physical_to_logical_map[global_phys_idx].item()
-            num_replicas = manager.logical_replica_counts[global_log_idx].item() - 1
+            global_log_idx = manager.physical_to_logical_map[
+                layer_id, global_phys_idx
+            ].item()
+            num_replicas = (
+                manager.logical_replica_counts[layer_id, global_log_idx].item() - 1
+            )
             total_replicas += num_replicas
             max_replicas = max(max_replicas, num_replicas)
 
@@ -98,7 +106,6 @@ def main():
         print_on_leader_ranks(f"Max replicas per master: {max_replicas_tensor.item()}")
 
         # Prepare data
-        layer_id = 0
         expert_total_numel = args.expert_fc1_numel + args.expert_fc2_numel
 
         # Master weight buffers on this rank (source)
@@ -136,14 +143,16 @@ def main():
         for i in range(args.num_local_redundant_experts):
             local_phys_idx = args.num_local_master_experts + i
             global_phys_idx = rank * manager.num_local_physical_experts + local_phys_idx
-            logical_idx = manager.physical_to_logical_map[global_phys_idx].item()
+            logical_idx = manager.physical_to_logical_map[
+                layer_id, global_phys_idx
+            ].item()
 
             if logical_idx < 0:
                 continue  # Not assigned
 
             # Find the master for this logical expert
             master_global_phys_idx = manager.logical_to_physical_map[
-                logical_idx, 0
+                layer_id, logical_idx, 0
             ].item()
             master_rank = master_global_phys_idx // manager.num_local_physical_experts
             master_local_idx = (
@@ -179,14 +188,16 @@ def main():
         for i in range(args.num_local_redundant_experts):
             local_phys_idx = args.num_local_master_experts + i
             global_phys_idx = rank * manager.num_local_physical_experts + local_phys_idx
-            logical_idx = manager.physical_to_logical_map[global_phys_idx].item()
+            logical_idx = manager.physical_to_logical_map[
+                layer_id, global_phys_idx
+            ].item()
 
             if logical_idx < 0:
                 continue
 
             # Find the master
             master_global_phys_idx = manager.logical_to_physical_map[
-                logical_idx, 0
+                layer_id, logical_idx, 0
             ].item()
             master_rank = master_global_phys_idx // manager.num_local_physical_experts
             master_local_idx = (
@@ -210,36 +221,6 @@ def main():
         match = torch.allclose(
             replica_weight_buffer, expected_replica_weights, atol=args.correct_tolerance
         )
-
-        if not match:
-            # Find first mismatch for debugging
-            diff = (replica_weight_buffer - expected_replica_weights).abs()
-            max_diff = diff.max().item()
-            max_diff_idx = diff.argmax().item()
-            print(
-                f"Rank {rank}: Weight sync mismatch! Max diff: {max_diff} at index {max_diff_idx}",
-                flush=True,
-            )
-            # Check each replica
-            for i in range(args.num_local_redundant_experts):
-                replica_diff = (
-                    (replica_weight_buffer[i] - expected_replica_weights[i])
-                    .abs()
-                    .max()
-                    .item()
-                )
-                if replica_diff > args.correct_tolerance:
-                    local_phys_idx = args.num_local_master_experts + i
-                    global_phys_idx = (
-                        rank * manager.num_local_physical_experts + local_phys_idx
-                    )
-                    logical_idx = manager.physical_to_logical_map[
-                        global_phys_idx
-                    ].item()
-                    print(
-                        f"  Replica {i} (logical {logical_idx}): max diff = {replica_diff}",
-                        flush=True,
-                    )
 
         assert match, f"Weight sync verification failed on rank {rank}"
 
@@ -285,8 +266,12 @@ def main():
         bytes_sent_this_rank = 0
         for i in range(args.num_local_master_experts):
             global_phys_idx = rank * manager.num_local_physical_experts + i
-            global_log_idx = manager.physical_to_logical_map[global_phys_idx].item()
-            num_replicas = manager.logical_replica_counts[global_log_idx].item() - 1
+            global_log_idx = manager.physical_to_logical_map[
+                layer_id, global_phys_idx
+            ].item()
+            num_replicas = (
+                manager.logical_replica_counts[layer_id, global_log_idx].item() - 1
+            )
             bytes_sent_this_rank += (
                 num_replicas * expert_total_numel * 2
             )  # bf16 = 2 bytes

@@ -6,13 +6,12 @@ import ultra_ep._C as _C
 from .runtime import init_runtime
 from .event import EventHandle
 
-MAX_MODEL_LAYERS = 200
-
 
 class Manager:
     def __init__(
         self,
         group: dist.ProcessGroup,
+        num_layers: int,
         num_local_master_experts: int,
         num_local_redundant_experts: int,
         expert_fc1_numel: int,
@@ -27,6 +26,7 @@ class Manager:
         self.rank = group.rank()
         self.num_ranks = group.size()
 
+        self.num_layers = num_layers
         self.num_local_master_experts = num_local_master_experts
         self.num_local_redundant_experts = num_local_redundant_experts
         self.expert_fc1_numel = expert_fc1_numel
@@ -42,14 +42,18 @@ class Manager:
 
         # Pre-configured during model construction
         # Shape: num_layers x [num_local_master_experts,]
-        self.local_master_fc1_weight_pool = [None] * MAX_MODEL_LAYERS
-        self.local_master_fc2_weight_pool = [None] * MAX_MODEL_LAYERS
-        self.local_master_fc1_grad_pool = [None] * MAX_MODEL_LAYERS
-        self.local_master_fc2_grad_pool = [None] * MAX_MODEL_LAYERS
+        self.num_alloc_layers = (
+            num_layers + 3
+        )  # In case layer_id begins from 1 instead of 0
+        self.local_master_fc1_weight_pool = [None] * self.num_alloc_layers
+        self.local_master_fc2_weight_pool = [None] * self.num_alloc_layers
+        self.local_master_fc1_grad_pool = [None] * self.num_alloc_layers
+        self.local_master_fc2_grad_pool = [None] * self.num_alloc_layers
 
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
         self.runtime = _C.Manager(
+            self.num_alloc_layers,
             num_local_master_experts,
             num_local_redundant_experts,
             expert_fc1_numel,
@@ -94,7 +98,7 @@ class Manager:
         fc1_grads: List[torch.Tensor],
         fc2_grads: List[torch.Tensor],
     ):
-        assert layer_id < MAX_MODEL_LAYERS
+        assert layer_id < self.num_alloc_layers
         assert len(fc1_weights) == self.num_local_master_experts
         assert len(fc2_weights) == self.num_local_master_experts
         assert len(fc1_grads) == self.num_local_master_experts
@@ -128,12 +132,13 @@ class Manager:
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
     ):
-        assert layer_id < MAX_MODEL_LAYERS
+        assert layer_id < self.num_alloc_layers
         assert (
             self.local_master_fc1_grad_pool[layer_id] is not None
             and self.local_master_fc2_grad_pool[layer_id] is not None
         )
         event = self.runtime.grad_reduce(
+            layer_id,
             self.local_master_fc1_grad_pool[layer_id],
             self.local_master_fc2_grad_pool[layer_id],
             mode,
@@ -164,12 +169,13 @@ class Manager:
         Returns:
             EventHandle handle if async_finish=True, else None
         """
-        assert layer_id < MAX_MODEL_LAYERS
+        assert layer_id < self.num_alloc_layers
         assert (
             self.local_master_fc1_weight_pool[layer_id] is not None
             and self.local_master_fc2_weight_pool[layer_id] is not None
         )
         event = self.runtime.weight_sync(
+            layer_id,
             self.local_master_fc1_weight_pool[layer_id],
             self.local_master_fc2_weight_pool[layer_id],
             getattr(previous_event, "event", None),
@@ -189,10 +195,18 @@ class Manager:
             and self.logical_replica_counts.dtype == torch.int32
         )
         assert (
-            self.physical_to_logical_map.shape == (self.num_global_physical_experts,)
+            self.physical_to_logical_map.shape
+            == (
+                self.num_alloc_layers,
+                self.num_global_physical_experts,
+            )
             and self.logical_to_physical_map.shape
-            == (self.num_global_logical_experts, self.num_ranks)
-            and self.logical_replica_counts.shape == (self.num_global_logical_experts,)
+            == (self.num_alloc_layers, self.num_global_logical_experts, self.num_ranks)
+            and self.logical_replica_counts.shape
+            == (
+                self.num_alloc_layers,
+                self.num_global_logical_experts,
+            )
         )
         assert (self.physical_to_logical_map == -1).all().item()
         assert (self.logical_to_physical_map == -1).all().item()

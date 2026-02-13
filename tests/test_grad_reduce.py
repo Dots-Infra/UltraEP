@@ -8,6 +8,8 @@ from ultra_ep.util import setup_placement_random
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import bench, bench_kineto
 
+NUM_LAYERS = 48
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -32,6 +34,7 @@ def main():
 
     manager = ultra_ep.Manager(
         group=dist.group.WORLD,
+        num_layers=NUM_LAYERS,
         num_local_master_experts=args.num_local_master_experts,
         num_local_redundant_experts=args.num_local_redundant_experts,
         expert_fc1_numel=args.expert_fc1_numel,
@@ -79,7 +82,7 @@ def main():
             )
 
             # Prepare data
-            layer_id = 0
+            layer_id = 3
             expert_total_numel = args.expert_fc1_numel + args.expert_fc2_numel
 
             # Master grad buffers on this rank
@@ -129,7 +132,9 @@ def main():
             )
             for i in range(manager.num_local_physical_experts):
                 global_phys_idx = rank * manager.num_local_physical_experts + i
-                global_log_idx = manager.physical_to_logical_map[global_phys_idx].item()
+                global_log_idx = manager.physical_to_logical_map[
+                    layer_id, global_phys_idx
+                ].item()
                 if i < manager.num_local_master_experts:
                     global_logical_expert_fc1_grad_buffer[global_log_idx, :].copy_(
                         fc1_grads[i]
@@ -162,7 +167,9 @@ def main():
             ), f"Replica grad buffer was not zeroed out on rank {rank}"
             for i in range(manager.num_local_master_experts):
                 global_phys_idx = rank * manager.num_local_physical_experts + i
-                global_log_idx = manager.physical_to_logical_map[global_phys_idx].item()
+                global_log_idx = manager.physical_to_logical_map[
+                    layer_id, global_phys_idx
+                ].item()
                 assert torch.allclose(
                     fc1_grads[i],
                     global_logical_expert_fc1_grad_buffer[global_log_idx, :],
@@ -214,8 +221,12 @@ def main():
             bytes_recv_this_rank = 0
             for i in range(args.num_local_master_experts):
                 global_phys_idx = rank * manager.num_local_physical_experts + i
-                global_log_idx = manager.physical_to_logical_map[global_phys_idx].item()
-                num_replicas = manager.logical_replica_counts[global_log_idx].item() - 1
+                global_log_idx = manager.physical_to_logical_map[
+                    layer_id, global_phys_idx
+                ].item()
+                num_replicas = (
+                    manager.logical_replica_counts[layer_id, global_log_idx].item() - 1
+                )
                 bytes_recv_this_rank += (
                     num_replicas
                     * expert_total_numel

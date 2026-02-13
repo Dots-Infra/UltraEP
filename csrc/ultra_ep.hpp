@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <string>
+#include <tuple>
 
 #include "config.hpp"
 #include "kernels/api.cuh"
@@ -19,16 +20,17 @@ namespace ultra_ep {
 /* Describes the placement of global experts across all ranks.
 
 Attributes:
-    physical_to_logical_map: [num_global_physical_experts]
+    physical_to_logical_map: [num_layers, num_global_physical_experts]
         mapping from physical to logical expert indices
-    logical_to_physical_map: [num_global_logical_experts, max_replicas]
+    logical_to_physical_map: [num_layers, num_global_logical_experts, max_replicas]
         mapping from logical to physical expert indices, padded with -1.
         The first entry is always the master, followed by replicas.
-    logical_replica_counts: [num_global_logical_experts]
+    logical_replica_counts: [num_layers, num_global_logical_experts]
         number of replicas for each logical expert (includes master)
 
 Example:
     Suppose EP2 (2 GPUs) and 4 logical experts 0~3, each EP rank has 1 redundant expert
+    Omit the first index for layer for simplicity
     - Master assignment: rank0 masters [2, 1], rank1 masters [0, 3]
     - num_local_physical_experts = 2 + 1 = 3 per rank
     - Physical layout:
@@ -46,13 +48,11 @@ struct GlobalExpertPlacement {
     torch::Tensor physical_to_logical_map;
     torch::Tensor logical_to_physical_map;
     torch::Tensor logical_replica_counts;
-    int32_t* p2l_ptr;
-    int32_t* l2p_ptr;
-    int32_t* lcnts_ptr;
 };
 
 class Manager {
     // Model and expert settings
+    int num_layers;
     int num_local_master_experts;
     int num_local_redundant_experts;
     int num_local_physical_experts;
@@ -99,7 +99,8 @@ class Manager {
     // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
 
 public:
-    Manager(const int& num_local_master_experts,
+    Manager(const int& num_layers,
+            const int& num_local_master_experts,
             const int& num_local_redundant_experts,
             const int64_t& expert_fc1_numel,
             const int64_t& expert_fc2_numel,
@@ -113,7 +114,8 @@ public:
     // Parameters (ptr tensor of local master grad buffers, for the current layer):
     // - local_master_fc1_grad_ptr_tensor: [num_local_master_experts]
     // - local_master_fc2_grad_ptr_tensor: [num_local_master_experts]
-    std::optional<EventHandle> grad_reduce(torch::Tensor& local_master_fc1_grad_ptr_tensor,
+    std::optional<EventHandle> grad_reduce(const int& layer_id,
+                                           torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                            torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                            std::string& mode,
                                            std::optional<EventHandle>& previous_event,
@@ -122,7 +124,8 @@ public:
     // Parameters (ptr tensor of local master weight buffers, for the current layer):
     // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
     // - local_master_fc2_weight_ptr_tensor: [num_local_master_experts]
-    std::optional<EventHandle> weight_sync(torch::Tensor& local_master_fc1_weight_ptr_tensor,
+    std::optional<EventHandle> weight_sync(const int& layer_id,
+                                           torch::Tensor& local_master_fc1_weight_ptr_tensor,
                                            torch::Tensor& local_master_fc2_weight_ptr_tensor,
                                            std::optional<EventHandle>& previous_event,
                                            bool async);
@@ -134,11 +137,14 @@ public:
     torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
     torch::Tensor get_logical_to_physical_map_tensor() const { return placement.logical_to_physical_map; }
     torch::Tensor get_logical_replica_counts_tensor() const { return placement.logical_replica_counts; }
+
+private:
+    std::tuple<int32_t*, int32_t*, int32_t*> get_placement_map_ptrs(const int& layer_id) const;
 };
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<Manager>(m, "Manager")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool>())
+        .def(pybind11::init<int, int, int, int64_t, int64_t, bool>())
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("grad_reduce", &Manager::grad_reduce)
