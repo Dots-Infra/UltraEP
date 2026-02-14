@@ -183,6 +183,27 @@ class Manager:
         )
         return EventHandle(event)
 
+    def update_placement(self, layer_id: int, expert_loads: torch.Tensor):
+        """
+        Update expert placement for a single layer based on real-time load statistics.
+
+        Runs the EPLB-style placement algorithm entirely on CPU:
+          1. Masters remain fixed at their pre-assigned positions.
+          2. Per NVL domain, greedily replicates the most loaded experts.
+          3. Per NVL domain, packs replicas to GPU slots via LPT bin-packing,
+             ensuring replicas are never placed on the same GPU as their master.
+
+        Deterministic: all ranks compute identical results, no broadcast needed.
+
+        Args:
+            layer_id: The MoE layer index to update.
+            expert_loads: 1-D int32 tensor of shape [num_global_logical_experts],
+                          token counts (or any load metric) per logical expert.
+                          Can be on CPU or GPU (will be moved to CPU internally).
+        """
+        assert layer_id < self.num_alloc_layers
+        self.runtime.update_placement(layer_id, expert_loads)
+
     def check_tensors_blob_from_cpp(self):
         assert (
             self.physical_to_logical_map.device == torch.device("cpu")

@@ -67,6 +67,7 @@ Manager::Manager(const int& num_layers,
                                                                {num_local_redundant_experts, expert_total_numel},
                                                                torch::kFloat32,
                                                                torch::Device(torch::kCUDA, device_id));
+    local_replica_grad_buffer_tensor.zero_();
 
     // Synchronize all PEs to ensure buffers are allocated on all ranks
     nvshmem::barrier(true);
@@ -101,6 +102,15 @@ Manager::Manager(const int& num_layers,
         cudaMallocHost((void**)&_weight_sync_tasks_cpu, MAX_WEIGHT_SYNC_TASK_NUM * sizeof(kernels::WeightSyncTask)));
     CUDA_RUNTIME_CHECK(
         cudaMalloc((void**)&_weight_sync_tasks_gpu, MAX_WEIGHT_SYNC_TASK_NUM * sizeof(kernels::WeightSyncTask)));
+
+    // Create pre-allocated placement solver (zero-alloc on hot path)
+    placement_solver_ = std::make_unique<solver::PlacementSolver>(num_global_logical_experts,
+                                                                  runtime::num_ranks,
+                                                                  num_local_master_experts,
+                                                                  num_local_redundant_experts,
+                                                                  runtime::num_nvl_ranks,
+                                                                  runtime::num_ranks  // max_replicas_dim = num_ranks
+    );
 
     // Ready to use (no IPC handle exchange needed with NVSHMEM)
     _available = true;
@@ -157,6 +167,22 @@ void Manager::destroy() {
 
     // Ready to destroy
     _available = false;
+}
+
+void Manager::update_placement(const int& layer_id, torch::Tensor& expert_loads) {
+    EP_HOST_ASSERT(is_available());
+    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
+
+    // Ensure the tensor is int32 and contiguous on CPU
+    if (expert_loads.is_cuda()) {
+        expert_loads = expert_loads.to(torch::kCPU);
+    }
+    expert_loads = expert_loads.to(torch::kInt32).contiguous();
+    EP_HOST_ASSERT(expert_loads.dim() == 1 && expert_loads.size(0) == num_global_logical_experts);
+
+    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = get_placement_map_ptrs(layer_id);
+
+    placement_solver_->solve(expert_loads.data<int32_t>(), p2l_ptr, l2p_ptr, lcnts_ptr);
 }
 
 std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_map_ptrs(const int& layer_id) const {

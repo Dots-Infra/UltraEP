@@ -2,6 +2,7 @@
 #include <torch/python.h>
 
 #include "runtime.hpp"
+#include "solvers/api.hpp"
 #include "ultra_ep.hpp"
 #include "utils/ipc_manager.cuh"
 
@@ -19,4 +20,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     ultra_ep::runtime::register_apis(m);
     ultra_ep::ipc::register_apis(m);
     ultra_ep::event::register_apis(m);
+    ultra_ep::solver::register_apis(m);
 }

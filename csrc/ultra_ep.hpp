@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -10,6 +11,7 @@
 #include "config.hpp"
 #include "kernels/api.cuh"
 #include "runtime.hpp"
+#include "solvers/api.hpp"
 #include "utils/event.hpp"
 #include "utils/exception.cuh"
 #include "utils/nvshmem.cuh"
@@ -98,6 +100,9 @@ class Manager {
     kernels::WeightSyncTask* _weight_sync_tasks_gpu = nullptr;
     // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
 
+    // Pre-allocated placement solver (zero-alloc on hot path)
+    std::unique_ptr<solver::PlacementSolver> placement_solver_;
+
 public:
     Manager(const int& num_layers,
             const int& num_local_master_experts,
@@ -130,6 +135,11 @@ public:
                                            std::optional<EventHandle>& previous_event,
                                            bool async);
 
+    // Update expert placement for a single layer based on real-time load statistics.
+    // expert_loads: [num_global_logical_experts], int32 token counts per logical expert.
+    // Runs entirely on CPU. Deterministic across all ranks.
+    void update_placement(const int& layer_id, torch::Tensor& expert_loads);
+
     torch::Stream get_comm_stream() const { return comm_stream; }
 
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
@@ -147,6 +157,7 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<int, int, int, int64_t, int64_t, bool>())
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
+        .def("update_placement", &Manager::update_placement)
         .def("grad_reduce", &Manager::grad_reduce)
         .def("weight_sync", &Manager::weight_sync)
         .def("get_comm_stream", &Manager::get_comm_stream)
