@@ -102,6 +102,8 @@ class Manager {
 
     // Pre-allocated placement solver (zero-alloc on hot path)
     std::unique_ptr<solver::PlacementSolver> placement_solver_;
+    // CPU buffer for global logical expert loads
+    int* global_logical_expert_loads_cpu = nullptr;
 
 public:
     Manager(const int& num_layers,

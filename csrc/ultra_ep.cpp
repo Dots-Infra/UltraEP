@@ -111,6 +111,8 @@ Manager::Manager(const int& num_layers,
                                                                   runtime::num_nvl_ranks,
                                                                   runtime::num_ranks  // max_replicas_dim = num_ranks
     );
+    CUDA_RUNTIME_CHECK(
+        cudaMallocHost((void**)&global_logical_expert_loads_cpu, num_global_logical_experts * sizeof(int)));
 
     // Ready to use (no IPC handle exchange needed with NVSHMEM)
     _available = true;
@@ -162,6 +164,10 @@ void Manager::destroy() {
     _weight_sync_tasks_cpu = nullptr;
     _weight_sync_tasks_gpu = nullptr;
 
+    // Free expert load buffers
+    CUDA_RUNTIME_CHECK(cudaFreeHost(global_logical_expert_loads_cpu));
+    global_logical_expert_loads_cpu = nullptr;
+
     // Free NVSHMEM runtime
     runtime::destroy();
 
@@ -172,17 +178,22 @@ void Manager::destroy() {
 void Manager::update_placement(const int& layer_id, torch::Tensor& expert_loads) {
     EP_HOST_ASSERT(is_available());
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
+    EP_HOST_ASSERT(expert_loads.dim() == 1 && expert_loads.size(0) == num_global_logical_experts &&
+                   expert_loads.dtype() == torch::kInt32);
 
-    // Ensure the tensor is int32 and contiguous on CPU
+    int* expert_loads_ptr = nullptr;
     if (expert_loads.is_cuda()) {
-        expert_loads = expert_loads.to(torch::kCPU);
+        CUDA_RUNTIME_CHECK(cudaMemcpy(global_logical_expert_loads_cpu,
+                                      expert_loads.data<int32_t>(),
+                                      num_global_logical_experts * sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+        expert_loads_ptr = global_logical_expert_loads_cpu;
+    } else {
+        expert_loads_ptr = expert_loads.data<int32_t>();
     }
-    expert_loads = expert_loads.to(torch::kInt32).contiguous();
-    EP_HOST_ASSERT(expert_loads.dim() == 1 && expert_loads.size(0) == num_global_logical_experts);
-
     auto [p2l_ptr, l2p_ptr, lcnts_ptr] = get_placement_map_ptrs(layer_id);
 
-    placement_solver_->solve(expert_loads.data<int32_t>(), p2l_ptr, l2p_ptr, lcnts_ptr);
+    placement_solver_->solve(expert_loads_ptr, p2l_ptr, l2p_ptr, lcnts_ptr);
 }
 
 std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_map_ptrs(const int& layer_id) const {
