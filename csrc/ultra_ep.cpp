@@ -113,6 +113,11 @@ Manager::Manager(const int& num_layers,
     );
     CUDA_RUNTIME_CHECK(
         cudaMallocHost((void**)&global_logical_expert_loads_cpu, num_global_logical_experts * sizeof(int)));
+    // Create pre-allocated reroute solver
+    reroute_solver_ = std::make_unique<solver::RerouteSolver>(num_global_logical_experts,
+                                                              num_global_physical_experts,
+                                                              runtime::num_ranks  // max_replicas_dim = num_ranks
+    );
 
     // Ready to use (no IPC handle exchange needed with NVSHMEM)
     _available = true;
@@ -194,6 +199,15 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& expert_loads)
     auto [p2l_ptr, l2p_ptr, lcnts_ptr] = get_placement_map_ptrs(layer_id);
 
     placement_solver_->solve(expert_loads_ptr, p2l_ptr, l2p_ptr, lcnts_ptr);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> Manager::reroute(const int& layer_id,
+                                                                         torch::Tensor& routing_map) {
+    EP_HOST_ASSERT(is_available());
+    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
+
+    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = get_placement_map_ptrs(layer_id);
+    return reroute_solver_->solve(routing_map, l2p_ptr, lcnts_ptr);
 }
 
 std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_map_ptrs(const int& layer_id) const {

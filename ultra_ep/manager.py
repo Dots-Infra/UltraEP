@@ -5,6 +5,7 @@ from typing import List, Optional
 import ultra_ep._C as _C
 from .runtime import init_runtime
 from .event import EventHandle
+from .reroute import _RerouteProbsFunction
 
 
 class Manager:
@@ -203,6 +204,68 @@ class Manager:
         """
         assert layer_id < self.num_alloc_layers
         self.runtime.update_placement(layer_id, expert_loads)
+
+    def reroute(
+        self,
+        layer_id: int,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        is_train: bool = True,
+    ):
+        """
+        Expand routing from logical experts to physical experts using deterministic
+        round-robin dispatch.
+
+        For each logical expert l with C_l = lcnts[l] physical instances,
+        the k-th token (by global token index) routed to l is dispatched to
+        physical expert l2p[l, k % C_l].
+
+        Args:
+            layer_id: The MoE layer index to reroute.
+            probs: [num_tokens, num_logical_experts] float tensor, routing probabilities.
+            routing_map: [num_tokens, num_logical_experts] bool tensor, logical routing map.
+            is_train: If True and probs.requires_grad, use autograd for backward.
+                      If False (inference), skip autograd for lower overhead.
+        Returns:
+            expanded_probs: [num_tokens, num_physical_experts] float tensor, expanded probabilities.
+            expanded_routing_map: [num_tokens, num_physical_experts] bool tensor, physical routing map.
+        """
+        num_tokens = routing_map.size(0)
+        num_global_physical = self.num_global_physical_experts
+        token_indices, logical_indices, physical_indices = self.runtime.reroute(
+            layer_id, routing_map
+        )
+
+        # Construct expanded_routing_map on the same device as routing_map
+        expanded_routing_map = torch.zeros(
+            num_tokens, num_global_physical, dtype=torch.bool, device=routing_map.device
+        )
+        if token_indices.numel() > 0:
+            expanded_routing_map[token_indices, physical_indices] = True
+
+        # Construct expanded_probs with appropriate gradient handling
+        if is_train and probs.requires_grad:
+            expanded_probs = _RerouteProbsFunction.apply(
+                probs,
+                token_indices,
+                logical_indices,
+                physical_indices,
+                num_global_physical,
+            )
+        else:
+            # Inference path: no autograd overhead
+            expanded_probs = torch.zeros(
+                num_tokens,
+                num_global_physical,
+                dtype=probs.dtype,
+                device=routing_map.device,
+            )
+            if token_indices.numel() > 0:
+                expanded_probs[token_indices, physical_indices] = probs[
+                    token_indices, logical_indices
+                ]
+
+        return expanded_probs, expanded_routing_map
 
     def check_tensors_blob_from_cpp(self):
         assert (

@@ -3,7 +3,10 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <tuple>
 #include <vector>
+
+#include "../utils/exception.cuh"
 
 namespace ultra_ep::solver {
 
@@ -82,6 +85,59 @@ private:
     mutable std::vector<uint8_t> expert_on_rank_;
 };
 
+/**
+ * RerouteSolver: expands a logical routing map to a physical routing map using
+ * deterministic round-robin dispatch.
+ *
+ * For each logical expert l with C_l = lcnts[l] physical instances (1 master +
+ * replicas), all tokens routed to l are numbered in global token-index order.
+ * The k-th token is assigned to physical expert l2p[l, k % C_l].
+ *
+ * This produces a bijective mapping from each active (token, logical_expert) pair
+ * to a unique (token, physical_expert) pair.  The mapping is represented as three
+ * parallel index arrays (token_indices, logical_indices, physical_indices) of
+ * length N (number of active routing pairs).
+ *
+ * Design rationale (CPU-side computation):
+ *   - routing_map.nonzero() runs on GPU (CUB-optimised), yielding a compact [N, 2]
+ *     index tensor that is D2H-copied (~128 KB for T=4096, topk=2).
+ *   - The round-robin assignment is a single sequential O(N) scan with per-expert
+ *     counters — ideal for CPU cache and branch prediction.
+ *   - l2p and lcnts already reside on CPU (pinned); no extra copy needed.
+ *   - Result index arrays (~192 KB) are H2D-copied back to GPU.
+ *   - Total memcpy ≈ 300 KB, latency ≈ tens of microseconds.
+ *
+ * Deterministic: identical inputs → identical outputs, regardless of GPU timing.
+ * Thread-safe: solve() is logically const (internal buffers are mutable scratch).
+ */
+class RerouteSolver {
+public:
+    RerouteSolver(int num_global_logical_experts, int num_global_physical_experts, int max_replicas_dim);
+
+    /**
+     * Compute the round-robin reroute mapping.
+     *
+     * @param routing_map  [num_tokens, num_logical] bool – logical routing map (CPU or GPU)
+     * @param l2p          [num_logical, max_replicas] int32 – logical-to-physical map (CPU)
+     * @param lcnts        [num_logical] int32 – per-expert replica counts (CPU)
+     *
+     * @return (token_indices, logical_indices, physical_indices)
+     *         each [N] int64, on the same device as routing_map.
+     *         N = total number of active (token, logical_expert) pairs.
+     */
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> solve(const torch::Tensor& routing_map,
+                                                                  const int32_t* __restrict__ l2p_map,
+                                                                  const int32_t* __restrict__ lcnts) const;
+
+private:
+    int num_logical_;
+    int num_physical_;
+    int max_replicas_;
+
+    // Pre-allocated per-expert counters, reused across solve() calls.
+    mutable std::vector<int32_t> counters_;
+};
+
 inline void register_apis(pybind11::module_& m) {
     pybind11::class_<PlacementSolver>(m, "PlacementSolver")
         .def(pybind11::init<int, int, int, int, int, int>())
@@ -95,6 +151,22 @@ inline void register_apis(pybind11::module_& m) {
                             p2l_map.data<int32_t>(),
                             l2p_map.data<int32_t>(),
                             lcnts.data<int32_t>());
+             });
+
+    pybind11::class_<RerouteSolver>(m, "RerouteSolver")
+        .def(pybind11::init<int, int, int>())
+        .def("solve",
+             [](const RerouteSolver& self,
+                const torch::Tensor& routing_map,
+                torch::Tensor& l2p_map,
+                torch::Tensor& lcnts) {
+                 EP_HOST_ASSERT(l2p_map.device().is_cpu());
+                 EP_HOST_ASSERT(lcnts.device().is_cpu());
+                 EP_HOST_ASSERT(l2p_map.is_contiguous());
+                 EP_HOST_ASSERT(lcnts.is_contiguous());
+                 EP_HOST_ASSERT(l2p_map.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(lcnts.dtype() == torch::kInt32);
+                 return self.solve(routing_map, l2p_map.data<int32_t>(), lcnts.data<int32_t>());
              });
 }
 

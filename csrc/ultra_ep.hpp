@@ -100,8 +100,9 @@ class Manager {
     kernels::WeightSyncTask* _weight_sync_tasks_gpu = nullptr;
     // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
 
-    // Pre-allocated placement solver (zero-alloc on hot path)
+    // Solvers
     std::unique_ptr<solver::PlacementSolver> placement_solver_;
+    std::unique_ptr<solver::RerouteSolver> reroute_solver_;
     // CPU buffer for global logical expert loads
     int* global_logical_expert_loads_cpu = nullptr;
 
@@ -142,6 +143,14 @@ public:
     // Runs entirely on CPU. Deterministic across all ranks.
     void update_placement(const int& layer_id, torch::Tensor& expert_loads);
 
+    // Expand logical routing map to physical routing map.
+    // routing_map: [num_tokens, num_logical_experts], bool, logical routing map.
+    // Returns:
+    // - token_indices: [num_tokens], int64, token indices in the expanded routing map.
+    // - logical_indices: [num_tokens], int64, logical expert indices in the expanded routing map.
+    // - physical_indices: [num_tokens], int64, physical expert indices in the expanded routing map.
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> reroute(const int& layer_id, torch::Tensor& routing_map);
+
     torch::Stream get_comm_stream() const { return comm_stream; }
 
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
@@ -160,6 +169,7 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("update_placement", &Manager::update_placement)
+        .def("reroute", &Manager::reroute)
         .def("grad_reduce", &Manager::grad_reduce)
         .def("weight_sync", &Manager::weight_sync)
         .def("get_comm_stream", &Manager::get_comm_stream)
