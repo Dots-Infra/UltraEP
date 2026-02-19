@@ -47,9 +47,101 @@ Example:
     - logical_replica_counts: [1, 2, 1, 2]
 */
 struct GlobalExpertPlacement {
+    // CPU tensor views (strided views into cpu_buffer)
     torch::Tensor physical_to_logical_map;
     torch::Tensor logical_to_physical_map;
     torch::Tensor logical_replica_counts;
+
+    // GPU tensor views (strided views into gpu_buffer)
+    torch::Tensor physical_to_logical_map_gpu;
+    torch::Tensor logical_to_physical_map_gpu;
+    torch::Tensor logical_replica_counts_gpu;
+
+    // Contiguous per-layer buffer management.
+    // Layout per layer: [p2l (P) | l2p (L*R) | lcnts (L)] with padding to alignment.
+    // Cross-layer stride is per_layer_stride_numel (may be > per_layer_data_numel for alignment).
+    int32_t* cpu_buffer = nullptr;  // pinned host memory
+    int32_t* gpu_buffer = nullptr;  // device memory
+
+    int num_layers_ = 0;
+    int p2l_numel = 0;               // = num_global_physical_experts
+    int l2p_numel = 0;               // = num_global_logical_experts * max_replicas_dim
+    int lcnts_numel = 0;             // = num_global_logical_experts
+    int per_layer_data_numel = 0;    // = p2l + l2p + lcnts
+    int per_layer_stride_numel = 0;  // aligned stride (in int32 elements)
+    int per_layer_data_bytes = 0;
+    int per_layer_stride_bytes = 0;
+    int total_bytes = 0;
+
+    // Alignment for DMA transfers (256 bytes works well for PCIe/NVLink)
+    static constexpr int ALIGNMENT_BYTES = 256;
+
+    // Initialize contiguous buffers and create tensor views.
+    void init(int num_layers,
+              int num_global_physical_experts,
+              int num_global_logical_experts,
+              int max_replicas_dim,
+              int device_id);
+
+    // Free contiguous buffers. Safe to call multiple times.
+    void cleanup();
+
+    // Copy placement data from CPU to GPU for one layer (layer_id >= 0) or all layers (layer_id == -1).
+    // Uses the given CUDA stream (or current stream if not specified).
+    void to_gpu(const int layer_id = -1,
+                const bool async = true,
+                std::optional<at::cuda::CUDAStream> stream = std::nullopt) const;
+
+    // Raw pointer access for a specific layer.
+    std::tuple<int32_t*, int32_t*, int32_t*> get_cpu_ptrs(int layer_id) const;
+    std::tuple<int32_t*, int32_t*, int32_t*> get_gpu_ptrs(int layer_id) const;
+};
+
+// Pre-allocated CUDA output buffers for reroute (lazy init).
+// NOTE: forward buffer is layer-independent in training to ensure correctness.
+//       Backward buffer can be reused across layers (layers process sequentially).
+class RerouteOutputBuffer {
+    bool is_train_;
+    int num_layers_;
+    int num_global_logical_experts_;
+    int num_global_physical_experts_;
+    // FWD: [num_layers, T, P] (train), [T, P] (inference)
+    torch::Tensor reroute_expand_probs_buf_;  // probs dtype
+    // FWD: [num_layers, T, P] (train), [T, P] (inference)
+    torch::Tensor reroute_expand_rmap_buf_;  // bool
+    // BWD: [T, L] (only for train, shared across layers)
+    torch::Tensor reroute_grad_probs_buf_;  // probs dtype
+    // Flags: track if each layer is zero-filled
+    std::vector<bool> reroute_layer_valid_flags_;  // train
+    bool reroute_inf_valid_flag_ = false;
+    bool reroute_bwd_valid_flag_ = false;
+    // Sizes:
+    size_t reroute_expand_probs_nbytes_per_layer_ = 0;
+    size_t reroute_expand_rmap_nbytes_per_layer_ = 0;
+
+public:
+    RerouteOutputBuffer(const int num_layers,
+                        const int num_global_logical_experts,
+                        const int num_global_physical_experts,
+                        const bool is_train);
+    std::tuple<void*, bool*> get_or_create_fwd_bufs(const int num_tokens,
+                                                    const int layer_id,
+                                                    const torch::ScalarType probs_dtype);
+    void* get_or_create_bwd_buf(const int num_tokens, const torch::ScalarType probs_dtype);
+    void zero_out_fwd_bufs(const int layer_id, at::cuda::CUDAStream& stream);
+    void zero_out_bwd_buf(at::cuda::CUDAStream& stream);
+    bool get_fwd_valid_flag(const int layer_id) {
+        return is_train_ ? reroute_layer_valid_flags_[layer_id] : reroute_inf_valid_flag_;
+    };
+    void set_fwd_valid_flag(const int layer_id, bool valid) {
+        if (is_train_) {
+            reroute_layer_valid_flags_[layer_id] = valid;
+        } else {
+            reroute_inf_valid_flag_ = valid;
+        }
+    };
+    bool get_bwd_valid_flag() { return reroute_bwd_valid_flag_; };
+    void set_bwd_valid_flag(bool valid) { reroute_bwd_valid_flag_ = valid; };
 };
 
 class Manager {
@@ -62,6 +154,7 @@ class Manager {
     int64_t expert_total_numel;
     int num_global_physical_experts;
     int num_global_logical_experts;
+    bool is_train;
 
     // Placement (on CPU)
     GlobalExpertPlacement placement;
@@ -73,8 +166,9 @@ class Manager {
     bool explicitly_destroy;
     bool destroyed = false;
 
-    // CUDA stream for communication
+    // CUDA streams
     at::cuda::CUDAStream comm_stream;
+    at::cuda::CUDAStream memset_stream;
 
     // Device-side local replica weight (bf16)/grad (fp32) buffers, shared by layers
     // Allocated via NVSHMEM symmetric heap for cross-GPU access
@@ -106,12 +200,16 @@ class Manager {
     // CPU buffer for global logical expert loads
     int* global_logical_expert_loads_cpu = nullptr;
 
+    // Reroute output buffer management
+    std::unique_ptr<RerouteOutputBuffer> reroute_output_buffer_;
+
 public:
     Manager(const int& num_layers,
             const int& num_local_master_experts,
             const int& num_local_redundant_experts,
             const int64_t& expert_fc1_numel,
             const int64_t& expert_fc2_numel,
+            const bool& is_train,
             const bool& explicitly_destroy);
     ~Manager() noexcept(false);
     void destroy();
@@ -143,13 +241,27 @@ public:
     // Runs entirely on CPU. Deterministic across all ranks.
     void update_placement(const int& layer_id, torch::Tensor& expert_loads);
 
-    // Expand logical routing map to physical routing map.
+    // Expand logical routing map to physical routing map (CPU path).
     // routing_map: [num_tokens, num_logical_experts], bool, logical routing map.
     // Returns:
     // - token_indices: [num_tokens], int64, token indices in the expanded routing map.
     // - logical_indices: [num_tokens], int64, logical expert indices in the expanded routing map.
     // - physical_indices: [num_tokens], int64, physical expert indices in the expanded routing map.
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> reroute(const int& layer_id, torch::Tensor& routing_map);
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> reroute_cpu(const int& layer_id,
+                                                                        torch::Tensor& routing_map);
+
+    // CUDA reroute with pre-allocated output buffers (Manager owns the memory).
+    // Buffers are lazily created on first use and reused across layers.
+    // Each call returns fresh from_blob views (independent version counters).
+    // Forward:  zeros + reroute kernel → (expanded_probs, expanded_routing_map)
+    // Backward: zeros + backward kernel → grad_probs
+    std::tuple<torch::Tensor, torch::Tensor> reroute_cuda_forward(const int& layer_id,
+                                                                  torch::Tensor& probs,
+                                                                  torch::Tensor& routing_map);
+
+    torch::Tensor reroute_cuda_backward(const int& layer_id,
+                                        torch::Tensor& grad_expanded_probs,
+                                        torch::Tensor& routing_map);
 
     torch::Stream get_comm_stream() const { return comm_stream; }
 
@@ -158,18 +270,17 @@ public:
     torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
     torch::Tensor get_logical_to_physical_map_tensor() const { return placement.logical_to_physical_map; }
     torch::Tensor get_logical_replica_counts_tensor() const { return placement.logical_replica_counts; }
-
-private:
-    std::tuple<int32_t*, int32_t*, int32_t*> get_placement_map_ptrs(const int& layer_id) const;
 };
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<Manager>(m, "Manager")
-        .def(pybind11::init<int, int, int, int64_t, int64_t, bool>())
+        .def(pybind11::init<int, int, int, int64_t, int64_t, bool, bool>())
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("update_placement", &Manager::update_placement)
-        .def("reroute", &Manager::reroute)
+        .def("reroute_cpu", &Manager::reroute_cpu)
+        .def("reroute_cuda_forward", &Manager::reroute_cuda_forward)
+        .def("reroute_cuda_backward", &Manager::reroute_cuda_backward)
         .def("grad_reduce", &Manager::grad_reduce)
         .def("weight_sync", &Manager::weight_sync)
         .def("get_comm_stream", &Manager::get_comm_stream)

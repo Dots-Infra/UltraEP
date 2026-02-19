@@ -5,7 +5,7 @@ from typing import List, Optional
 import ultra_ep._C as _C
 from .runtime import init_runtime
 from .event import EventHandle
-from .reroute import _RerouteProbsFunction
+from .reroute import _RerouteProbsFunction, _RerouteCUDAFunction
 
 
 class Manager:
@@ -17,6 +17,7 @@ class Manager:
         num_local_redundant_experts: int,
         expert_fc1_numel: int,
         expert_fc2_numel: int,
+        is_train: bool = True,
         explicitly_destroy: bool = False,
     ):
         # Initialize global nvshmem runtime (if not initialized)
@@ -40,6 +41,7 @@ class Manager:
             self.num_local_physical_experts * self.num_ranks
         )
         self.num_global_logical_experts = num_local_master_experts * self.num_ranks
+        self.is_train = is_train
 
         # Pre-configured during model construction
         # Shape: num_layers x [num_local_master_experts,]
@@ -59,6 +61,7 @@ class Manager:
             num_local_redundant_experts,
             expert_fc1_numel,
             expert_fc2_numel,
+            is_train,
             explicitly_destroy,
         )
         assert self.runtime.is_available()
@@ -175,14 +178,15 @@ class Manager:
             self.local_master_fc1_weight_pool[layer_id] is not None
             and self.local_master_fc2_weight_pool[layer_id] is not None
         )
-        event = self.runtime.weight_sync(
-            layer_id,
-            self.local_master_fc1_weight_pool[layer_id],
-            self.local_master_fc2_weight_pool[layer_id],
-            getattr(previous_event, "event", None),
-            async_finish,
-        )
-        return EventHandle(event)
+        with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
+            event = self.runtime.weight_sync(
+                layer_id,
+                self.local_master_fc1_weight_pool[layer_id],
+                self.local_master_fc2_weight_pool[layer_id],
+                getattr(previous_event, "event", None),
+                async_finish,
+            )
+            return EventHandle(event)
 
     def update_placement(self, layer_id: int, expert_loads: torch.Tensor):
         """
@@ -203,14 +207,15 @@ class Manager:
                           Can be on CPU or GPU (will be moved to CPU internally).
         """
         assert layer_id < self.num_alloc_layers
-        self.runtime.update_placement(layer_id, expert_loads)
+        with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
+            self.runtime.update_placement(layer_id, expert_loads)
 
     def reroute(
         self,
         layer_id: int,
         probs: torch.Tensor,
         routing_map: torch.Tensor,
-        is_train: bool = True,
+        backend: str = "cuda",
     ):
         """
         Expand routing from logical experts to physical experts using deterministic
@@ -220,19 +225,35 @@ class Manager:
         the k-th token (by global token index) routed to l is dispatched to
         physical expert l2p[l, k % C_l].
 
+        Two paths are available (selected by backend):
+          - CPU path: C++ RerouteSolver computes index arrays, Python scatters.
+          - CUDA path: fused GPU kernel avoids all H2D/D2H transfers.
+
         Args:
             layer_id: The MoE layer index to reroute.
             probs: [num_tokens, num_logical_experts] float tensor, routing probabilities.
             routing_map: [num_tokens, num_logical_experts] bool tensor, logical routing map.
-            is_train: If True and probs.requires_grad, use autograd for backward.
-                      If False (inference), skip autograd for lower overhead.
         Returns:
             expanded_probs: [num_tokens, num_physical_experts] float tensor, expanded probabilities.
             expanded_routing_map: [num_tokens, num_physical_experts] bool tensor, physical routing map.
         """
+        if backend == "cuda":
+            return self._reroute_cuda(layer_id, probs, routing_map)
+        elif backend == "cpu":
+            return self._reroute_cpu(layer_id, probs, routing_map)
+        else:
+            raise ValueError(f"Invalid backend: {backend}")
+
+    def _reroute_cpu(
+        self,
+        layer_id: int,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+    ):
+        """CPU path: C++ RerouteSolver + Python index scatter/gather."""
         num_tokens = routing_map.size(0)
         num_global_physical = self.num_global_physical_experts
-        token_indices, logical_indices, physical_indices = self.runtime.reroute(
+        token_indices, logical_indices, physical_indices = self.runtime.reroute_cpu(
             layer_id, routing_map
         )
 
@@ -244,7 +265,7 @@ class Manager:
             expanded_routing_map[token_indices, physical_indices] = True
 
         # Construct expanded_probs with appropriate gradient handling
-        if is_train and probs.requires_grad:
+        if self.is_train and probs.requires_grad:
             expanded_probs = _RerouteProbsFunction.apply(
                 probs,
                 token_indices,
@@ -264,6 +285,29 @@ class Manager:
                 expanded_probs[token_indices, physical_indices] = probs[
                     token_indices, logical_indices
                 ]
+
+        return expanded_probs, expanded_routing_map
+
+    def _reroute_cuda(
+        self,
+        layer_id: int,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+    ):
+        """CUDA path: fused GPU kernel for reroute with pre-allocated buffers."""
+        if self.is_train and probs.requires_grad:
+            expanded_probs, expanded_routing_map = _RerouteCUDAFunction.apply(
+                probs,
+                routing_map,
+                self.runtime,
+                layer_id,
+            )
+        else:
+            # Inference path: direct Manager call, no autograd overhead
+            with torch.cuda.nvtx.range(f"Reroute CUDA forward (layer {layer_id})"):
+                expanded_probs, expanded_routing_map = (
+                    self.runtime.reroute_cuda_forward(layer_id, probs, routing_map)
+                )
 
         return expanded_probs, expanded_routing_map
 

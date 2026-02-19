@@ -2,6 +2,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
+
+#include <tuple>
 
 #include "../config.hpp"
 
@@ -65,5 +68,60 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                      const int total_tasks,
                      cudaStream_t stream,
                      const int num_device_sms);
+
+// ============================================================================
+// Reroute: Expand logical routing map to physical routing map (CUDA path)
+// ============================================================================
+
+// Forward: scatter probs from [T,L] logical to [T,P] physical space,
+//          and construct expanded_routing_map [T,P] bool.
+// Uses deterministic round-robin: for each expert l with C_l replicas,
+// the k-th token (in ascending token order) maps to l2p[l, k % C_l].
+//
+// Parameters:
+//   routing_map:           [T, L] bool, device
+//   probs:                 [T, L] scalar_t (float/bf16), device
+//   l2p_map:               [L, max_replicas] int32, device (this layer's slice)
+//   lcnts:                 [L] int32, device (this layer's slice)
+//   expanded_routing_map:  [T, P] bool, device, output (must be zero-initialized)
+//   expanded_probs:        [T, P] scalar_t, device, output (must be zero-initialized)
+//   T, L, P, max_replicas: dimensions
+//   stream: CUDA stream
+void run_reroute_forward(const bool* routing_map,
+                         const void* probs,
+                         const int32_t* l2p_map,
+                         const int32_t* lcnts,
+                         bool* expanded_routing_map,
+                         void* expanded_probs,
+                         int T,
+                         int L,
+                         int P,
+                         int max_replicas,
+                         at::ScalarType dtype,
+                         cudaStream_t stream);
+
+// Backward: gather gradients from [T,P] physical back to [T,L] logical space.
+// Recomputes the same round-robin mapping as forward, then:
+//   grad_probs[t, l] = grad_expanded_probs[t, phys]
+//
+// Parameters:
+//   grad_expanded_probs:  [T, P] scalar_t, device
+//   routing_map:          [T, L] bool, device (saved from forward)
+//   l2p_map:              [L, max_replicas] int32, device
+//   lcnts:                [L] int32, device
+//   grad_probs:           [T, L] scalar_t, device, output (must be zero-initialized)
+//   T, L, P, max_replicas: dimensions
+//   stream: CUDA stream
+void run_reroute_backward(const void* grad_expanded_probs,
+                          const bool* routing_map,
+                          const int32_t* l2p_map,
+                          const int32_t* lcnts,
+                          void* grad_probs,
+                          int T,
+                          int L,
+                          int P,
+                          int max_replicas,
+                          at::ScalarType dtype,
+                          cudaStream_t stream);
 
 }  // namespace ultra_ep::kernels

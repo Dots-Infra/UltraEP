@@ -6,11 +6,15 @@ Reroute method maps a logical routing map
 [num_tokens, num_global_physical_experts], distributing tokens across replicas
 in a deterministic round-robin fashion.
 
-The heavy-lifting (round-robin index computation) is done by the C++ RerouteSolver.
-This module adds the torch.autograd.Function wrapper so that gradients flow
-correctly through the probability tensor during training.
+Two implementations are provided:
+  1. CPU path (_RerouteProbsFunction):
+     The C++ RerouteSolver computes index arrays on CPU, transfers them to GPU,
+     and Python index operations scatter/gather the probabilities.
+  2. CUDA path (_RerouteCUDAFunction):
+     A fused CUDA kernel performs the round-robin assignment and probability
+     scatter in a single GPU launch, avoiding all H2D/D2H transfers.
 
-Gradient flow:
+Gradient flow (both paths):
   Forward:  expanded_probs[t, phys] = probs[t, logical]   (scatter)
   Backward: grad_probs[t, logical]  = grad_out[t, phys]    (gather)
   The mapping between (t, logical) and (t, phys) is a 1-to-1 bijection
@@ -22,7 +26,7 @@ import torch
 
 class _RerouteProbsFunction(torch.autograd.Function):
     """
-    Custom autograd function for scattering probabilities from logical to physical
+    CPU-path autograd function for scattering probabilities from logical to physical
     expert space, and gathering gradients back.
 
     The mapping (token_idx, logical_idx) <-> (token_idx, physical_idx) is pre-computed
@@ -78,3 +82,64 @@ class _RerouteProbsFunction(torch.autograd.Function):
             grad_probs[token_idx, logical_idx] = grad_output[token_idx, physical_idx]
 
         return grad_probs, None, None, None, None
+
+
+class _RerouteCUDAFunction(torch.autograd.Function):
+    """
+    CUDA-path autograd function for reroute with pre-allocated output buffers.
+
+    The C++ Manager owns the output buffers and returns fresh ``from_blob``
+    views (independent version counters) each call.  This eliminates the
+    CUDA allocator overhead and memset launch latency visible in nsys.
+
+    Forward buffer reuse across layers is correct when activation
+    checkpointing is enabled (``moe_layer_recompute=True``), which is the
+    standard MoE training configuration.  Backward buffer reuse is always
+    correct because autograd processes layers sequentially in reverse.
+
+    Non-differentiable arguments are stored as plain ctx attributes (not via
+    ``save_for_backward``) to avoid version-counter issues from in-place
+    updates to the shared placement buffer.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        probs: torch.Tensor,  # [T, L] float, requires_grad
+        routing_map: torch.Tensor,  # [T, L] bool
+        manager_runtime,  # _C.Manager (pybind11 object)
+        layer_id: int,
+    ):
+        """
+        Forward: scatter probs and construct expanded_routing_map via CUDA kernel
+        using pre-allocated Manager buffers.
+
+        Returns:
+            expanded_probs: [T, P] float (differentiable)
+            expanded_routing_map: [T, P] bool (non-differentiable)
+        """
+        expanded_probs, expanded_routing_map = manager_runtime.reroute_cuda_forward(
+            layer_id, probs, routing_map
+        )
+
+        ctx.mark_non_differentiable(expanded_routing_map)
+
+        # Save for backward (plain attributes — avoids version-counter checks)
+        ctx.manager_runtime = manager_runtime
+        ctx.routing_map = routing_map
+        ctx.layer_id = layer_id
+
+        return expanded_probs, expanded_routing_map
+
+    @staticmethod
+    def backward(ctx, grad_expanded_probs: torch.Tensor, grad_expanded_routing_map):
+        """
+        Backward: gather gradients from physical to logical space via CUDA kernel
+        using pre-allocated Manager buffers.
+        """
+        grad_probs = ctx.manager_runtime.reroute_cuda_backward(
+            ctx.layer_id,
+            grad_expanded_probs,
+            ctx.routing_map,
+        )
+        return grad_probs, None, None, None
