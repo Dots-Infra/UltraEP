@@ -312,6 +312,9 @@ Manager::Manager(const int& num_layers,
                                                                   runtime::num_nvl_ranks,
                                                                   runtime::num_ranks  // max_replicas_dim = num_ranks
     );
+    // Allocate global logical expert load buffer
+    global_logical_expert_loads_gpu =
+        reinterpret_cast<int*>(nvshmem::alloc(num_global_logical_experts * sizeof(int), NVSHMEM_ALIGNMENT));
     CUDA_RUNTIME_CHECK(
         cudaMallocHost((void**)&global_logical_expert_loads_cpu, num_global_logical_experts * sizeof(int)));
     // Create pre-allocated reroute solver
@@ -348,6 +351,7 @@ void Manager::destroy() {
     // No need to close remote handles - nvshmem_ptr pointers are automatically invalidated
     nvshmem::free(local_replica_weight_buffer);
     nvshmem::free(local_replica_grad_buffer);
+    nvshmem::free(global_logical_expert_loads_gpu);
     local_replica_weight_buffer = nullptr;
     local_replica_grad_buffer = nullptr;
 
@@ -387,27 +391,37 @@ void Manager::destroy() {
     _available = false;
 }
 
-void Manager::update_placement(const int& layer_id, torch::Tensor& expert_loads) {
+void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) {
     EP_HOST_ASSERT(is_available());
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
-    EP_HOST_ASSERT(expert_loads.dim() == 1 && expert_loads.size(0) == num_global_logical_experts &&
-                   expert_loads.dtype() == torch::kInt32);
+    EP_HOST_ASSERT(routing_map.dim() == 2 && routing_map.size(1) == num_global_logical_experts &&
+                   routing_map.dtype() == torch::kBool);
+
+    auto curr_stream = at::cuda::getCurrentCUDAStream();
+
+    kernels::rmap_local_sum_and_allreduce(routing_map.size(0),
+                                          num_global_logical_experts,
+                                          routing_map.data_ptr<bool>(),
+                                          global_logical_expert_loads_gpu,
+                                          curr_stream.stream());
+
+    // Copy global logical expert loads from GPU to CPU
+    // Must use current stream to ensure data readiness
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(global_logical_expert_loads_cpu,
+                                       global_logical_expert_loads_gpu,
+                                       num_global_logical_experts * sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       curr_stream.stream()));
+
     // Zero-out reroute buffer in advance for overlapping
     reroute_output_buffer_->zero_out_fwd_bufs(layer_id, memset_stream);
 
-    int* expert_loads_ptr = nullptr;
-    if (expert_loads.is_cuda()) {
-        CUDA_RUNTIME_CHECK(cudaMemcpy(global_logical_expert_loads_cpu,
-                                      expert_loads.data<int32_t>(),
-                                      num_global_logical_experts * sizeof(int),
-                                      cudaMemcpyDeviceToHost));
-        expert_loads_ptr = global_logical_expert_loads_cpu;
-    } else {
-        expert_loads_ptr = expert_loads.data<int32_t>();
-    }
     auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
 
-    placement_solver_->solve(expert_loads_ptr, p2l_ptr, l2p_ptr, lcnts_ptr);
+    // Ensure data readiness for CPU-side placement solver
+    CUDA_RUNTIME_CHECK(cudaStreamSynchronize(curr_stream.stream()));
+
+    placement_solver_->solve(global_logical_expert_loads_cpu, p2l_ptr, l2p_ptr, lcnts_ptr);
 
     // Move placement to GPU for later use
     placement.to_gpu(layer_id);

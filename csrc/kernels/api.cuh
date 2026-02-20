@@ -124,4 +124,10 @@ void run_reroute_backward(const void* grad_expanded_probs,
                           at::ScalarType dtype,
                           cudaStream_t stream);
 
+void rmap_local_sum_and_allreduce(int num_tokens,                  // T
+                                  int num_global_logical_experts,  // L
+                                  const bool* routing_map_ptr,     // [T, L] bool
+                                  int32_t* expert_loads_ptr,       // [L] int32, alloc by nvshmem
+                                  cudaStream_t stream);
+
 }  // namespace ultra_ep::kernels

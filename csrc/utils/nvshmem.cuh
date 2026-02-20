@@ -93,4 +93,8 @@ inline void finalize() {
     nvshmem_finalize();
 }
 
+inline void int32_allreduce(int32_t* ptr, size_t nelems, cudaStream_t stream) {
+    EP_HOST_ASSERT(nvshmemx_int32_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, ptr, ptr, nelems, stream) == 0);
+}
+
 }  // namespace ultra_ep::nvshmem

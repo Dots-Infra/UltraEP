@@ -188,7 +188,12 @@ class Manager:
             )
             return EventHandle(event)
 
-    def update_placement(self, layer_id: int, expert_loads: torch.Tensor):
+    def update_placement(
+        self,
+        layer_id: int,
+        routing_map: torch.Tensor,
+        verify_reduced_loads: bool = False,
+    ):
         """
         Update expert placement for a single layer based on real-time load statistics.
 
@@ -202,13 +207,18 @@ class Manager:
 
         Args:
             layer_id: The MoE layer index to update.
-            expert_loads: 1-D int32 tensor of shape [num_global_logical_experts],
-                          token counts (or any load metric) per logical expert.
-                          Can be on CPU or GPU (will be moved to CPU internally).
+            routing_map: [num_tokens, num_global_logical_experts] bool tensor, logical routing map.
         """
         assert layer_id < self.num_alloc_layers
         with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
-            self.runtime.update_placement(layer_id, expert_loads)
+            self.runtime.update_placement(layer_id, routing_map)
+        if verify_reduced_loads:
+            global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
+            dist.all_reduce(global_logical_expert_loads, group=self.group)
+            assert torch.equal(
+                global_logical_expert_loads,
+                self.runtime.get_global_logical_expert_loads_tensor(),
+            )
 
     def reroute(
         self,

@@ -193,12 +193,14 @@ class Manager {
     kernels::WeightSyncTask* _weight_sync_tasks_cpu = nullptr;
     kernels::WeightSyncTask* _weight_sync_tasks_gpu = nullptr;
     // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
+    int* _task_tile_offsets_cpu = nullptr;
 
     // Solvers
     std::unique_ptr<solver::PlacementSolver> placement_solver_;
     std::unique_ptr<solver::RerouteSolver> reroute_solver_;
-    // CPU buffer for global logical expert loads
-    int* global_logical_expert_loads_cpu = nullptr;
+    // Shape: [num_global_logical_experts]
+    int* global_logical_expert_loads_cpu = nullptr;  // pinned memory for CPU-side placement solver
+    int* global_logical_expert_loads_gpu = nullptr;  // alloc by nvshmem for allreduce
 
     // Reroute output buffer management
     std::unique_ptr<RerouteOutputBuffer> reroute_output_buffer_;
@@ -237,9 +239,9 @@ public:
                                            bool async);
 
     // Update expert placement for a single layer based on real-time load statistics.
-    // expert_loads: [num_global_logical_experts], int32 token counts per logical expert.
+    // routing_map: [num_tokens, num_global_logical_experts], bool, logical routing map.
     // Runs entirely on CPU. Deterministic across all ranks.
-    void update_placement(const int& layer_id, torch::Tensor& expert_loads);
+    void update_placement(const int& layer_id, torch::Tensor& routing_map);
 
     // Expand logical routing map to physical routing map (CPU path).
     // routing_map: [num_tokens, num_logical_experts], bool, logical routing map.
@@ -270,6 +272,12 @@ public:
     torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
     torch::Tensor get_logical_to_physical_map_tensor() const { return placement.logical_to_physical_map; }
     torch::Tensor get_logical_replica_counts_tensor() const { return placement.logical_replica_counts; }
+    torch::Tensor get_global_logical_expert_loads_tensor() const {
+        return make_tensor_from_buffer(global_logical_expert_loads_gpu,
+                                       {num_global_logical_experts},
+                                       torch::kInt32,
+                                       torch::Device(torch::kCUDA, runtime::device_id));
+    };
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -288,7 +296,8 @@ static void register_apis(pybind11::module_& m) {
         .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)
         .def("get_physical_to_logical_map_tensor", &Manager::get_physical_to_logical_map_tensor)
         .def("get_logical_to_physical_map_tensor", &Manager::get_logical_to_physical_map_tensor)
-        .def("get_logical_replica_counts_tensor", &Manager::get_logical_replica_counts_tensor);
+        .def("get_logical_replica_counts_tensor", &Manager::get_logical_replica_counts_tensor)
+        .def("get_global_logical_expert_loads_tensor", &Manager::get_global_logical_expert_loads_tensor);
 }
 
 }  // namespace ultra_ep

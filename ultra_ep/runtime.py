@@ -19,6 +19,8 @@ def init_runtime(group: dist.ProcessGroup):
     os.environ["NVSHMEM_DISABLE_NVLS"] = "1"
     # NOTES: NVSHMEM initialization requires at least 256 MiB
     os.environ["NVSHMEM_CUMEM_GRANULARITY"] = f"{2 ** 29}"
+    # Use primitive NVSHMEM for low-latency expert load all-reduce
+    os.environ["NVSHMEM_DISABLE_NCCL"] = "1"
 
     # Synchronize NVSHMEM unique IDs
     root_unique_id = None

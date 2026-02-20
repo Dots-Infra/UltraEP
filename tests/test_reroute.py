@@ -71,12 +71,11 @@ def generate_routing_map(T, L, topk, device="cuda"):
     return routing_map
 
 
-def update_placement_with_random_loads(mgr, layer_id):
-    """Run update_placement with random loads (all-reduced across ranks)."""
+def update_placement_with_random_loads(mgr, layer_id, T, topk):
+    """Run update_placement with random routing map."""
     L = mgr.num_global_logical_experts
-    loads = torch.randint(100, 10000, (L,), dtype=torch.int32, device="cuda")
-    dist.all_reduce(loads, group=mgr.group)
-    mgr.update_placement(layer_id, loads)
+    routing_map = generate_routing_map(T, L, topk)
+    mgr.update_placement(layer_id, routing_map, verify_reduced_loads=True)
 
 
 # ============================================================================
@@ -96,7 +95,7 @@ def test_forward_correctness(mgr, layer_id, T, topk, verbose=False):
     num_trials = 3
     for trial in range(num_trials):
         torch.manual_seed(trial * 1000 + dist.get_rank())
-        update_placement_with_random_loads(mgr, layer_id)
+        update_placement_with_random_loads(mgr, layer_id, T, topk)
 
         routing_map = generate_routing_map(T, L, topk)
         probs = torch.randn(T, L, dtype=torch.float32, device="cuda")
@@ -138,7 +137,7 @@ def test_backward_correctness(mgr, layer_id, T, topk):
     L = mgr.num_global_logical_experts
 
     torch.manual_seed(7 + dist.get_rank())
-    update_placement_with_random_loads(mgr, layer_id)
+    update_placement_with_random_loads(mgr, layer_id, T, topk)
 
     routing_map = generate_routing_map(T, L, topk)
 
@@ -187,7 +186,7 @@ def test_edge_cases(mgr, layer_id):
     print_rank0(f"{'='*60}")
 
     L = mgr.num_global_logical_experts
-    update_placement_with_random_loads(mgr, layer_id)
+    update_placement_with_random_loads(mgr, layer_id, T=8192, topk=8)
 
     # Case 1: all-zero routing map (no tokens routed)
     routing_map = torch.zeros(16, L, dtype=torch.bool, device="cuda")
@@ -241,7 +240,7 @@ def bench_latency(mgr, layer_id, T, topk, num_warmup=50, num_iters=200):
     P = mgr.num_global_physical_experts
 
     torch.manual_seed(42 + dist.get_rank())
-    update_placement_with_random_loads(mgr, layer_id)
+    update_placement_with_random_loads(mgr, layer_id, T, topk)
     routing_map = generate_routing_map(T, L, topk)
     probs = torch.randn(T, L, dtype=torch.float32, device="cuda")
 
