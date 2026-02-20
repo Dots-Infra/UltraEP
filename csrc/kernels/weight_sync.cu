@@ -193,6 +193,7 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                      WeightSyncTask* weight_sync_tasks_gpu,
                      int* global_tile_counter_gpu,
                      int* task_tile_offsets_gpu,
+                     int* task_tile_offsets_cpu,
                      const int total_tasks,
                      cudaStream_t stream,
                      const int num_device_sms) {
@@ -200,13 +201,12 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
         return;
 
     // Compute tile offsets on CPU (prefix sum of tile counts per task)
-    std::vector<int> task_tile_offsets(total_tasks + 1);
-    task_tile_offsets[0] = 0;
+    task_tile_offsets_cpu[0] = 0;
     for (int i = 0; i < total_tasks; ++i) {
         int num_tiles = (weight_sync_tasks_cpu[i].numel + WEIGHT_SYNC_TILE_ELEMENTS - 1) / WEIGHT_SYNC_TILE_ELEMENTS;
-        task_tile_offsets[i + 1] = task_tile_offsets[i] + num_tiles;
+        task_tile_offsets_cpu[i + 1] = task_tile_offsets_cpu[i] + num_tiles;
     }
-    int total_tiles = task_tile_offsets[total_tasks];
+    int total_tiles = task_tile_offsets_cpu[total_tasks];
 
     // Copy tasks and tile offsets from CPU to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(weight_sync_tasks_gpu,
@@ -214,11 +214,8 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                                        total_tasks * sizeof(WeightSyncTask),
                                        cudaMemcpyHostToDevice,
                                        stream));
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(task_tile_offsets_gpu,
-                                       task_tile_offsets.data(),
-                                       (total_tasks + 1) * sizeof(int),
-                                       cudaMemcpyHostToDevice,
-                                       stream));
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+        task_tile_offsets_gpu, task_tile_offsets_cpu, (total_tasks + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
 
     // Configure kernel launch

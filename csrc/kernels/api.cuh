@@ -58,6 +58,7 @@ struct WeightSyncTask {
 //   weight_sync_tasks_gpu: Device-side buffer for tasks
 //   global_tile_counter_gpu: Device-side atomic counter for tile distribution
 //   task_tile_offsets_gpu: Device-side buffer for prefix sum of tile counts
+//   task_tile_offsets_cpu: Host-side buffer for prefix sum of tile counts
 //   total_tasks: Number of broadcast tasks
 //   stream: CUDA stream for async execution
 //   num_device_sms: Number of SMs on the device
@@ -65,6 +66,7 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                      WeightSyncTask* weight_sync_tasks_gpu,
                      int* global_tile_counter_gpu,
                      int* task_tile_offsets_gpu,
+                     int* task_tile_offsets_cpu,
                      const int total_tasks,
                      cudaStream_t stream,
                      const int num_device_sms);

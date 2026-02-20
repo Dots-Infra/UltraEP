@@ -296,6 +296,7 @@ Manager::Manager(const int& num_layers,
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_global_task_or_tile_counter_gpu, sizeof(int)));
     // +1 for the final offset (total tile count)
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_tile_offsets_gpu, (MAX_GRAD_REDUCE_TASK_NUM + 1) * sizeof(int)));
+    CUDA_RUNTIME_CHECK(cudaMallocHost((void**)&_task_tile_offsets_cpu, 3 * num_local_master_experts * sizeof(int)));
 
     // Allocate intermediate buffers for weight sync tasks
     // For weight sync, each local master expert creates one broadcast task
@@ -366,10 +367,12 @@ void Manager::destroy() {
     CUDA_RUNTIME_CHECK(cudaFree(_grad_reduce_tasks_gpu));
     CUDA_RUNTIME_CHECK(cudaFree(_global_task_or_tile_counter_gpu));
     CUDA_RUNTIME_CHECK(cudaFree(_task_tile_offsets_gpu));
+    CUDA_RUNTIME_CHECK(cudaFreeHost(_task_tile_offsets_cpu));
     _grad_reduce_tasks_cpu = nullptr;
     _grad_reduce_tasks_gpu = nullptr;
     _global_task_or_tile_counter_gpu = nullptr;
     _task_tile_offsets_gpu = nullptr;
+    _task_tile_offsets_cpu = nullptr;
 
     // Free weight sync buffers
     CUDA_RUNTIME_CHECK(cudaFreeHost(_weight_sync_tasks_cpu));
@@ -710,12 +713,15 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         }
         return event;
     }
+    // Ensure the task tile offsets buffer is large enough
+    EP_HOST_ASSERT(num_tasks + 1 < 3 * num_local_master_experts);
 
     // Call device-side kernel
     kernels::run_weight_sync(_weight_sync_tasks_cpu,
                              _weight_sync_tasks_gpu,
                              _global_task_or_tile_counter_gpu,
                              _task_tile_offsets_gpu,
+                             _task_tile_offsets_cpu,
                              num_tasks,
                              comm_stream,
                              runtime::num_device_sms);
