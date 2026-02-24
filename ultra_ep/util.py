@@ -14,6 +14,13 @@ def print_rank_k(message, rank):
         print(message, flush=True)
 
 
+def get_max_by_mean(load_tensor):
+    load_tensor = load_tensor.float()
+    max_load = load_tensor.max().item()
+    mean_load = load_tensor.mean().item()
+    return max_load / mean_load if mean_load > 0 else 1.0
+
+
 def setup_placement_random(
     num_ranks: int,
     num_local_master: int,

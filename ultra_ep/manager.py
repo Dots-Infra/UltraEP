@@ -1,11 +1,14 @@
+import os
 import torch
 import torch.distributed as dist
 from typing import List, Optional
+from datetime import datetime
 
 import ultra_ep._C as _C
 from .runtime import init_runtime
 from .event import EventHandle
 from .reroute import _RerouteProbsFunction, _RerouteCUDAFunction
+from .util import get_max_by_mean
 
 
 class Manager:
@@ -19,6 +22,7 @@ class Manager:
         expert_fc2_numel: int,
         is_train: bool = True,
         explicitly_destroy: bool = False,
+        log_expert_loads: bool = False,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -52,6 +56,17 @@ class Manager:
         self.local_master_fc2_weight_pool = [None] * self.num_alloc_layers
         self.local_master_fc1_grad_pool = [None] * self.num_alloc_layers
         self.local_master_fc2_grad_pool = [None] * self.num_alloc_layers
+
+        # Expert loads logging
+        self.log_expert_loads = log_expert_loads
+        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.ep_loads_save_dir = os.environ.get(
+            "EP_LOADS_SAVE_DIR", "/var/log/ep_loads"
+        )
+        os.makedirs(self.ep_loads_save_dir, exist_ok=True)
+        self.ep_log_path = os.path.join(
+            self.ep_loads_save_dir, f"ep_loads_{now_str}.log"
+        )
 
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
@@ -247,12 +262,43 @@ class Manager:
             expanded_probs: [num_tokens, num_physical_experts] float tensor, expanded probabilities.
             expanded_routing_map: [num_tokens, num_physical_experts] bool tensor, physical routing map.
         """
+        if self.log_expert_loads:
+            orig_log_expert_loads, balanced_phys_expert_loads = None, None
+            orig_log_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
+            dist.all_reduce(orig_log_expert_loads, group=self.group)
+            curr_phy2log = self.physical_to_logical_map[layer_id].clone().cpu()
+
         if backend == "cuda":
-            return self._reroute_cuda(layer_id, probs, routing_map)
+            expanded_probs, expanded_routing_map = self._reroute_cuda(
+                layer_id, probs, routing_map
+            )
         elif backend == "cpu":
-            return self._reroute_cpu(layer_id, probs, routing_map)
+            expanded_probs, expanded_routing_map = self._reroute_cpu(
+                layer_id, probs, routing_map
+            )
         else:
             raise ValueError(f"Invalid backend: {backend}")
+
+        if self.log_expert_loads:
+            balanced_phys_expert_loads = expanded_routing_map.sum(
+                dim=0, dtype=torch.int32
+            )
+            dist.all_reduce(balanced_phys_expert_loads, group=self.group)
+
+            if self.rank == 0:
+                mask = curr_phy2log != -1  # filter empty slots for physical experts
+                balanced_phys_expert_loads = balanced_phys_expert_loads.cpu()[mask]
+
+                orig_imbalance = get_max_by_mean(orig_log_expert_loads.cpu())
+                balanced_imbalance = get_max_by_mean(balanced_phys_expert_loads)
+                with open(self.ep_log_path, "a") as f:
+                    f.write(
+                        f"Layer {layer_id}: Orig max/mean load: {orig_imbalance:.2f}, "
+                        f"Balanced max/mean load: {balanced_imbalance:.2f}, "
+                        f"Improvement: {orig_imbalance / balanced_imbalance:.2f}x\n"
+                    )
+
+        return expanded_probs, expanded_routing_map
 
     def _reroute_cpu(
         self,
