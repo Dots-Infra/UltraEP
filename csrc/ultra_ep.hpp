@@ -111,6 +111,8 @@ class RerouteOutputBuffer {
     torch::Tensor reroute_expand_rmap_buf_;  // bool
     // BWD: [T, L] (only for train, shared across layers)
     torch::Tensor reroute_grad_probs_buf_;  // probs dtype
+    // FWD scratch: [L, max_num_tiles] int32 — tile counts for two-pass forward
+    torch::Tensor reroute_tile_counts_buf_;
     // Flags: track if each layer is zero-filled
     std::vector<bool> reroute_layer_valid_flags_;  // train
     bool reroute_inf_valid_flag_ = false;
@@ -128,6 +130,7 @@ public:
                                                     const int layer_id,
                                                     const torch::ScalarType probs_dtype);
     void* get_or_create_bwd_buf(const int num_tokens, const torch::ScalarType probs_dtype);
+    int32_t* get_or_create_tile_counts(const int L, const int num_tiles);
     void zero_out_fwd_bufs(const int layer_id, at::cuda::CUDAStream& stream);
     void zero_out_bwd_buf(at::cuda::CUDAStream& stream);
     bool get_fwd_valid_flag(const int layer_id) {
@@ -142,6 +145,10 @@ public:
     };
     bool get_bwd_valid_flag() { return reroute_bwd_valid_flag_; };
     void set_bwd_valid_flag(bool valid) { reroute_bwd_valid_flag_ = valid; };
+
+    // Retrieve forward's expanded_routing_map pointer for use in backward.
+    // The buffer persists from forward to backward within the same training iteration.
+    const bool* get_fwd_expanded_rmap_ptr(const int layer_id) const;
 };
 
 class Manager {

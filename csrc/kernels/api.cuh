@@ -75,10 +75,9 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
 // Reroute: Expand logical routing map to physical routing map (CUDA path)
 // ============================================================================
 
-// Forward: scatter probs from [T,L] logical to [T,P] physical space,
-//          and construct expanded_routing_map [T,P] bool.
-// Uses deterministic round-robin: for each expert l with C_l replicas,
-// the k-th token (in ascending token order) maps to l2p[l, k % C_l].
+// Forward (two-pass): scatter probs from [T,L] logical to [T,P] physical space.
+// Pass 1 counts active tokens per (expert, tile), pass 2 uses prefix sums for
+// deterministic round-robin scatter.  Grid: ceil(L/8) × ceil(T/128) blocks.
 //
 // Parameters:
 //   routing_map:           [T, L] bool, device
@@ -87,6 +86,7 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
 //   lcnts:                 [L] int32, device (this layer's slice)
 //   expanded_routing_map:  [T, P] bool, device, output (must be zero-initialized)
 //   expanded_probs:        [T, P] scalar_t, device, output (must be zero-initialized)
+//   tile_counts:           [L, num_tiles] int32, device, scratch buffer
 //   T, L, P, max_replicas: dimensions
 //   stream: CUDA stream
 void run_reroute_forward(const bool* routing_map,
@@ -95,6 +95,7 @@ void run_reroute_forward(const bool* routing_map,
                          const int32_t* lcnts,
                          bool* expanded_routing_map,
                          void* expanded_probs,
+                         int32_t* tile_counts,
                          int T,
                          int L,
                          int P,
@@ -102,20 +103,23 @@ void run_reroute_forward(const bool* routing_map,
                          at::ScalarType dtype,
                          cudaStream_t stream);
 
-// Backward: gather gradients from [T,P] physical back to [T,L] logical space.
-// Recomputes the same round-robin mapping as forward, then:
-//   grad_probs[t, l] = grad_expanded_probs[t, phys]
+// Backward (row-parallel gather): gather gradients from [T,P] physical to [T,L] logical.
+// Each thread handles one (t, l) pair.  For active pairs, searches the forward's
+// expanded_routing_map to find the assigned physical replica, then gathers the gradient.
+// Eliminates the serial round-robin recomputation from the old backward kernel.
 //
 // Parameters:
-//   grad_expanded_probs:  [T, P] scalar_t, device
-//   routing_map:          [T, L] bool, device (saved from forward)
-//   l2p_map:              [L, max_replicas] int32, device
-//   lcnts:                [L] int32, device
-//   grad_probs:           [T, L] scalar_t, device, output (must be zero-initialized)
+//   grad_expanded_probs:   [T, P] scalar_t, device
+//   routing_map:           [T, L] bool, device (saved from forward)
+//   expanded_routing_map:  [T, P] bool, device (produced by forward, same layer)
+//   l2p_map:               [L, max_replicas] int32, device
+//   lcnts:                 [L] int32, device
+//   grad_probs:            [T, L] scalar_t, device, output (must be zero-initialized)
 //   T, L, P, max_replicas: dimensions
 //   stream: CUDA stream
 void run_reroute_backward(const void* grad_expanded_probs,
                           const bool* routing_map,
+                          const bool* expanded_routing_map,
                           const int32_t* l2p_map,
                           const int32_t* lcnts,
                           void* grad_probs,

@@ -208,6 +208,26 @@ void RerouteOutputBuffer::zero_out_bwd_buf(at::cuda::CUDAStream& stream) {
         reroute_bwd_valid_flag_ = true;
     }
 }
+
+int32_t* RerouteOutputBuffer::get_or_create_tile_counts(const int L, const int num_tiles) {
+    int64_t needed = static_cast<int64_t>(L) * num_tiles;
+    if (!reroute_tile_counts_buf_.defined() || reroute_tile_counts_buf_.numel() < needed) {
+        reroute_tile_counts_buf_ =
+            torch::empty({needed}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    }
+    return reroute_tile_counts_buf_.data_ptr<int32_t>();
+}
+
+const bool* RerouteOutputBuffer::get_fwd_expanded_rmap_ptr(const int layer_id) const {
+    EP_HOST_ASSERT(reroute_expand_rmap_buf_.defined());
+    if (is_train_) {
+        EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
+        return reinterpret_cast<const bool*>(reinterpret_cast<const int8_t*>(reroute_expand_rmap_buf_.data_ptr()) +
+                                             layer_id * reroute_expand_rmap_nbytes_per_layer_);
+    } else {
+        return reinterpret_cast<const bool*>(reroute_expand_rmap_buf_.data_ptr());
+    }
+}
 // ============================================================================
 // Manager
 // ============================================================================
@@ -473,12 +493,17 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
     reroute_output_buffer_->set_fwd_valid_flag(layer_id, false);
 
     if (T > 0 && L > 0) {
+        constexpr int TILE_T = REROUTE_FWD_TILE_T;
+        const int num_tiles = (T + TILE_T - 1) / TILE_T;
+        int32_t* tile_counts_ptr = reroute_output_buffer_->get_or_create_tile_counts(L, num_tiles);
+
         kernels::run_reroute_forward(routing_map.data_ptr<bool>(),
                                      probs.data_ptr(),
                                      l2p_gpu,
                                      lcnts_gpu,
                                      expand_rmap_ptr,
                                      expand_probs_ptr,
+                                     tile_counts_ptr,
                                      T,
                                      L,
                                      P,
@@ -523,9 +548,13 @@ torch::Tensor Manager::reroute_cuda_backward(const int& layer_id,
 
     auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
 
+    // Retrieve forward's expanded_routing_map for the row-parallel backward gather.
+    const bool* fwd_expanded_rmap = reroute_output_buffer_->get_fwd_expanded_rmap_ptr(layer_id);
+
     if (T > 0 && L > 0) {
         kernels::run_reroute_backward(grad_expanded_probs.data_ptr(),
                                       routing_map.data_ptr<bool>(),
+                                      fwd_expanded_rmap,
                                       l2p_gpu,
                                       lcnts_gpu,
                                       bwd_buf_ptr,

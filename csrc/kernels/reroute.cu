@@ -1,17 +1,18 @@
 /**
- * CUDA kernels for reroute: expand logical routing map to physical routing map.
+ * Optimized CUDA kernels for reroute: expand logical routing map to physical routing map.
  *
- * Algorithm (per logical expert, one warp per expert):
- *   1. Cooperative load: transpose a tile of routing_map[tile:tile+TILE_T, block_experts]
- *      from global memory into shared memory for bank-conflict-free column access.
- *   2. Warp scan: each warp processes its expert column in groups of 32 tokens using
- *      __ballot_sync / __popc for a warp-level prefix sum that gives each active token
- *      its deterministic round-robin rank.
- *   3. Scatter (forward) or gather (backward): use the rank to compute the physical
- *      expert index via l2p_map[expert, rank % C], then read/write probs.
+ * Forward (two-pass, deterministic round-robin):
+ *   Pass 1 — Count: each warp counts active tokens for one (expert, tile) pair
+ *            using __ballot_sync / __popc.  Fully parallel across all (expert, tile) pairs.
+ *   Pass 2 — Scatter: each warp computes its base rank via warp-parallel prefix-sum of
+ *            tile_counts, then scatters probs to the physical expert determined by
+ *            l2p_map[expert, rank % C].  Fully parallel.
  *
- * The mapping is deterministic: tokens are processed in ascending index order per expert,
- * and the round-robin counter increments monotonically.
+ * Backward (row-parallel gather):
+ *   Each thread handles one (token, expert) pair.  For active pairs, it searches the
+ *   forward's expanded_routing_map to find which physical replica was assigned, then
+ *   gathers the gradient.  This eliminates the serial round-robin recomputation entirely.
+ *   For typical replica counts (1–4), the search is 1–4 iterations.
  */
 
 #include <ATen/cuda/CUDAContext.h>
@@ -25,152 +26,136 @@
 namespace ultra_ep::kernels {
 
 // ============================================================================
-// Forward kernel: scatter probs from [T,L] logical to [T,P] physical space
+// Forward pass 1: count active tokens per (expert, tile)
 // ============================================================================
-template <typename scalar_t, int TILE_T, int WARPS_PER_BLOCK, int SMEM_PAD>
-__global__ void reroute_forward_kernel(const bool* __restrict__ routing_map,
-                                       const scalar_t* __restrict__ probs,
-                                       const int32_t* __restrict__ l2p_map,
-                                       const int32_t* __restrict__ lcnts,
-                                       bool* __restrict__ expanded_routing_map,
-                                       scalar_t* __restrict__ expanded_probs,
-                                       const int T,
-                                       const int L,
-                                       const int P,
-                                       const int max_replicas) {
-    // Transposed SMEM tile: smem[expert_in_block][token_in_tile + PAD]
-    // PAD eliminates bank conflicts: with bool (1B) and 32 banks of 4B,
-    // stride = TILE_T + PAD avoids all-same-bank access patterns.
-    constexpr int SMEM_STRIDE = TILE_T + SMEM_PAD;
-    __shared__ bool smem_routing[WARPS_PER_BLOCK][SMEM_STRIDE];
+template <int TILE_T, int WARPS_PER_BLOCK>
+__global__ void reroute_forward_count_kernel(const bool* __restrict__ routing_map,
+                                             int32_t* __restrict__ tile_counts,
+                                             const int T,
+                                             const int L,
+                                             const int num_tiles) {
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int expert_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int tile_id = blockIdx.y;
 
-    const int warp_id = threadIdx.x >> 5;  // threadIdx.x / 32
-    const int lane = threadIdx.x & 31;     // threadIdx.x % 32
-    const int block_expert_base = blockIdx.x * WARPS_PER_BLOCK;
-    const int expert_id = block_expert_base + warp_id;
-    const bool warp_active = (expert_id < L);
+    if (expert_id >= L)
+        return;
 
-    // Load per-expert constants into registers
-    int C = 0;
-    int counter = 0;
-    if (warp_active) {
-        C = lcnts[expert_id];
+    const int tile_start = tile_id * TILE_T;
+    const int tile_end = min(tile_start + TILE_T, T);
+    int count = 0;
+
+    for (int offset = tile_start; offset < tile_end; offset += 32) {
+        const int t = offset + lane;
+        const bool active = (t < tile_end) && routing_map[t * L + expert_id];
+        const unsigned ballot = __ballot_sync(0xFFFFFFFF, active);
+        if (lane == 0)
+            count += __popc(ballot);
     }
 
-    // Number of active experts in this block (for cooperative load bounds)
-    const int num_experts_this_block = min(WARPS_PER_BLOCK, L - block_expert_base);
-
-    // Process tokens in tiles
-    for (int tile_start = 0; tile_start < T; tile_start += TILE_T) {
-        const int tile_T = min(TILE_T, T - tile_start);
-
-        // Cooperative load: all threads in the block load the routing_map tile
-        // and transpose it into SMEM for bank-conflict-free column reads.
-        // Iterate over TILE_T * WARPS_PER_BLOCK slots (power-of-2 for fast index math);
-        // the bounds check skips padding slots for the last block / last tile.
-        for (int i = threadIdx.x; i < TILE_T * WARPS_PER_BLOCK; i += blockDim.x) {
-            const int local_e = i & (WARPS_PER_BLOCK - 1);  // i % WARPS_PER_BLOCK
-            const int local_t = i >> 3;                     // i / WARPS_PER_BLOCK (=8)
-            if (local_e < num_experts_this_block && local_t < tile_T) {
-                smem_routing[local_e][local_t] = routing_map[(tile_start + local_t) * L + block_expert_base + local_e];
-            }
-        }
-        __syncthreads();
-
-        // Warp scan: each warp processes its expert column
-        if (warp_active) {
-            for (int offset = 0; offset < tile_T; offset += 32) {
-                const int local_t = offset + lane;
-                const int global_t = tile_start + local_t;
-                const bool active = (local_t < tile_T) ? smem_routing[warp_id][local_t] : false;
-
-                // Warp-level prefix sum using ballot + population count
-                const unsigned ballot = __ballot_sync(0xFFFFFFFF, active);
-                const int preceding = __popc(ballot & ((1u << lane) - 1));
-                const int total_active = __popc(ballot);
-                const int my_rank = counter + preceding;
-
-                if (active && global_t < T) {
-                    const int replica_idx = my_rank % C;
-                    const int phys = l2p_map[expert_id * max_replicas + replica_idx];
-                    expanded_routing_map[global_t * P + phys] = true;
-                    expanded_probs[global_t * P + phys] = probs[global_t * L + expert_id];
-                }
-
-                counter += total_active;
-            }
-        }
-
-        __syncthreads();  // ensure SMEM is safe to overwrite for next tile
+    if (lane == 0) {
+        tile_counts[expert_id * num_tiles + tile_id] = count;
     }
 }
 
 // ============================================================================
-// Backward kernel: gather gradients from [T,P] physical to [T,L] logical
+// Forward pass 2: prefix-sum of tile counts + scatter
 // ============================================================================
-template <typename scalar_t, int TILE_T, int WARPS_PER_BLOCK, int SMEM_PAD>
-__global__ void reroute_backward_kernel(const scalar_t* __restrict__ grad_expanded_probs,
-                                        const bool* __restrict__ routing_map,
-                                        const int32_t* __restrict__ l2p_map,
-                                        const int32_t* __restrict__ lcnts,
-                                        scalar_t* __restrict__ grad_probs,
-                                        const int T,
-                                        const int L,
-                                        const int P,
-                                        const int max_replicas) {
-    constexpr int SMEM_STRIDE = TILE_T + SMEM_PAD;
-    __shared__ bool smem_routing[WARPS_PER_BLOCK][SMEM_STRIDE];
-
+template <typename scalar_t, int TILE_T, int WARPS_PER_BLOCK>
+__global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_map,
+                                               const scalar_t* __restrict__ probs,
+                                               const int32_t* __restrict__ l2p_map,
+                                               const int32_t* __restrict__ lcnts,
+                                               const int32_t* __restrict__ tile_counts,
+                                               bool* __restrict__ expanded_routing_map,
+                                               scalar_t* __restrict__ expanded_probs,
+                                               const int T,
+                                               const int L,
+                                               const int P,
+                                               const int max_replicas,
+                                               const int num_tiles) {
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int block_expert_base = blockIdx.x * WARPS_PER_BLOCK;
-    const int expert_id = block_expert_base + warp_id;
-    const bool warp_active = (expert_id < L);
+    const int expert_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int tile_id = blockIdx.y;
 
-    int C = 0;
-    int counter = 0;
-    if (warp_active) {
-        C = lcnts[expert_id];
+    if (expert_id >= L)
+        return;
+
+    const int C = lcnts[expert_id];
+
+    // Warp-parallel prefix-sum: sum tile_counts[expert][0..tile_id-1] to get base_rank.
+    // Each round loads 32 values via coalesced warp read and reduces with shuffles.
+    int base_rank = 0;
+    const int32_t* my_tile_counts = tile_counts + expert_id * num_tiles;
+    for (int base = 0; base < tile_id; base += 32) {
+        const int idx = base + lane;
+        int val = (idx < tile_id) ? my_tile_counts[idx] : 0;
+// Warp-level sum reduction
+#pragma unroll
+        for (int s = 16; s > 0; s >>= 1) {
+            val += __shfl_down_sync(0xFFFFFFFF, val, s);
+        }
+        if (lane == 0)
+            base_rank += val;
     }
+    base_rank = __shfl_sync(0xFFFFFFFF, base_rank, 0);
 
-    const int num_experts_this_block = min(WARPS_PER_BLOCK, L - block_expert_base);
+    int counter = base_rank;
+    const int tile_start = tile_id * TILE_T;
+    const int tile_end = min(tile_start + TILE_T, T);
 
-    for (int tile_start = 0; tile_start < T; tile_start += TILE_T) {
-        const int tile_T = min(TILE_T, T - tile_start);
+    for (int offset = tile_start; offset < tile_end; offset += 32) {
+        const int t = offset + lane;
+        const bool active = (t < tile_end) && routing_map[t * L + expert_id];
 
-        // Cooperative load of routing_map tile (same as forward)
-        for (int i = threadIdx.x; i < TILE_T * WARPS_PER_BLOCK; i += blockDim.x) {
-            const int local_e = i & (WARPS_PER_BLOCK - 1);
-            const int local_t = i >> 3;
-            if (local_e < num_experts_this_block && local_t < tile_T) {
-                smem_routing[local_e][local_t] = routing_map[(tile_start + local_t) * L + block_expert_base + local_e];
-            }
-        }
-        __syncthreads();
+        const unsigned ballot = __ballot_sync(0xFFFFFFFF, active);
+        const int preceding = __popc(ballot & ((1u << lane) - 1));
+        const int total_active = __popc(ballot);
+        const int my_rank = counter + preceding;
 
-        if (warp_active) {
-            for (int offset = 0; offset < tile_T; offset += 32) {
-                const int local_t = offset + lane;
-                const int global_t = tile_start + local_t;
-                const bool active = (local_t < tile_T) ? smem_routing[warp_id][local_t] : false;
-
-                const unsigned ballot = __ballot_sync(0xFFFFFFFF, active);
-                const int preceding = __popc(ballot & ((1u << lane) - 1));
-                const int total_active = __popc(ballot);
-                const int my_rank = counter + preceding;
-
-                if (active && global_t < T) {
-                    const int replica_idx = my_rank % C;
-                    const int phys = l2p_map[expert_id * max_replicas + replica_idx];
-                    // Gather: grad_probs[t, logical] = grad_expanded_probs[t, physical]
-                    grad_probs[global_t * L + expert_id] = grad_expanded_probs[global_t * P + phys];
-                }
-
-                counter += total_active;
-            }
+        if (active) {
+            const int replica_idx = my_rank % C;
+            const int phys = l2p_map[expert_id * max_replicas + replica_idx];
+            expanded_routing_map[t * P + phys] = true;
+            expanded_probs[t * P + phys] = probs[t * L + expert_id];
         }
 
-        __syncthreads();
+        counter += total_active;
+    }
+}
+
+// ============================================================================
+// Backward kernel: row-parallel gather using expanded_routing_map lookup
+// ============================================================================
+template <typename scalar_t>
+__global__ void reroute_backward_gather_kernel(const scalar_t* __restrict__ grad_expanded_probs,
+                                               const bool* __restrict__ routing_map,
+                                               const bool* __restrict__ expanded_routing_map,
+                                               const int32_t* __restrict__ l2p_map,
+                                               const int32_t* __restrict__ lcnts,
+                                               scalar_t* __restrict__ grad_probs,
+                                               const int T,
+                                               const int L,
+                                               const int P,
+                                               const int max_replicas) {
+    const int t = blockIdx.x * blockDim.y + threadIdx.y;
+    const int l = blockIdx.y * blockDim.x + threadIdx.x;
+
+    if (t >= T || l >= L)
+        return;
+
+    const int idx = t * L + l;
+    if (routing_map[idx]) {
+        const int C = lcnts[l];
+        for (int r = 0; r < C; ++r) {
+            const int phys = l2p_map[l * max_replicas + r];
+            if (expanded_routing_map[t * P + phys]) {
+                grad_probs[idx] = grad_expanded_probs[t * P + phys];
+                break;
+            }
+        }
     }
 }
 
@@ -184,6 +169,7 @@ void run_reroute_forward(const bool* routing_map,
                          const int32_t* lcnts,
                          bool* expanded_routing_map,
                          void* expanded_probs,
+                         int32_t* tile_counts,
                          int T,
                          int L,
                          int P,
@@ -193,50 +179,61 @@ void run_reroute_forward(const bool* routing_map,
     if (T == 0 || L == 0)
         return;
 
-    const int num_blocks = (L + REROUTE_WARPS_PER_BLOCK - 1) / REROUTE_WARPS_PER_BLOCK;
-    dim3 grid(num_blocks);
-    dim3 block(REROUTE_THREADS_PER_BLOCK);
+    constexpr int TILE_T = REROUTE_FWD_TILE_T;
+    constexpr int WPB = REROUTE_FWD_WARPS_PER_BLOCK;
+    constexpr int TPB = REROUTE_FWD_THREADS_PER_BLOCK;
 
-    // Kernel uses static __shared__ memory; no dynamic SMEM needed.
-    // Static SMEM per block: WARPS_PER_BLOCK * (TILE_T + PAD) bytes ≈ 2 KB.
+    const int num_tiles = (T + TILE_T - 1) / TILE_T;
+    const int num_expert_blocks = (L + WPB - 1) / WPB;
+    dim3 grid(num_expert_blocks, num_tiles);
+    dim3 block(TPB);
 
-    // Dispatch on scalar type
+    // Pass 1: count active tokens per (expert, tile)
+    reroute_forward_count_kernel<TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map, tile_counts, T, L, num_tiles);
+
+    // Pass 2: prefix-sum + scatter (type-dispatched)
     if (dtype == at::ScalarType::Float) {
-        reroute_forward_kernel<float, REROUTE_TILE_T, REROUTE_WARPS_PER_BLOCK, REROUTE_SMEM_PAD>
+        reroute_forward_scatter_kernel<float, TILE_T, WPB>
             <<<grid, block, 0, stream>>>(routing_map,
                                          static_cast<const float*>(probs),
                                          l2p_map,
                                          lcnts,
+                                         tile_counts,
                                          expanded_routing_map,
                                          static_cast<float*>(expanded_probs),
                                          T,
                                          L,
                                          P,
-                                         max_replicas);
+                                         max_replicas,
+                                         num_tiles);
     } else if (dtype == at::ScalarType::BFloat16) {
-        reroute_forward_kernel<__nv_bfloat16, REROUTE_TILE_T, REROUTE_WARPS_PER_BLOCK, REROUTE_SMEM_PAD>
+        reroute_forward_scatter_kernel<__nv_bfloat16, TILE_T, WPB>
             <<<grid, block, 0, stream>>>(routing_map,
                                          static_cast<const __nv_bfloat16*>(probs),
                                          l2p_map,
                                          lcnts,
+                                         tile_counts,
                                          expanded_routing_map,
                                          static_cast<__nv_bfloat16*>(expanded_probs),
                                          T,
                                          L,
                                          P,
-                                         max_replicas);
+                                         max_replicas,
+                                         num_tiles);
     } else if (dtype == at::ScalarType::Half) {
-        reroute_forward_kernel<__half, REROUTE_TILE_T, REROUTE_WARPS_PER_BLOCK, REROUTE_SMEM_PAD>
+        reroute_forward_scatter_kernel<__half, TILE_T, WPB>
             <<<grid, block, 0, stream>>>(routing_map,
                                          static_cast<const __half*>(probs),
                                          l2p_map,
                                          lcnts,
+                                         tile_counts,
                                          expanded_routing_map,
                                          static_cast<__half*>(expanded_probs),
                                          T,
                                          L,
                                          P,
-                                         max_replicas);
+                                         max_replicas,
+                                         num_tiles);
     } else {
         EP_HOST_ASSERT(false && "Unsupported dtype for reroute_cuda_forward");
     }
@@ -244,6 +241,7 @@ void run_reroute_forward(const bool* routing_map,
 
 void run_reroute_backward(const void* grad_expanded_probs,
                           const bool* routing_map,
+                          const bool* expanded_routing_map,
                           const int32_t* l2p_map,
                           const int32_t* lcnts,
                           void* grad_probs,
@@ -256,14 +254,17 @@ void run_reroute_backward(const void* grad_expanded_probs,
     if (T == 0 || L == 0)
         return;
 
-    const int num_blocks = (L + REROUTE_WARPS_PER_BLOCK - 1) / REROUTE_WARPS_PER_BLOCK;
-    dim3 grid(num_blocks);
-    dim3 block(REROUTE_THREADS_PER_BLOCK);
+    // 2D block: x = expert dimension (up to 256), y = rows per block
+    const int block_x = min(L, 256);
+    const int block_y = min(REROUTE_BWD_ROWS_PER_BLOCK, 1024 / block_x);
+    dim3 block(block_x, block_y);
+    dim3 grid((T + block_y - 1) / block_y, (L + block_x - 1) / block_x);
 
     if (dtype == at::ScalarType::Float) {
-        reroute_backward_kernel<float, REROUTE_TILE_T, REROUTE_WARPS_PER_BLOCK, REROUTE_SMEM_PAD>
+        reroute_backward_gather_kernel<float>
             <<<grid, block, 0, stream>>>(static_cast<const float*>(grad_expanded_probs),
                                          routing_map,
+                                         expanded_routing_map,
                                          l2p_map,
                                          lcnts,
                                          static_cast<float*>(grad_probs),
@@ -272,9 +273,10 @@ void run_reroute_backward(const void* grad_expanded_probs,
                                          P,
                                          max_replicas);
     } else if (dtype == at::ScalarType::BFloat16) {
-        reroute_backward_kernel<__nv_bfloat16, REROUTE_TILE_T, REROUTE_WARPS_PER_BLOCK, REROUTE_SMEM_PAD>
+        reroute_backward_gather_kernel<__nv_bfloat16>
             <<<grid, block, 0, stream>>>(static_cast<const __nv_bfloat16*>(grad_expanded_probs),
                                          routing_map,
+                                         expanded_routing_map,
                                          l2p_map,
                                          lcnts,
                                          static_cast<__nv_bfloat16*>(grad_probs),
@@ -283,9 +285,10 @@ void run_reroute_backward(const void* grad_expanded_probs,
                                          P,
                                          max_replicas);
     } else if (dtype == at::ScalarType::Half) {
-        reroute_backward_kernel<__half, REROUTE_TILE_T, REROUTE_WARPS_PER_BLOCK, REROUTE_SMEM_PAD>
+        reroute_backward_gather_kernel<__half>
             <<<grid, block, 0, stream>>>(static_cast<const __half*>(grad_expanded_probs),
                                          routing_map,
+                                         expanded_routing_map,
                                          l2p_map,
                                          lcnts,
                                          static_cast<__half*>(grad_probs),

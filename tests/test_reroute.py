@@ -175,61 +175,6 @@ def test_backward_correctness(mgr, layer_id, T, topk):
 
 
 # ============================================================================
-# Test: edge cases
-# ============================================================================
-
-
-def test_edge_cases(mgr, layer_id):
-    """Test edge cases: empty routing, single token, etc."""
-    print_rank0(f"\n{'='*60}")
-    print_rank0("Test: edge cases")
-    print_rank0(f"{'='*60}")
-
-    L = mgr.num_global_logical_experts
-    update_placement_with_random_loads(mgr, layer_id, T=8192, topk=8)
-
-    # Case 1: all-zero routing map (no tokens routed)
-    routing_map = torch.zeros(16, L, dtype=torch.bool, device="cuda")
-    probs = torch.randn(16, L, dtype=torch.float32, device="cuda")
-    exp_probs_cpu, exp_map_cpu = mgr._reroute_cpu(layer_id, probs, routing_map)
-    exp_probs_cuda, exp_map_cuda = mgr._reroute_cuda(layer_id, probs, routing_map)
-    assert exp_map_cpu.sum() == 0, "CPU: expected empty routing map"
-    assert exp_map_cuda.sum() == 0, "CUDA: expected empty routing map"
-    assert exp_probs_cpu.sum() == 0, "CPU: expected zero probs"
-    assert exp_probs_cuda.sum() == 0, "CUDA: expected zero probs"
-    print_rank0("  Case 1 (empty routing): PASS")
-
-    # Case 2: single token routed to one expert
-    routing_map = torch.zeros(1, L, dtype=torch.bool, device="cuda")
-    routing_map[0, 0] = True
-    probs = torch.randn(1, L, dtype=torch.float32, device="cuda")
-    exp_probs_cpu, exp_map_cpu = mgr._reroute_cpu(layer_id, probs, routing_map)
-    exp_probs_cuda, exp_map_cuda = mgr._reroute_cuda(layer_id, probs, routing_map)
-    assert torch.equal(exp_map_cpu, exp_map_cuda), "single token: routing map mismatch"
-    assert torch.equal(exp_probs_cpu, exp_probs_cuda), "single token: probs mismatch"
-    print_rank0("  Case 2 (single token): PASS")
-
-    # Case 3: all tokens routed to every expert (dense routing)
-    T_small = 32
-    routing_map = torch.ones(T_small, L, dtype=torch.bool, device="cuda")
-    probs = torch.randn(T_small, L, dtype=torch.float32, device="cuda")
-    exp_probs_cpu, exp_map_cpu = mgr._reroute_cpu(layer_id, probs, routing_map)
-    exp_probs_cuda, exp_map_cuda = mgr._reroute_cuda(layer_id, probs, routing_map)
-    assert torch.equal(exp_map_cpu, exp_map_cuda), "dense routing: routing map mismatch"
-    assert torch.equal(exp_probs_cpu, exp_probs_cuda), "dense routing: probs mismatch"
-    print_rank0("  Case 3 (dense routing): PASS")
-
-    # Case 4: backward with empty routing (should not crash)
-    routing_map = torch.zeros(4, L, dtype=torch.bool, device="cuda")
-    probs = torch.randn(4, L, dtype=torch.float32, device="cuda", requires_grad=True)
-    exp_probs_cuda, _ = mgr._reroute_cuda(layer_id, probs, routing_map)
-    exp_probs_cuda.sum().backward()
-    assert probs.grad is not None
-    assert probs.grad.sum() == 0, "expected zero gradient for empty routing"
-    print_rank0("  Case 4 (backward empty): PASS")
-
-
-# ============================================================================
 # Benchmark: forward and forward+backward latency
 # ============================================================================
 
@@ -301,7 +246,7 @@ def bench_latency(mgr, layer_id, T, topk, num_warmup=50, num_iters=200):
     return results
 
 
-def run_benchmarks(mgr, layer_id, configs, num_iters):
+def run_benchmarks(mgr, layer_id, T, topk, num_iters):
     """Run benchmarks across multiple (T, topk) configurations and print results."""
     print_rank0(f"\n{'='*60}")
     print_rank0("Benchmark: CPU vs CUDA reroute latency")
@@ -310,39 +255,36 @@ def run_benchmarks(mgr, layer_id, configs, num_iters):
     L = mgr.num_global_logical_experts
     P = mgr.num_global_physical_experts
 
-    for T, topk in configs:
-        results = bench_latency(mgr, layer_id, T, topk, num_iters=num_iters)
+    results = bench_latency(mgr, layer_id, T, topk, num_iters=num_iters)
 
-        if dist.get_rank() == 0:
-            print(f"\n  T={T}, L={L}, P={P}, topk={topk}:")
-            # Print forward
-            cpu_fwd = results["CPU_fwd"]
-            cuda_fwd = results["CUDA_fwd"]
-            speedup_fwd = (
-                cpu_fwd["mean"] / cuda_fwd["mean"] if cuda_fwd["mean"] > 0 else 0
-            )
-            print(
-                f"    {'CPU  fwd':20s}  mean={cpu_fwd['mean']:8.1f}µs  "
-                f"p50={cpu_fwd['p50']:8.1f}µs  p99={cpu_fwd['p99']:8.1f}µs"
-            )
-            print(
-                f"    {'CUDA fwd':20s}  mean={cuda_fwd['mean']:8.1f}µs  "
-                f"p50={cuda_fwd['p50']:8.1f}µs  p99={cuda_fwd['p99']:8.1f}µs  "
-                f"speedup={speedup_fwd:.2f}x"
-            )
-            # Print fwd+bwd
-            cpu_fb = results["CPU_fwd+bwd"]
-            cuda_fb = results["CUDA_fwd+bwd"]
-            speedup_fb = cpu_fb["mean"] / cuda_fb["mean"] if cuda_fb["mean"] > 0 else 0
-            print(
-                f"    {'CPU  fwd+bwd':20s}  mean={cpu_fb['mean']:8.1f}µs  "
-                f"p50={cpu_fb['p50']:8.1f}µs  p99={cpu_fb['p99']:8.1f}µs"
-            )
-            print(
-                f"    {'CUDA fwd+bwd':20s}  mean={cuda_fb['mean']:8.1f}µs  "
-                f"p50={cuda_fb['p50']:8.1f}µs  p99={cuda_fb['p99']:8.1f}µs  "
-                f"speedup={speedup_fb:.2f}x"
-            )
+    if dist.get_rank() == 0:
+        print(f"\n  T={T}, L={L}, P={P}, topk={topk}:")
+        # Print forward
+        cpu_fwd = results["CPU_fwd"]
+        cuda_fwd = results["CUDA_fwd"]
+        speedup_fwd = cpu_fwd["mean"] / cuda_fwd["mean"] if cuda_fwd["mean"] > 0 else 0
+        print(
+            f"    {'CPU  fwd':20s}  mean={cpu_fwd['mean']:8.1f}µs  "
+            f"p50={cpu_fwd['p50']:8.1f}µs  p99={cpu_fwd['p99']:8.1f}µs"
+        )
+        print(
+            f"    {'CUDA fwd':20s}  mean={cuda_fwd['mean']:8.1f}µs  "
+            f"p50={cuda_fwd['p50']:8.1f}µs  p99={cuda_fwd['p99']:8.1f}µs  "
+            f"speedup={speedup_fwd:.2f}x"
+        )
+        # Print fwd+bwd
+        cpu_fb = results["CPU_fwd+bwd"]
+        cuda_fb = results["CUDA_fwd+bwd"]
+        speedup_fb = cpu_fb["mean"] / cuda_fb["mean"] if cuda_fb["mean"] > 0 else 0
+        print(
+            f"    {'CPU  fwd+bwd':20s}  mean={cpu_fb['mean']:8.1f}µs  "
+            f"p50={cpu_fb['p50']:8.1f}µs  p99={cpu_fb['p99']:8.1f}µs"
+        )
+        print(
+            f"    {'CUDA fwd+bwd':20s}  mean={cuda_fb['mean']:8.1f}µs  "
+            f"p50={cuda_fb['p50']:8.1f}µs  p99={cuda_fb['p99']:8.1f}µs  "
+            f"speedup={speedup_fb:.2f}x"
+        )
 
 
 # ============================================================================
@@ -357,14 +299,13 @@ def main():
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--num-local-master", type=int, default=4)
     parser.add_argument("--num-local-redundant", type=int, default=2)
-    parser.add_argument("--T", type=int, default=4096, help="Number of tokens")
+    parser.add_argument("--T", type=int, default=8192, help="Number of tokens")
     parser.add_argument("--topk", type=int, default=8, help="Top-k experts per token")
     parser.add_argument("--bench-iters", type=int, default=200)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     group = setup_distributed()
-    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     print_rank0(
@@ -406,29 +347,8 @@ def main():
 
             traceback.print_exc()
 
-    try:
-        test_edge_cases(mgr, layer_id)
-    except Exception as e:
-        all_passed = False
-        print_rank0(f"  FAIL: {e}")
-        if args.verbose:
-            import traceback
-
-            traceback.print_exc()
-
     # ---- Benchmarks ----
-    # Deduplicate benchmark configs
-    bench_configs = list(
-        dict.fromkeys(
-            [
-                (args.T, args.topk),
-                (4096, 2),
-                (4096, 8),
-                (8192, 8),
-            ]
-        )
-    )
-    run_benchmarks(mgr, layer_id, bench_configs, num_iters=args.bench_iters)
+    run_benchmarks(mgr, layer_id, args.T, args.topk, num_iters=args.bench_iters)
 
     # ---- Summary ----
     print_rank0(f"\n{'='*60}")

@@ -14,3 +14,7 @@
 #define WEIGHT_ELEMENT_SIZE 2
 // Suppose FP32 grad data
 #define GRAD_ELEMENT_SIZE 4
+
+// Reroute forward tile size (tokens per tile in the two-pass forward kernel).
+// Defined here so it is accessible from both .cu (via config.cuh) and .cpp files.
+#define REROUTE_FWD_TILE_T 128
