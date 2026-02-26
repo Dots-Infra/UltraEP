@@ -22,12 +22,12 @@ class Manager:
         expert_fc2_numel: int,
         is_train: bool = True,
         explicitly_destroy: bool = False,
-        log_expert_loads: bool = False,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
 
         self.group = group
+        self.id = id(group)
         self.device = torch.cuda.current_device()
         self.rank = group.rank()
         self.num_ranks = group.size()
@@ -58,14 +58,14 @@ class Manager:
         self.local_master_fc2_grad_pool = [None] * self.num_alloc_layers
 
         # Expert loads logging
-        self.log_expert_loads = log_expert_loads
+        self.log_expert_loads = os.environ.get("ULTRA_EP_LOG_EXPERT_LOADS", "0") == "1"
         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.ep_loads_save_dir = os.environ.get(
-            "EP_LOADS_SAVE_DIR", "/var/log/ep_loads"
+            "ULTRA_EP_LOADS_SAVE_DIR", "/var/log/ultra_ep_loads"
         )
         os.makedirs(self.ep_loads_save_dir, exist_ok=True)
         self.ep_log_path = os.path.join(
-            self.ep_loads_save_dir, f"ep_loads_{now_str}.log"
+            self.ep_loads_save_dir, f"ep_loads_{now_str}_group{self.id}.log"
         )
 
         # Create cpp handle
@@ -266,7 +266,6 @@ class Manager:
             orig_log_expert_loads, balanced_phys_expert_loads = None, None
             orig_log_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
             dist.all_reduce(orig_log_expert_loads, group=self.group)
-            curr_phy2log = self.physical_to_logical_map[layer_id].clone().cpu()
             max_replica_cnt = self.logical_replica_counts[layer_id].cpu().max().item()
 
         if backend == "cuda":
@@ -287,14 +286,19 @@ class Manager:
             dist.all_reduce(balanced_phys_expert_loads, group=self.group)
 
             if self.rank == 0:
-                mask = curr_phy2log != -1  # filter empty slots for physical experts
-                balanced_phys_expert_loads = balanced_phys_expert_loads.cpu()[mask]
-
-                orig_imbalance = get_max_by_mean(orig_log_expert_loads.cpu())
-                balanced_imbalance = get_max_by_mean(balanced_phys_expert_loads)
+                orig_log_expert_loads_by_rank = orig_log_expert_loads.view(
+                    self.num_ranks, self.num_local_master_experts
+                ).sum(dim=1)
+                balanced_phys_expert_loads_by_rank = balanced_phys_expert_loads.view(
+                    self.num_ranks, self.num_local_physical_experts
+                ).sum(dim=1)
+                orig_imbalance = get_max_by_mean(orig_log_expert_loads_by_rank.cpu())
+                balanced_imbalance = get_max_by_mean(
+                    balanced_phys_expert_loads_by_rank.cpu()
+                )
                 with open(self.ep_log_path, "a") as f:
                     f.write(
-                        f"Layer {layer_id}: Imbalance (max/mean load): {orig_imbalance:.2f} -> "
+                        f"Layer {layer_id}: Imbalance (max/mean load per rank): {orig_imbalance:.2f} -> "
                         f"{balanced_imbalance:.2f} ({orig_imbalance / balanced_imbalance:.2f}x) | "
                         f"max #replicas: {max_replica_cnt}\n"
                     )
