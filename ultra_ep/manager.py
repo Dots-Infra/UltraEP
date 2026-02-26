@@ -267,6 +267,7 @@ class Manager:
             orig_log_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
             dist.all_reduce(orig_log_expert_loads, group=self.group)
             curr_phy2log = self.physical_to_logical_map[layer_id].clone().cpu()
+            max_replica_cnt = self.logical_replica_counts[layer_id].cpu().max().item()
 
         if backend == "cuda":
             expanded_probs, expanded_routing_map = self._reroute_cuda(
@@ -293,9 +294,9 @@ class Manager:
                 balanced_imbalance = get_max_by_mean(balanced_phys_expert_loads)
                 with open(self.ep_log_path, "a") as f:
                     f.write(
-                        f"Layer {layer_id}: Orig max/mean load: {orig_imbalance:.2f}, "
-                        f"Balanced max/mean load: {balanced_imbalance:.2f}, "
-                        f"Improvement: {orig_imbalance / balanced_imbalance:.2f}x\n"
+                        f"Layer {layer_id}: Imbalance (max/mean load): {orig_imbalance:.2f} -> "
+                        f"{balanced_imbalance:.2f} ({orig_imbalance / balanced_imbalance:.2f}x) | "
+                        f"max #replicas: {max_replica_cnt}\n"
                     )
 
         return expanded_probs, expanded_routing_map
