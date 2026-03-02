@@ -22,6 +22,7 @@ class Manager:
         expert_fc2_numel: int,
         is_train: bool = True,
         explicitly_destroy: bool = False,
+        max_microbatches: int = 1,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -47,15 +48,23 @@ class Manager:
         self.num_global_logical_experts = num_local_master_experts * self.num_ranks
         self.is_train = is_train
 
-        # Pre-configured during model construction
-        # Shape: num_layers x [num_local_master_experts,]
-        self.num_alloc_layers = (
-            num_layers + 3
-        )  # In case layer_id begins from 1 instead of 0
-        self.local_master_fc1_weight_pool = [None] * self.num_alloc_layers
-        self.local_master_fc2_weight_pool = [None] * self.num_alloc_layers
-        self.local_master_fc1_grad_pool = [None] * self.num_alloc_layers
-        self.local_master_fc2_grad_pool = [None] * self.num_alloc_layers
+        # PP/VPP support: multiple micro-batches may be in-flight simultaneously.
+        # Each (real_layer, microbatch_slot) pair gets a unique "virtual layer ID"
+        # so that placement maps and reroute buffers don't collide across micro-batches.
+        # For DDP-only (max_microbatches=1) the virtual ID equals the real layer ID.
+        self.max_microbatches = max(1, max_microbatches)
+        self.real_num_alloc_layers = num_layers + 3  # padding for 1-indexed layer IDs
+        self.num_alloc_layers = self.real_num_alloc_layers * self.max_microbatches
+
+        # Master weight/grad pointer pools, indexed by REAL layer_id.
+        # These don't depend on micro-batch because the physical memory is the same.
+        self.local_master_fc1_weight_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc2_weight_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc1_grad_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc2_grad_pool = [None] * self.real_num_alloc_layers
+
+        # Per-real-layer micro-batch slot counters (wraps modulo max_microbatches)
+        self._mb_counters = [0] * self.real_num_alloc_layers
 
         # Expert loads logging
         self.log_expert_loads = os.environ.get("ULTRA_EP_LOG_EXPERT_LOADS", "0") == "1"
@@ -109,6 +118,29 @@ class Manager:
             self.runtime.destroy()
         self.runtime = None
 
+    def allocate_microbatch_slot(self, real_layer_id: int) -> int:
+        """Allocate the next virtual layer ID for this real layer.
+
+        Maps ``(real_layer_id, mb_slot)`` → ``virtual_layer_id`` using:
+            ``virtual = real_layer_id * max_microbatches + (counter % max_microbatches)``
+
+        The counter wraps modulo ``max_microbatches``, so once a micro-batch's
+        backward completes and frees a slot, that slot can be reused by a later
+        micro-batch.  The caller must ensure ``max_microbatches`` is at least as
+        large as the peak number of in-flight micro-batches per layer.
+
+        For DDP-only (``max_microbatches == 1``), the virtual ID equals the real
+        layer ID and the counter overhead is a single integer increment.
+        """
+        assert real_layer_id < self.real_num_alloc_layers
+        mb_slot = self._mb_counters[real_layer_id] % self.max_microbatches
+        self._mb_counters[real_layer_id] += 1
+        return real_layer_id * self.max_microbatches + mb_slot
+
+    def _real_layer_id(self, virtual_layer_id: int) -> int:
+        """Map a virtual layer ID back to the real layer ID."""
+        return virtual_layer_id // self.max_microbatches
+
     def construct_local_master_ptr_pool(
         self,
         layer_id: int,
@@ -117,7 +149,7 @@ class Manager:
         fc1_grads: List[torch.Tensor],
         fc2_grads: List[torch.Tensor],
     ):
-        assert layer_id < self.num_alloc_layers
+        assert layer_id < self.real_num_alloc_layers
         assert len(fc1_weights) == self.num_local_master_experts
         assert len(fc2_weights) == self.num_local_master_experts
         assert len(fc1_grads) == self.num_local_master_experts
@@ -151,15 +183,23 @@ class Manager:
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
     ):
+        """Aggregate replica gradients to masters.
+
+        Args:
+            layer_id: Virtual layer ID (encodes both real layer and micro-batch
+                slot).  Used for placement map lookup in C++.  Master pointer
+                pools are looked up by the real layer ID derived from this.
+        """
         assert layer_id < self.num_alloc_layers
+        real_lid = self._real_layer_id(layer_id)
         assert (
-            self.local_master_fc1_grad_pool[layer_id] is not None
-            and self.local_master_fc2_grad_pool[layer_id] is not None
+            self.local_master_fc1_grad_pool[real_lid] is not None
+            and self.local_master_fc2_grad_pool[real_lid] is not None
         )
         event = self.runtime.grad_reduce(
             layer_id,
-            self.local_master_fc1_grad_pool[layer_id],
-            self.local_master_fc2_grad_pool[layer_id],
+            self.local_master_fc1_grad_pool[real_lid],
+            self.local_master_fc2_grad_pool[real_lid],
             mode,
             getattr(previous_event, "event", None),
             async_finish,
@@ -180,24 +220,25 @@ class Manager:
         to shared memory once and then TMA stored to all replica destinations.
 
         Args:
-            layer_id: Layer index for which to sync weights
-            previous_event: Optional event to wait for before starting
-            async_finish: If True, return immediately with an event handle
-                         If False, wait for completion before returning
+            layer_id: Virtual layer ID.  Used for placement map lookup in C++.
+                Master pointer pools are looked up by the derived real layer ID.
+            previous_event: Optional event to wait for before starting.
+            async_finish: If True, return immediately with an event handle.
 
         Returns:
-            EventHandle handle if async_finish=True, else None
+            EventHandle if async_finish=True, else None.
         """
         assert layer_id < self.num_alloc_layers
+        real_lid = self._real_layer_id(layer_id)
         assert (
-            self.local_master_fc1_weight_pool[layer_id] is not None
-            and self.local_master_fc2_weight_pool[layer_id] is not None
+            self.local_master_fc1_weight_pool[real_lid] is not None
+            and self.local_master_fc2_weight_pool[real_lid] is not None
         )
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
             event = self.runtime.weight_sync(
                 layer_id,
-                self.local_master_fc1_weight_pool[layer_id],
-                self.local_master_fc2_weight_pool[layer_id],
+                self.local_master_fc1_weight_pool[real_lid],
+                self.local_master_fc2_weight_pool[real_lid],
                 getattr(previous_event, "event", None),
                 async_finish,
             )
