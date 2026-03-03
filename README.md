@@ -1,4 +1,4 @@
-# UltraEP: Online Expert Load Balancing for MoE Serving and Training
+# UltraEP: Online Expert Load Balancing for Large-Scale MoE Serving and Training
 
 UltraEP is a high-performance, online expert load balancing library specifically designed for Mixture-of-Experts (MoE) training and inference. It provides efficient synchronization of expert weights and gradients across GPUs, enabling flexible expert placement and redundant expert strategies to mitigate load imbalance. It incurs near-zero latency or memory overhead with dedicated kernels and layer-reused replica weight/gradient buffers.
 
@@ -7,8 +7,11 @@ UltraEP is a high-performance, online expert load balancing library specifically
 - [x] Intra-NVLINK domain master-replica synchronization.
 - [x] High-performance `weight_sync` and `grad_reduce` kernels.
 - [x] Support for SM90 (H100/H800) and SM100 (Blackwell) architectures.
-- [ ] Advanced expert placement and token dispatch algorithms.
-- [ ] Deep integration with mainstream training and inference frameworks (e.g., Megatron-LM, SGLang, vLLM).
+- [x] Advanced online expert placement and token dispatch algorithms.
+- [x] Deep integration with mainstream training and inference frameworks (e.g., Megatron-LM, SGLang, vLLM).
+- [ ] Support for FP8 training/serving.
+- [ ] C2C expert offloading for reduced NVLink traffic contention.
+- [ ] CUDA graph integration with pure on-device kernels.
 - [ ] Support for cross-RDMA (Inter-node) expert synchronization.
 
 ## 💡 Background & Concepts
@@ -59,13 +62,19 @@ pip install dist/*.whl
 
 UltraEP currently provides two primary operators for managing master-replica synchronization. Both sync and async modes are supported for flexible overlapping control:
 
-### 1. `weight_sync`
+### 1. `weight_sync` (CUDA)
 Used during **inference** or the **forward** pass of training. It broadcasts the weights from the master expert to all its redundant experts across the NVLINK domain. This should be finished before the MoE computation starts in each layer.
 
-### 2. `grad_reduce`
+### 2. `grad_reduce` (CUDA)
 Used during the **backward** pass of training. It aggregates (reduces) gradients from all redundant experts back to their respective master experts, then zeros replica gradient buffers. Since the replica grad buffer is cross-layer shared, `grad_reduce` must complete before the next layer starts computing expert gradients.
 - High-SM mode (`high_sm`): Optimized for maximum throughput when GPU resources are primarily dedicated to this reduction.
 - Low-SM mode (`low_sm`): Recommended when you need to overlap the gradient reduction with other backward computations (e.g., Attention or MLP calculations) to hide communication latency.
+
+### 3. `update_placement` (CPU)
+Dynamically adjusts expert placement based on real-time load statistics. It runs an EPLB-style greedy replication and bin-packing algorithm on the CPU. The algorithm is deterministic, ensuring all ranks compute identical placements without additional communication.
+
+### 4. `reroute` (CUDA)
+A high-performance CUDA kernel that expands token routing from logical experts to physical experts. It uses deterministic round-robin dispatch to distribute tokens among master and replica instances, effectively balancing the computation load across the NVLINK domain.
 
 ### Example Code Snippet
 
@@ -83,18 +92,21 @@ manager = ultra_ep.Manager(
     expert_fc2_numel=1536 * 4096,
 )
 
-# Register master weight/grad buffers (from serving/train frameworks)
-for layer_id in range(num_layers):
-    # Get weight/grad tensor views for each layer
-    # ......
-    manager.construct_local_master_ptr_pool(
-        layer_id, fc1_weights, fc2_weights, fc1_grads, fc2_grads
-    )
+# ... (Register master weight/grad buffers) ...
+
+# --- Token Dispatch & Placement ---
+# Update placement based on routing map
+manager.update_placement(layer_id=layer_x, routing_map=routing_map)
+
+# Reroute tokens to physical experts (master + replicas)
+expanded_probs, expanded_routing_map = manager.reroute(
+    layer_id=layer_x, probs=probs, routing_map=routing_map
+)
 
 # --- Forward Pass ---
 # Sync master weights to replicas before MoE calculation
 manager.weight_sync(layer_id=layer_x, async_finish=False)
-# Run MoE forward...
+# Run MoE forward using expanded_probs and expanded_routing_map...
 
 # --- Backward Pass ---
 # Run MoE backward to get gradients...
@@ -114,10 +126,18 @@ You can run the provided tests to verify correctness and benchmark performance:
 
 ```bash
 # Test Weight Synchronization
-torchrun --nproc_per_node=8 tests/test_weight_sync.py
+torchrun --nproc_per_node=4 ..... tests/test_weight_sync.py
 
 # Test Gradient Reduction
-torchrun --nproc_per_node=8 tests/test_grad_reduce.py
+torchrun --nproc_per_node=4 ..... tests/test_grad_reduce.py
+
+# Test Expert Placement
+python3 tests/test_placement.py --num-ranks 32 --nvl-domain-size 8 \
+    --num-local-master 4 --num-local-redundant 2
+
+# Test Reroute Kernel
+torchrun --nproc_per_node=4 ..... tests/test_reroute.py \
+    --num-local-master 4 --num-local-redundant 2 --T 8192 --topk 8
 ```
 
 These tests verify numerical correctness against a golden reference and report end-to-end latency and achieved bandwidth, under either uniform or skewed expert placement (the latter might be more common in practice, with hot/cold experts unevenly distributed).
