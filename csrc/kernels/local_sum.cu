@@ -1,10 +1,4 @@
-// Avoid NVSHMEM compilation errors
-#undef __CUDA_NO_HALF_OPERATORS__
-#undef __CUDA_NO_HALF_CONVERSIONS__
-#undef __CUDA_NO_BFLOAT16_CONVERSIONS__
-#undef __CUDA_NO_HALF2_OPERATORS__
-
-#include "../utils/nvshmem.cuh"
+#include "../utils/exception.cuh"
 #include "api.cuh"
 
 namespace ultra_ep::kernels {
@@ -53,11 +47,11 @@ __global__ void rmap_local_sum_kernel(const bool* __restrict__ routing_map,
     }
 }
 
-void rmap_local_sum_and_allreduce(int T,
-                                  int L,
-                                  const bool* routing_map_ptr,  // [T, L] bool
-                                  int32_t* expert_loads_ptr,    // [L] int32, alloc by nvshmem
-                                  cudaStream_t stream) {
+void rmap_local_sum(int T,
+                    int L,
+                    const bool* routing_map_ptr,  // [T, L] bool
+                    int32_t* expert_loads_ptr,    // [L] int32, alloc by nvshmem
+                    cudaStream_t stream) {
     // 1. Zero out the target array (since we accumulate via atomicAdd)
     // For 128/256 int32s, cudaMemsetAsync has very little overhead on the stream
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(expert_loads_ptr, 0, L * sizeof(int32_t), stream));
@@ -77,9 +71,65 @@ void rmap_local_sum_and_allreduce(int T,
         cudaFuncSetAttribute(rmap_local_sum_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     rmap_local_sum_kernel<<<grid, block, smem_size, stream>>>(routing_map_ptr, expert_loads_ptr, T, L);
+}
 
-    // 3. NVSHMEM In-Place All-Reduce
-    nvshmem::int32_allreduce(expert_loads_ptr, L, stream);
+// ---------------------------------------------------------------------------
+// sparse_topk_histogram_kernel
+//
+// Computes per-expert token counts from sparse topk_ids [T, K].
+// Each thread processes one topk entry via grid-stride loop.
+// Uses shared-memory reduction per block to minimize global atomics.
+// ---------------------------------------------------------------------------
+
+static constexpr int HIST_BLOCK_SIZE = 256;
+
+__global__ void sparse_topk_histogram_kernel(const int64_t* __restrict__ topk_ids,
+                                             int32_t* __restrict__ expert_loads,
+                                             const int num_entries,
+                                             const int num_experts) {
+    extern __shared__ int32_t smem_hist[];
+
+    for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
+        smem_hist[i] = 0;
+    }
+    __syncthreads();
+
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_entries; idx += gridDim.x * blockDim.x) {
+        int64_t eid = topk_ids[idx];
+        if (eid >= 0 && eid < num_experts) {
+            atomicAdd(&smem_hist[eid], 1);
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
+        if (smem_hist[i] > 0) {
+            atomicAdd(&expert_loads[i], smem_hist[i]);
+        }
+    }
+}
+
+void topk_local_sum(const int64_t* topk_ids_ptr,
+                    const int num_tokens,
+                    const int top_k,
+                    const int num_global_logical_experts,
+                    int32_t* expert_loads_ptr,
+                    cudaStream_t stream) {
+    int num_entries = num_tokens * top_k;
+    int L = num_global_logical_experts;
+
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(expert_loads_ptr, 0, L * sizeof(int32_t), stream));
+
+    if (num_entries > 0) {
+        int smem_bytes = L * sizeof(int32_t);
+        int num_blocks = min(256, (num_entries + HIST_BLOCK_SIZE - 1) / HIST_BLOCK_SIZE);
+
+        CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(
+            sparse_topk_histogram_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
+        sparse_topk_histogram_kernel<<<num_blocks, HIST_BLOCK_SIZE, smem_bytes, stream>>>(
+            topk_ids_ptr, expert_loads_ptr, num_entries, L);
+    }
 }
 
 }  // namespace ultra_ep::kernels

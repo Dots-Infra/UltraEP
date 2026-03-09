@@ -15,10 +15,8 @@
  *   For typical replica counts (1–4), the search is 1–4 iterations.
  */
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <torch/extension.h>
 
 #include "api.cuh"
 #include "config.cuh"
@@ -174,7 +172,6 @@ void run_reroute_forward(const bool* routing_map,
                          int L,
                          int P,
                          int max_replicas,
-                         at::ScalarType dtype,
                          cudaStream_t stream) {
     if (T == 0 || L == 0)
         return;
@@ -192,51 +189,18 @@ void run_reroute_forward(const bool* routing_map,
     reroute_forward_count_kernel<TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map, tile_counts, T, L, num_tiles);
 
     // Pass 2: prefix-sum + scatter (type-dispatched)
-    if (dtype == at::ScalarType::Float) {
-        reroute_forward_scatter_kernel<float, TILE_T, WPB>
-            <<<grid, block, 0, stream>>>(routing_map,
-                                         static_cast<const float*>(probs),
-                                         l2p_map,
-                                         lcnts,
-                                         tile_counts,
-                                         expanded_routing_map,
-                                         static_cast<float*>(expanded_probs),
-                                         T,
-                                         L,
-                                         P,
-                                         max_replicas,
-                                         num_tiles);
-    } else if (dtype == at::ScalarType::BFloat16) {
-        reroute_forward_scatter_kernel<__nv_bfloat16, TILE_T, WPB>
-            <<<grid, block, 0, stream>>>(routing_map,
-                                         static_cast<const __nv_bfloat16*>(probs),
-                                         l2p_map,
-                                         lcnts,
-                                         tile_counts,
-                                         expanded_routing_map,
-                                         static_cast<__nv_bfloat16*>(expanded_probs),
-                                         T,
-                                         L,
-                                         P,
-                                         max_replicas,
-                                         num_tiles);
-    } else if (dtype == at::ScalarType::Half) {
-        reroute_forward_scatter_kernel<__half, TILE_T, WPB>
-            <<<grid, block, 0, stream>>>(routing_map,
-                                         static_cast<const __half*>(probs),
-                                         l2p_map,
-                                         lcnts,
-                                         tile_counts,
-                                         expanded_routing_map,
-                                         static_cast<__half*>(expanded_probs),
-                                         T,
-                                         L,
-                                         P,
-                                         max_replicas,
-                                         num_tiles);
-    } else {
-        EP_HOST_ASSERT(false && "Unsupported dtype for reroute_cuda_forward");
-    }
+    reroute_forward_scatter_kernel<float, TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map,
+                                                                                   static_cast<const float*>(probs),
+                                                                                   l2p_map,
+                                                                                   lcnts,
+                                                                                   tile_counts,
+                                                                                   expanded_routing_map,
+                                                                                   static_cast<float*>(expanded_probs),
+                                                                                   T,
+                                                                                   L,
+                                                                                   P,
+                                                                                   max_replicas,
+                                                                                   num_tiles);
 }
 
 void run_reroute_backward(const void* grad_expanded_probs,
@@ -249,7 +213,6 @@ void run_reroute_backward(const void* grad_expanded_probs,
                           int L,
                           int P,
                           int max_replicas,
-                          at::ScalarType dtype,
                           cudaStream_t stream) {
     if (T == 0 || L == 0)
         return;
@@ -260,44 +223,69 @@ void run_reroute_backward(const void* grad_expanded_probs,
     dim3 block(block_x, block_y);
     dim3 grid((T + block_y - 1) / block_y, (L + block_x - 1) / block_x);
 
-    if (dtype == at::ScalarType::Float) {
-        reroute_backward_gather_kernel<float>
-            <<<grid, block, 0, stream>>>(static_cast<const float*>(grad_expanded_probs),
-                                         routing_map,
-                                         expanded_routing_map,
-                                         l2p_map,
-                                         lcnts,
-                                         static_cast<float*>(grad_probs),
-                                         T,
-                                         L,
-                                         P,
-                                         max_replicas);
-    } else if (dtype == at::ScalarType::BFloat16) {
-        reroute_backward_gather_kernel<__nv_bfloat16>
-            <<<grid, block, 0, stream>>>(static_cast<const __nv_bfloat16*>(grad_expanded_probs),
-                                         routing_map,
-                                         expanded_routing_map,
-                                         l2p_map,
-                                         lcnts,
-                                         static_cast<__nv_bfloat16*>(grad_probs),
-                                         T,
-                                         L,
-                                         P,
-                                         max_replicas);
-    } else if (dtype == at::ScalarType::Half) {
-        reroute_backward_gather_kernel<__half>
-            <<<grid, block, 0, stream>>>(static_cast<const __half*>(grad_expanded_probs),
-                                         routing_map,
-                                         expanded_routing_map,
-                                         l2p_map,
-                                         lcnts,
-                                         static_cast<__half*>(grad_probs),
-                                         T,
-                                         L,
-                                         P,
-                                         max_replicas);
-    } else {
-        EP_HOST_ASSERT(false && "Unsupported dtype for reroute_cuda_backward");
+    reroute_backward_gather_kernel<float><<<grid, block, 0, stream>>>(static_cast<const float*>(grad_expanded_probs),
+                                                                      routing_map,
+                                                                      expanded_routing_map,
+                                                                      l2p_map,
+                                                                      lcnts,
+                                                                      static_cast<float*>(grad_probs),
+                                                                      T,
+                                                                      L,
+                                                                      P,
+                                                                      max_replicas);
+}
+
+// ---------------------------------------------------------------------------
+// reroute_sparse_kernel
+//
+// In-place remaps topk_ids from logical expert IDs to physical expert IDs
+// using round-robin dispatch across replicas.
+// Each thread handles one topk entry.  An atomicAdd on a per-expert counter
+// determines the round-robin rank; the modulo selects the physical replica.
+// ---------------------------------------------------------------------------
+
+__global__ void reroute_sparse_kernel(int64_t* __restrict__ topk_ids,
+                                      const int32_t* __restrict__ l2p_map,
+                                      const int32_t* __restrict__ replica_counts,
+                                      int* __restrict__ counters,
+                                      const int num_entries,
+                                      const int max_replicas,
+                                      const int num_experts) {
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_entries; idx += gridDim.x * blockDim.x) {
+        int64_t logical_id = topk_ids[idx];
+        if (logical_id < 0 || logical_id >= num_experts)
+            continue;
+
+        int C = replica_counts[logical_id];
+        if (C <= 0)
+            continue;
+
+        int rank = atomicAdd(&counters[logical_id], 1);
+        int replica_idx = rank % C;
+        int32_t physical_id = l2p_map[logical_id * max_replicas + replica_idx];
+        topk_ids[idx] = static_cast<int64_t>(physical_id);
+    }
+}
+
+void run_reroute_sparse(int64_t* topk_ids_ptr,
+                        const int32_t* l2p_map_gpu,
+                        const int32_t* lcnts_gpu,
+                        int* counters_gpu,
+                        const int num_tokens,
+                        const int top_k,
+                        const int num_global_logical_experts,
+                        const int max_replicas,
+                        cudaStream_t stream) {
+    int num_entries = num_tokens * top_k;
+    int L = num_global_logical_experts;
+
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(counters_gpu, 0, L * sizeof(int), stream));
+
+    if (num_entries > 0) {
+        constexpr int BLOCK = 256;
+        int num_blocks = min(256, (num_entries + BLOCK - 1) / BLOCK);
+        reroute_sparse_kernel<<<num_blocks, BLOCK, 0, stream>>>(
+            topk_ids_ptr, l2p_map_gpu, lcnts_gpu, counters_gpu, num_entries, max_replicas, L);
     }
 }
 

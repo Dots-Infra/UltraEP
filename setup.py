@@ -93,11 +93,34 @@ if __name__ == "__main__":
         ]
     )
 
-    # Prefer Hopper and Blackwell series
-    os.environ["TORCH_CUDA_ARCH_LIST"] = os.getenv("TORCH_CUDA_ARCH_LIST", "9.0 10.0")
+    # Auto-detect CUDA arch if not explicitly set
+    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        compute_cap = result.stdout.strip().splitlines()[0].strip()
+        sm = int(compute_cap.replace(".", ""))
+        if sm == 90:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+        elif sm == 100:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0"
+        else:
+            raise RuntimeError(
+                f"Unsupported CUDA compute capability: {compute_cap} (SM{sm}). "
+                "Only SM90 (Hopper) and SM100 (Blackwell) are supported. "
+                "Set TORCH_CUDA_ARCH_LIST manually to override."
+            )
 
     # CUDA 12 flags
-    nvcc_flags.extend(["-rdc=true", "--ptxas-options=--register-usage-level=10"])
+    nvcc_flags.extend(
+        [
+            # "-rdc=true",
+            "--ptxas-options=--register-usage-level=10"
+        ]
+    )
 
     # Disable aggressive PTX instructions
     if int(os.getenv("DISABLE_AGGRESSIVE_PTX_INSTRS", "1")):

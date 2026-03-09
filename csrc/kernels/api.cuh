@@ -2,7 +2,6 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <torch/extension.h>
 
 #include <tuple>
 
@@ -100,7 +99,6 @@ void run_reroute_forward(const bool* routing_map,
                          int L,
                          int P,
                          int max_replicas,
-                         at::ScalarType dtype,
                          cudaStream_t stream);
 
 // Backward (row-parallel gather): gather gradients from [T,P] physical to [T,L] logical.
@@ -127,13 +125,42 @@ void run_reroute_backward(const void* grad_expanded_probs,
                           int L,
                           int P,
                           int max_replicas,
-                          at::ScalarType dtype,
                           cudaStream_t stream);
 
-void rmap_local_sum_and_allreduce(int num_tokens,                  // T
-                                  int num_global_logical_experts,  // L
-                                  const bool* routing_map_ptr,     // [T, L] bool
-                                  int32_t* expert_loads_ptr,       // [L] int32, alloc by nvshmem
-                                  cudaStream_t stream);
+void rmap_local_sum(int num_tokens,                  // T
+                    int num_global_logical_experts,  // L
+                    const bool* routing_map_ptr,     // [T, L] bool
+                    int32_t* expert_loads_ptr,       // [L] int32, alloc by nvshmem
+                    cudaStream_t stream);
+
+// ============================================================================
+// Sparse topk format support (for frameworks using topk_ids instead of routing_map)
+// ============================================================================
+
+// Compute per-expert token counts from sparse topk_ids
+// Replaces rmap_local_sum for sparse topk format.
+//   topk_ids_ptr: [T, K] int64, device — each entry is a logical expert ID
+//   expert_loads_ptr: [L] int32, allocated by nvshmem — output (global loads)
+void topk_local_sum(const int64_t* topk_ids_ptr,
+                    const int num_tokens,
+                    const int top_k,
+                    const int num_global_logical_experts,
+                    int32_t* expert_loads_ptr,
+                    cudaStream_t stream);
+
+// In-place remap topk_ids from logical to physical expert IDs using round-robin.
+//   topk_ids_ptr: [T, K] int64, device — modified in place
+//   l2p_map_gpu: [L, max_replicas] int32, device — logical-to-physical map
+//   lcnts_gpu: [L] int32, device — replica counts per logical expert
+//   counters_gpu: [L] int32, device scratch — round-robin counters (zeroed internally)
+void run_reroute_sparse(int64_t* topk_ids_ptr,
+                        const int32_t* l2p_map_gpu,
+                        const int32_t* lcnts_gpu,
+                        int* counters_gpu,
+                        const int num_tokens,
+                        const int top_k,
+                        const int num_global_logical_experts,
+                        const int max_replicas,
+                        cudaStream_t stream);
 
 }  // namespace ultra_ep::kernels

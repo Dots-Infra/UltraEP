@@ -202,6 +202,9 @@ class Manager {
     // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
     int* _task_tile_offsets_cpu = nullptr;
 
+    // Sparse reroute: per-expert round-robin counters [num_global_logical_experts]
+    int* _reroute_sparse_counters_gpu = nullptr;
+
     // Solvers
     std::unique_ptr<solver::PlacementSolver> placement_solver_;
     std::unique_ptr<solver::RerouteSolver> reroute_solver_;
@@ -250,6 +253,13 @@ public:
     // Runs entirely on CPU. Deterministic across all ranks.
     void update_placement(const int& layer_id, torch::Tensor& routing_map);
 
+    // Sparse variant: compute expert loads from topk_ids [T, K] int64 instead of dense routing_map.
+    void update_placement_sparse(const int& layer_id, torch::Tensor& topk_ids);
+
+    // In-place remap topk_ids from logical to physical expert IDs using current placement.
+    // topk_ids: [T, K] int64, modified in-place on GPU.
+    void reroute_sparse(const int& layer_id, torch::Tensor& topk_ids);
+
     // Expand logical routing map to physical routing map (CPU path).
     // routing_map: [num_tokens, num_logical_experts], bool, logical routing map.
     // Returns:
@@ -275,7 +285,10 @@ public:
     torch::Stream get_comm_stream() const { return comm_stream; }
 
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
-    torch::Tensor get_local_replica_grad_buffer_tensor() const { return local_replica_grad_buffer_tensor; }
+    torch::Tensor get_local_replica_grad_buffer_tensor() const {
+        EP_HOST_ASSERT(is_train && "Grad buffer not available in inference mode");
+        return local_replica_grad_buffer_tensor;
+    }
     torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
     torch::Tensor get_logical_to_physical_map_tensor() const { return placement.logical_to_physical_map; }
     torch::Tensor get_logical_replica_counts_tensor() const { return placement.logical_replica_counts; }
@@ -293,6 +306,8 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("update_placement", &Manager::update_placement)
+        .def("update_placement_sparse", &Manager::update_placement_sparse)
+        .def("reroute_sparse", &Manager::reroute_sparse)
         .def("reroute_cpu", &Manager::reroute_cpu)
         .def("reroute_cuda_forward", &Manager::reroute_cuda_forward)
         .def("reroute_cuda_backward", &Manager::reroute_cuda_backward)

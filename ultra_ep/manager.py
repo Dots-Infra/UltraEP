@@ -100,14 +100,17 @@ class Manager:
         self.logical_replica_counts: torch.Tensor = (
             self.runtime.get_logical_replica_counts_tensor()
         )
-        # Replica weight/grad buffers shared by layers on GPU
-        # Blobbed from cpp-side buffers
+        # Replica weight buffer shared by layers on GPU
         self.local_replica_weight_buffer: torch.Tensor = (
             self.runtime.get_local_replica_weight_buffer_tensor()
         )
-        self.local_replica_grad_buffer: torch.Tensor = (
-            self.runtime.get_local_replica_grad_buffer_tensor()
-        )
+        # Grad buffer only available in training mode
+        if self.is_train:
+            self.local_replica_grad_buffer: torch.Tensor = (
+                self.runtime.get_local_replica_grad_buffer_tensor()
+            )
+        else:
+            self.local_replica_grad_buffer = None
 
         self.check_tensors_blob_from_cpp()
 
@@ -146,14 +149,12 @@ class Manager:
         layer_id: int,
         fc1_weights: List[torch.Tensor],
         fc2_weights: List[torch.Tensor],
-        fc1_grads: List[torch.Tensor],
-        fc2_grads: List[torch.Tensor],
+        fc1_grads: Optional[List[torch.Tensor]] = None,
+        fc2_grads: Optional[List[torch.Tensor]] = None,
     ):
         assert layer_id < self.real_num_alloc_layers
         assert len(fc1_weights) == self.num_local_master_experts
         assert len(fc2_weights) == self.num_local_master_experts
-        assert len(fc1_grads) == self.num_local_master_experts
-        assert len(fc2_grads) == self.num_local_master_experts
 
         def check_tensors_dtype(tensors: List[torch.Tensor], dtype: torch.dtype):
             for t in tensors:
@@ -163,8 +164,6 @@ class Manager:
 
         check_tensors_dtype(fc1_weights, torch.bfloat16)
         check_tensors_dtype(fc2_weights, torch.bfloat16)
-        check_tensors_dtype(fc1_grads, torch.float32)
-        check_tensors_dtype(fc2_grads, torch.float32)
 
         def _to_dataptr_tensor(tensors: List[torch.Tensor]) -> torch.Tensor:
             return torch.tensor(
@@ -173,8 +172,17 @@ class Manager:
 
         self.local_master_fc1_weight_pool[layer_id] = _to_dataptr_tensor(fc1_weights)
         self.local_master_fc2_weight_pool[layer_id] = _to_dataptr_tensor(fc2_weights)
-        self.local_master_fc1_grad_pool[layer_id] = _to_dataptr_tensor(fc1_grads)
-        self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(fc2_grads)
+
+        if self.is_train:
+            assert (
+                fc1_grads is not None and fc2_grads is not None
+            ), "Grad tensors required in training mode"
+            assert len(fc1_grads) == self.num_local_master_experts
+            assert len(fc2_grads) == self.num_local_master_experts
+            check_tensors_dtype(fc1_grads, torch.float32)
+            check_tensors_dtype(fc2_grads, torch.float32)
+            self.local_master_fc1_grad_pool[layer_id] = _to_dataptr_tensor(fc1_grads)
+            self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(fc2_grads)
 
     def grad_reduce(
         self,
@@ -275,6 +283,14 @@ class Manager:
                 global_logical_expert_loads,
                 self.runtime.get_global_logical_expert_loads_tensor(),
             )
+
+    def update_placement_sparse(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+    ):
+        assert layer_id < self.num_alloc_layers
+        self.runtime.update_placement_sparse(layer_id, topk_ids)
 
     def reroute(
         self,
@@ -413,6 +429,52 @@ class Manager:
 
         return expanded_probs, expanded_routing_map
 
+    def reroute_sparse(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+    ):
+        assert layer_id < self.num_alloc_layers
+
+        if self.log_expert_loads:
+            # Compute original logical expert loads before rerouting.
+            # global_logical_expert_loads_gpu is already populated by the preceding
+            # update_placement_sparse call via nvshmem allreduce, so we reuse it
+            # directly instead of recomputing from topk_ids.
+            orig_log_expert_loads = (
+                self.runtime.get_global_logical_expert_loads_tensor().cpu().clone()
+            )
+            max_replica_cnt = self.logical_replica_counts[layer_id].cpu().max().item()
+
+        self.runtime.reroute_sparse(layer_id, topk_ids)
+
+        if self.log_expert_loads:
+            # After in-place reroute, topk_ids now holds physical expert IDs.
+            # Compute per-physical-expert token counts via bincount + all_reduce.
+            flat_phys_ids = topk_ids.flatten().to(torch.int64)
+            balanced_phys_expert_loads = torch.bincount(
+                flat_phys_ids, minlength=self.num_global_physical_experts
+            ).to(torch.int32)
+            dist.all_reduce(balanced_phys_expert_loads, group=self.group)
+
+            if self.rank == 0:
+                orig_log_expert_loads_by_rank = orig_log_expert_loads.view(
+                    self.num_ranks, self.num_local_master_experts
+                ).sum(dim=1)
+                balanced_phys_expert_loads_by_rank = balanced_phys_expert_loads.view(
+                    self.num_ranks, self.num_local_physical_experts
+                ).sum(dim=1)
+                orig_imbalance = get_max_by_mean(orig_log_expert_loads_by_rank.float())
+                balanced_imbalance = get_max_by_mean(
+                    balanced_phys_expert_loads_by_rank.float()
+                )
+                with open(self.ep_log_path, "a") as f:
+                    f.write(
+                        f"Layer {layer_id}: Imbalance (max/mean load per rank): {orig_imbalance:.2f} -> "
+                        f"{balanced_imbalance:.2f} ({orig_imbalance / balanced_imbalance:.2f}x) | "
+                        f"max #replicas: {max_replica_cnt}\n"
+                    )
+
     def check_tensors_blob_from_cpp(self):
         assert (
             self.physical_to_logical_map.device == torch.device("cpu")
@@ -438,24 +500,23 @@ class Manager:
                 self.num_global_logical_experts,
             )
         )
-        assert (self.physical_to_logical_map == -1).all().item()
-        assert (self.logical_to_physical_map == -1).all().item()
         assert self.local_replica_weight_buffer.device == torch.device(
             "cuda", self.device
         )
-        assert self.local_replica_grad_buffer.device == torch.device(
-            "cuda", self.device
-        )
         assert self.local_replica_weight_buffer.dtype == torch.bfloat16
-        assert self.local_replica_grad_buffer.dtype == torch.float32
         assert self.local_replica_weight_buffer.shape == (
             self.num_local_redundant_experts,
             self.expert_total_numel,
         )
-        assert self.local_replica_grad_buffer.shape == (
-            self.num_local_redundant_experts,
-            self.expert_total_numel,
-        )
+        if self.is_train:
+            assert self.local_replica_grad_buffer.device == torch.device(
+                "cuda", self.device
+            )
+            assert self.local_replica_grad_buffer.dtype == torch.float32
+            assert self.local_replica_grad_buffer.shape == (
+                self.num_local_redundant_experts,
+                self.expert_total_numel,
+            )
 
     def get_comm_stream(self) -> torch.Stream:
         ts: torch.Stream = self.runtime.get_comm_stream()
