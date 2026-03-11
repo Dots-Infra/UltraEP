@@ -6,6 +6,7 @@ import setuptools
 import importlib
 
 from pathlib import Path
+import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -114,13 +115,15 @@ if __name__ == "__main__":
                 "Set TORCH_CUDA_ARCH_LIST manually to override."
             )
 
-    # CUDA 12 flags
     nvcc_flags.extend(
         [
             # "-rdc=true",
             "--ptxas-options=--register-usage-level=10"
         ]
     )
+    # Compilation workaround for CUDA 13.x
+    if torch.version.cuda and torch.version.cuda.startswith("13."):
+        include_dirs.extend(["/usr/local/cuda/include/cccl/"])
 
     # Disable aggressive PTX instructions
     if int(os.getenv("DISABLE_AGGRESSIVE_PTX_INSTRS", "1")):

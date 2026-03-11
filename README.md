@@ -38,11 +38,13 @@ UltraEP uses layer-wise mappings to delineate the state of expert placement:
 
 ### Prerequisites
 - Hardware: Only support SM90 and SM100 GPUs.
-- Docker Image: Recommended to start from `nvcr.io/nvidia/pytorch:25.06-py3` or newer (CUDA 12.x).
 - Dependencies:
   - `nvshmem`: High-performance communication library for NVIDIA GPUs.
   ```bash
+  # For CUDA 12.x
   pip install nvidia-nvshmem-cu12
+  # For CUDA 13.x
+  pip install nvdia-nvshmem-cu13==3.4.5
   ```
 
 ### Build and Install
@@ -52,7 +54,11 @@ git clone https://github.com/your-repo/UltraEP.git
 cd UltraEP
 
 # Build the project
+# CUDA 12.x
 ./build.sh
+# For CUDA 13.x, you need to compile NVSHMEM v3.4.5 from source first,
+# then set the installation path
+NVSHMEM_DIR=/path/to/nvshmem/install python setup.py bdist_wheel
 
 # Install the generated wheel
 pip install dist/*.whl
