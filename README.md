@@ -73,6 +73,19 @@ Used during the **backward** pass of training. It aggregates (reduces) gradients
 ### 3. `update_placement` (CPU)
 Dynamically adjusts expert placement based on real-time load statistics. It runs an EPLB-style greedy replication and bin-packing algorithm on the CPU. The algorithm is deterministic, ensuring all ranks compute identical placements without additional communication.
 
+### GPU Placement Solver
+UltraEP now also supports a GPU placement path via `Manager(..., use_gpu_solver=True)`.
+The manager pre-creates `PlacementSolverGPU` and keeps the hot-path buffers resident on device, so `update_placement()` can stay on GPU after the NVSHMEM allreduce instead of paying the usual D2H sync, CPU solve, and H2D copy cost.
+
+The current GPU solver targets the common EPLB workloads where `num_ranks` is 32 or 64, the global expert count is 128/192/256, and each rank has 1 or 2 redundant experts. The solver keeps the same placement invariants as the CPU implementation and is exercised by:
+
+```bash
+python3 tests/bench_placement_solver_standalone.py --solver both
+torchrun --nproc_per_node=4 tests/test_gpu_vs_cpu_benchmark.py --benchmark all
+```
+
+`balance_threshold` is an optional early-stop knob for replica allocation. When it is greater than `0`, the solver stops adding more replicas once each expert's per-replica load is within `balance_threshold x average_per_slot_load`. In practice, a slightly larger threshold trades a bit of placement optimality for less `weight_sync` / `grad_reduce` traffic and lower EPLB overhead.
+
 ### 4. `reroute` (CUDA)
 A high-performance CUDA kernel that expands token routing from logical experts to physical experts. It uses deterministic round-robin dispatch to distribute tokens among master and replica instances, effectively balancing the computation load across the NVLINK domain.
 

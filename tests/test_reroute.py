@@ -39,7 +39,13 @@ def setup_distributed():
     return dist.group.WORLD
 
 
-def create_manager(group, num_layers, num_local_master, num_local_redundant):
+def create_manager(
+    group,
+    num_layers,
+    num_local_master,
+    num_local_redundant,
+    use_gpu_solver=False,
+):
     """Create a Manager with CUDA reroute enabled and minimal expert buffer sizes."""
     return ultra_ep.Manager(
         group=group,
@@ -49,6 +55,7 @@ def create_manager(group, num_layers, num_local_master, num_local_redundant):
         expert_fc1_numel=64,
         expert_fc2_numel=64,
         explicitly_destroy=True,
+        use_gpu_solver=use_gpu_solver,
     )
 
 
@@ -302,6 +309,7 @@ def main():
     parser.add_argument("--T", type=int, default=8192, help="Number of tokens")
     parser.add_argument("--topk", type=int, default=8, help="Top-k experts per token")
     parser.add_argument("--bench-iters", type=int, default=200)
+    parser.add_argument("--gpu-solver", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -312,11 +320,16 @@ def main():
         f"Config: world_size={world_size}, "
         f"num_local_master={args.num_local_master}, "
         f"num_local_redundant={args.num_local_redundant}, "
-        f"T={args.T}, topk={args.topk}"
+        f"T={args.T}, topk={args.topk}, "
+        f"solver={'GPU' if args.gpu_solver else 'CPU'}"
     )
 
     mgr = create_manager(
-        group, args.num_layers, args.num_local_master, args.num_local_redundant
+        group,
+        args.num_layers,
+        args.num_local_master,
+        args.num_local_redundant,
+        use_gpu_solver=args.gpu_solver,
     )
 
     L = mgr.num_global_logical_experts

@@ -15,18 +15,12 @@ struct GradReduceTask {
     size_t numel;
 };
 
-// Run gradient reduce operation across all tasks
-// Parameters:
-//   grad_reduce_tasks_cpu: Host-side array of tasks (will be copied to GPU)
-//   grad_reduce_tasks_gpu: Device-side buffer for tasks
-//   global_tile_counter_gpu: Device-side atomic counter for tile distribution
-//   task_tile_offsets_gpu: Device-side buffer for prefix sum of tile counts (size: total_tasks + 1)
-//   total_tasks: Number of tasks
-//   stream: CUDA stream for async execution
-//   num_device_sms: Number of SMs on the device
+// Run gradient reduce operation across all tasks (CPU task-build path)
+// task_metadata_gpu: device buffer [2], written by this function as {total_tasks, total_tiles}
 void run_grad_reduce_low_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                             GradReduceTask* grad_reduce_tasks_gpu,
                             int* global_task_counter_gpu,
+                            int* task_metadata_gpu,
                             const int total_tasks,
                             cudaStream_t stream,
                             const int num_device_sms);
@@ -34,9 +28,26 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                              GradReduceTask* grad_reduce_tasks_gpu,
                              int* global_tile_counter_gpu,
                              int* task_tile_offsets_gpu,
+                             int* task_metadata_gpu,
                              const int total_tasks,
                              cudaStream_t stream,
                              const int num_device_sms);
+
+// Run gradient reduce using GPU-resident tasks (no H2D copy)
+// task_metadata_gpu must already contain {total_tasks, total_tiles} (written by build kernel)
+void run_grad_reduce_low_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
+                                     int* global_task_counter_gpu,
+                                     int* task_metadata_gpu,
+                                     cudaStream_t stream,
+                                     int num_device_sms,
+                                     int max_possible_tasks);
+void run_grad_reduce_high_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
+                                      int* task_tile_offsets_gpu,
+                                      int* task_metadata_gpu,
+                                      int* global_tile_counter_gpu,
+                                      cudaStream_t stream,
+                                      int num_device_sms,
+                                      int max_possible_tiles);
 
 // ============================================================================
 // Weight Sync: Broadcast master weights to replicas
@@ -51,24 +62,74 @@ struct WeightSyncTask {
     size_t numel;                                                  // Number of elements
 };
 
-// Run weight sync operation (master broadcasts to all replicas)
-// Parameters:
-//   weight_sync_tasks_cpu: Host-side array of broadcast tasks
-//   weight_sync_tasks_gpu: Device-side buffer for tasks
-//   global_tile_counter_gpu: Device-side atomic counter for tile distribution
-//   task_tile_offsets_gpu: Device-side buffer for prefix sum of tile counts
-//   task_tile_offsets_cpu: Host-side buffer for prefix sum of tile counts
-//   total_tasks: Number of broadcast tasks
-//   stream: CUDA stream for async execution
-//   num_device_sms: Number of SMs on the device
+// Run weight sync operation — CPU task-build path
+// task_metadata_gpu: device buffer [2], written by this function as {total_tasks, total_tiles}
 void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                      WeightSyncTask* weight_sync_tasks_gpu,
                      int* global_tile_counter_gpu,
                      int* task_tile_offsets_gpu,
                      int* task_tile_offsets_cpu,
+                     int* task_metadata_gpu,
                      const int total_tasks,
                      cudaStream_t stream,
                      const int num_device_sms);
+
+// Run weight sync using GPU-resident tasks (no H2D copy)
+void run_weight_sync_from_gpu(WeightSyncTask* tasks_gpu,
+                              int* task_tile_offsets_gpu,
+                              int* task_metadata_gpu,
+                              int* global_tile_counter_gpu,
+                              cudaStream_t stream,
+                              int num_device_sms,
+                              int max_possible_tiles);
+
+// ============================================================================
+// GPU Task Build: Build weight_sync/grad_reduce tasks entirely on GPU
+// ============================================================================
+
+// Immutable config for GPU task build kernels (copied to GPU once in Manager ctor)
+struct TaskBuildConfig {
+    int rank_idx;
+    int nvl_rank_idx;
+    int num_nvl_ranks;
+    int num_local_master_experts;
+    int num_local_physical_experts;
+    int num_local_redundant_experts;
+    int64_t expert_fc1_numel;
+    int64_t expert_fc2_numel;
+    int64_t expert_total_numel;
+    int max_replicas_dim;
+};
+
+// Build weight sync task array on GPU from placement data.
+// Writes tasks, tile_offsets, and task_metadata ({total_tasks, total_tiles}).
+// Also resets global_tile_counter to 0.
+void build_weight_sync_tasks(const TaskBuildConfig* config_gpu,
+                             const int32_t* p2l_gpu,
+                             const int32_t* l2p_gpu,
+                             const int32_t* lcnts_gpu,
+                             void* const* remote_weight_ptrs_gpu,
+                             const int64_t* local_master_fc1_ptrs_gpu,
+                             const int64_t* local_master_fc2_ptrs_gpu,
+                             WeightSyncTask* tasks_gpu,
+                             int* task_tile_offsets_gpu,
+                             int* task_metadata_gpu,
+                             int* global_tile_counter_gpu,
+                             cudaStream_t stream);
+
+// Build grad reduce task array on GPU from placement data.
+void build_grad_reduce_tasks(const TaskBuildConfig* config_gpu,
+                             const int32_t* p2l_gpu,
+                             const int32_t* l2p_gpu,
+                             const int32_t* lcnts_gpu,
+                             void* const* remote_grad_ptrs_gpu,
+                             const int64_t* local_master_fc1_ptrs_gpu,
+                             const int64_t* local_master_fc2_ptrs_gpu,
+                             GradReduceTask* tasks_gpu,
+                             int* task_tile_offsets_gpu,
+                             int* task_metadata_gpu,
+                             int* global_task_or_tile_counter_gpu,
+                             cudaStream_t stream);
 
 // ============================================================================
 // Reroute: Expand logical routing map to physical routing map (CUDA path)

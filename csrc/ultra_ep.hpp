@@ -92,6 +92,12 @@ struct GlobalExpertPlacement {
                 const bool async = true,
                 std::optional<at::cuda::CUDAStream> stream = std::nullopt) const;
 
+    // Copy placement data from GPU to CPU for one layer (layer_id >= 0) or all layers (layer_id == -1).
+    // Used to refresh the host-visible mirror on demand for CPU fallbacks and debugging.
+    void to_cpu(const int layer_id = -1,
+                const bool async = true,
+                std::optional<at::cuda::CUDAStream> stream = std::nullopt) const;
+
     // Raw pointer access for a specific layer.
     std::tuple<int32_t*, int32_t*, int32_t*> get_cpu_ptrs(int layer_id) const;
     std::tuple<int32_t*, int32_t*, int32_t*> get_gpu_ptrs(int layer_id) const;
@@ -163,7 +169,7 @@ class Manager {
     int num_global_logical_experts;
     bool is_train;
 
-    // Placement (on CPU)
+    // Placement buffers. CPU views are a host-visible mirror of the GPU state.
     GlobalExpertPlacement placement;
 
     // After NVSHMEM synchronization, this flag will be true
@@ -175,7 +181,10 @@ class Manager {
 
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
-    at::cuda::CUDAStream memset_stream;
+    // Completion event for the latest placement update / forward-buffer pre-zero.
+    // Train mode tracks one slot per layer; inference mode uses slot 0 as the shared buffer.
+    std::vector<std::optional<EventHandle>> placement_ready_events_;
+    std::vector<int64_t> placement_ready_stream_ids_;
 
     // Device-side local replica weight (bf16)/grad (fp32) buffers, shared by layers
     // Allocated via NVSHMEM symmetric heap for cross-GPU access
@@ -202,18 +211,42 @@ class Manager {
     // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
     int* _task_tile_offsets_cpu = nullptr;
 
+    // Task metadata: [total_tasks, total_tiles] written by CPU or GPU task build path,
+    // read by the main kernel from device memory.
+    int* _task_metadata_gpu = nullptr;
+
+    // GPU task build support: config + remote pointer tables + staging buffer
+    kernels::TaskBuildConfig* _task_build_config_gpu = nullptr;
+    void** _remote_weight_ptrs_gpu = nullptr;  // [MAX_NVL_DOMAIN_SIZE]
+    void** _remote_grad_ptrs_gpu = nullptr;    // [MAX_NVL_DOMAIN_SIZE]
+    int64_t* _local_master_ptrs_staging_gpu = nullptr;  // [2 * num_local_master_experts]
+    // Pre-computed upper bounds for GPU-path grid sizing
+    int _max_ws_total_tiles = 0;
+    int _max_gr_total_tasks = 0;
+    int _max_gr_total_tiles = 0;
+
     // Sparse reroute: per-expert round-robin counters [num_global_logical_experts]
     int* _reroute_sparse_counters_gpu = nullptr;
 
+    // Early-stop balance threshold for replica allocation
+    float balance_threshold_ = 0.0f;
+
     // Solvers
     std::unique_ptr<solver::PlacementSolver> placement_solver_;
+    std::unique_ptr<solver::PlacementSolverGPU> placement_solver_gpu_;
     std::unique_ptr<solver::RerouteSolver> reroute_solver_;
+    bool use_gpu_solver_ = false;
+    std::vector<bool> placement_cpu_dirty_;
     // Shape: [num_global_logical_experts]
     int* global_logical_expert_loads_cpu = nullptr;  // pinned memory for CPU-side placement solver
     int* global_logical_expert_loads_gpu = nullptr;  // alloc by nvshmem for allreduce
 
     // Reroute output buffer management
     std::unique_ptr<RerouteOutputBuffer> reroute_output_buffer_;
+
+    int placement_sync_slot(const int layer_id) const { return is_train ? layer_id : 0; }
+    void record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream);
+    void wait_for_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream) const;
 
 public:
     Manager(const int& num_layers,
@@ -222,10 +255,13 @@ public:
             const int64_t& expert_fc1_numel,
             const int64_t& expert_fc2_numel,
             const bool& is_train,
-            const bool& explicitly_destroy);
+            const bool& explicitly_destroy,
+            const bool& use_gpu_solver = false,
+            const float& balance_threshold = 0.0f);
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
+    void sync_placement_to_cpu(const int layer_id = -1);
 
     // Aggregate grad from remote replicas to local master
     // then zero-out replica grad buffers
@@ -250,7 +286,7 @@ public:
 
     // Update expert placement for a single layer based on real-time load statistics.
     // routing_map: [num_tokens, num_global_logical_experts], bool, logical routing map.
-    // Runs entirely on CPU. Deterministic across all ranks.
+    // Runs on CPU or GPU depending on use_gpu_solver_. Deterministic across all ranks.
     void update_placement(const int& layer_id, torch::Tensor& routing_map);
 
     // Sparse variant: compute expert loads from topk_ids [T, K] int64 instead of dense routing_map.
@@ -302,9 +338,19 @@ public:
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<Manager>(m, "Manager")
-        .def(pybind11::init<int, int, int, int64_t, int64_t, bool, bool>())
+        .def(pybind11::init<int, int, int, int64_t, int64_t, bool, bool, bool, float>(),
+             pybind11::arg("num_layers"),
+             pybind11::arg("num_local_master_experts"),
+             pybind11::arg("num_local_redundant_experts"),
+             pybind11::arg("expert_fc1_numel"),
+             pybind11::arg("expert_fc2_numel"),
+             pybind11::arg("is_train"),
+             pybind11::arg("explicitly_destroy"),
+             pybind11::arg("use_gpu_solver") = false,
+             pybind11::arg("balance_threshold") = 0.0f)
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
+        .def("sync_placement_to_cpu", &Manager::sync_placement_to_cpu, pybind11::arg("layer_id") = -1)
         .def("update_placement", &Manager::update_placement)
         .def("update_placement_sparse", &Manager::update_placement_sparse)
         .def("reroute_sparse", &Manager::reroute_sparse)
