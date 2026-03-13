@@ -1,5 +1,5 @@
 """
-Standalone benchmark for PlacementSolver / PlacementSolverGPU.
+Standalone benchmark for PlacementSolver / PlacementSolverGPU / PlacementSolverQuota.
 
 This script does not require torch.distributed or UltraEP Manager. It directly
 instantiates the placement solvers and simulates multi-rank EP workloads on a
@@ -7,16 +7,23 @@ single process by configuring the global logical/physical expert layout through
 EPConfig.
 
 Features:
-  - solver-only latency benchmark (CPU / GPU)
+  - solver-only latency benchmark (CPU / GPU / Quota)
   - placement invariant validation
   - load-balance quality reporting
   - GPU-vs-CPU quality check
+  - Quota solver correctness + latency vs GPU solver
 
 Example:
     python3 tests/bench_placement_solver_standalone.py \
         --workloads 32:4:2:32,64:4:2:64 \
         --distributions uniform,zipf,multi_hot \
         --solver both
+
+    # 包含 quota solver benchmark
+    python3 tests/bench_placement_solver_standalone.py \
+        --workloads 32:4:2:32,64:4:2:64 \
+        --distributions uniform,zipf,multi_hot \
+        --solver both --quota
 """
 
 import argparse
@@ -37,6 +44,13 @@ from test_placement import (
     run_solver,
     validate_placement,
 )
+from test_placement_quota import split_loads_per_rank
+
+try:
+    import ultra_ep._C as _C
+except ImportError:
+    print("ERROR: Cannot import ultra_ep._C.", file=sys.stderr)
+    sys.exit(1)
 
 
 def parse_workload(spec: str) -> EPConfig:
@@ -217,6 +231,223 @@ def run_gpu_benchmark(
     return summarize_times_us(times_us), metrics
 
 
+# ============================================================================
+# Quota solver helpers and benchmark
+# ============================================================================
+
+
+def make_quota_solver_and_buffers(config: EPConfig):
+    """Create PlacementSolverQuota + CUDA output tensors."""
+    num_global_logical = config.num_local_master * config.num_ranks
+    num_local_physical = config.num_local_master + config.num_local_redundant
+    num_global_physical = num_local_physical * config.num_ranks
+    max_replicas_dim = config.num_ranks
+
+    solver = _C.PlacementSolverQuota(
+        num_global_logical,
+        config.num_ranks,
+        config.num_local_master,
+        config.num_local_redundant,
+        config.num_nvl_ranks,
+        max_replicas_dim,
+    )
+
+    p2l = torch.full((num_global_physical,), -1, dtype=torch.int32, device="cuda")
+    l2p = torch.full((num_global_logical, max_replicas_dim), -1, dtype=torch.int32, device="cuda")
+    lcnts = torch.zeros(num_global_logical, dtype=torch.int32, device="cuda")
+    quota = torch.zeros((num_global_logical, max_replicas_dim), dtype=torch.int32, device="cuda")
+    quota_prefix = torch.zeros_like(quota)
+    rank_quota_prefix = torch.zeros_like(quota)
+
+    return solver, p2l, l2p, lcnts, quota, quota_prefix, rank_quota_prefix
+
+
+def validate_quota_tensors(
+    loads: torch.Tensor,
+    expert_loads_per_rank: torch.Tensor,
+    lcnts: torch.Tensor,
+    quota: torch.Tensor,
+    quota_prefix: torch.Tensor,
+    rank_quota_prefix: torch.Tensor,
+    config: EPConfig,
+) -> Dict[str, object]:
+    """验证 quota/quota_prefix/rank_quota_prefix 的正确性。"""
+    L = loads.numel()
+    R = quota.size(1)
+    my_rank = 0  # standalone 模式下 runtime 未初始化，solver 使用 rank 0
+
+    errors = []
+    for l in range(L):
+        C = int(lcnts[l].item())
+        assert C >= 1, f"expert {l}: lcnts={C} < 1"
+
+        # quota 各 replica 之和等于 total load
+        quota_sum = int(quota[l, :C].sum().item())
+        total_load = int(loads[l].item())
+        if quota_sum != total_load:
+            errors.append(f"expert {l}: quota sum={quota_sum} != load={total_load}")
+
+        # quota_prefix 单调不降，最后一项等于 total load
+        if C > 0 and int(quota_prefix[l, C - 1].item()) != total_load:
+            errors.append(
+                f"expert {l}: quota_prefix[C-1]={quota_prefix[l, C-1].item()} != load={total_load}"
+            )
+        for j in range(1, C):
+            if int(quota_prefix[l, j].item()) < int(quota_prefix[l, j - 1].item()):
+                errors.append(f"expert {l}: quota_prefix not monotonic at j={j}")
+
+        # rank_quota_prefix[C-1] 等于 my_rank 的本地 load
+        local_load = int(expert_loads_per_rank[my_rank, l].item())
+        if C > 0 and int(rank_quota_prefix[l, C - 1].item()) != local_load:
+            errors.append(
+                f"expert {l}: rank_quota_prefix[C-1]={rank_quota_prefix[l, C-1].item()} "
+                f"!= local_load={local_load}"
+            )
+
+        # 超出 C 的位置应为 0
+        for j in range(C, R):
+            if int(quota[l, j].item()) != 0:
+                errors.append(f"expert {l}: quota[{j}]={quota[l, j].item()} should be 0")
+
+    if errors:
+        raise AssertionError("\n  ".join(errors[:5]))  # 只打印前 5 个
+
+    return {"quota_ok": True, "num_experts_checked": L}
+
+
+def compute_quota_imbalance(
+    l2p: torch.Tensor,    # (num_global_logical, max_replicas_dim), int32, CPU
+    lcnts: torch.Tensor,  # (num_global_logical,), int32, CPU
+    quota: torch.Tensor,  # (num_global_logical, max_replicas_dim), int32, CPU
+    config: EPConfig,
+) -> float:
+    """基于实际 quota 分配计算真实负载不均衡度。
+
+    validate_placement() 假设 round-robin 均分（load / lcnts），但 quota solver
+    为每个 replica 分配不等的 quota。本函数累加每个 rank 上所有 replica 的实际
+    quota 作为真实负载，并以 max / mean 返回不均衡度。
+    """
+    num_local_physical = config.num_local_master + config.num_local_redundant
+    rank_load: List[float] = [0.0] * config.num_ranks
+    L = quota.size(0)
+    for l in range(L):
+        C = int(lcnts[l].item())
+        for j in range(C):
+            phys_idx = int(l2p[l, j].item())
+            if phys_idx >= 0:
+                rank = phys_idx // num_local_physical
+                rank_load[rank] += int(quota[l, j].item())
+    total = sum(rank_load)
+    if total <= 0:
+        return 1.0
+    mean_load = total / config.num_ranks
+    return max(rank_load) / mean_load
+
+
+def run_quota_benchmark(
+    config: EPConfig,
+    loads: torch.Tensor,
+    warmup_iters: int,
+    bench_iters: int,
+    verbose: bool,
+    locality_aware: bool = True,
+    min_tokens_per_replica: int = 1,
+) -> Tuple[Dict[str, float], Dict[str, object]]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA device is required for PlacementSolverQuota")
+
+    solver, p2l, l2p, lcnts, quota, quota_prefix, rank_quota_prefix = (
+        make_quota_solver_and_buffers(config)
+    )
+    loads_gpu = loads.cuda()
+    # 预计算 per-rank loads（不计入 solver 计时）
+    expert_loads_per_rank = split_loads_per_rank(loads, config.num_ranks).cuda()
+
+    def reset():
+        p2l.fill_(-1)
+        l2p.fill_(-1)
+        lcnts.fill_(0)
+        quota.fill_(0)
+        quota_prefix.fill_(0)
+        rank_quota_prefix.fill_(0)
+
+    def solve_once():
+        solver.solve(
+            loads_gpu,
+            expert_loads_per_rank,
+            p2l, l2p, lcnts,
+            quota, quota_prefix, rank_quota_prefix,
+            1.0,                     # balance_threshold
+            min_tokens_per_replica,  # min_tokens_per_replica
+            True,                    # allow_zero_master_quota
+            locality_aware,
+        )
+
+    # Warmup
+    for _ in range(warmup_iters):
+        reset()
+        solve_once()
+    torch.cuda.synchronize()
+
+    # 正确性验证
+    reset()
+    solve_once()
+    torch.cuda.synchronize()
+    placement_metrics = validate_placement(
+        loads, p2l.cpu(), l2p.cpu(), lcnts.cpu(), config, verbose=verbose
+    )
+    validate_quota_tensors(
+        loads,
+        expert_loads_per_rank.cpu(),
+        lcnts.cpu(),
+        quota.cpu(),
+        quota_prefix.cpu(),
+        rank_quota_prefix.cpu(),
+        config,
+    )
+    # 用实际 quota 计算真实不均衡度（替代 round-robin 假设的 imbalance_ratio）
+    placement_metrics["quota_imbalance"] = compute_quota_imbalance(
+        l2p.cpu(), lcnts.cpu(), quota.cpu(), config
+    )
+
+    # 计时（CUDA event）
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    times_us = []
+    for _ in range(bench_iters):
+        reset()
+        start_evt.record()
+        solve_once()
+        end_evt.record()
+        torch.cuda.synchronize()
+        times_us.append(start_evt.elapsed_time(end_evt) * 1000.0)  # ms → µs
+
+    return summarize_times_us(times_us), placement_metrics
+
+
+def print_quota_report(
+    latency: Dict[str, float],
+    metrics: Dict[str, object],
+    baseline: float,
+    gpu_latency: Dict[str, float] = None,
+    locality_aware: bool = True,
+) -> None:
+    # 优先使用 quota-aware 不均衡度；若尚未计算（旧调用路径）则降级到 round-robin 值
+    imbalance = metrics.get("quota_imbalance", metrics["imbalance_ratio"])
+    improvement = baseline / imbalance if imbalance > 0 else 0.0
+    locality_tag = "locality=on" if locality_aware else "locality=off"
+    speedup_str = ""
+    if gpu_latency is not None:
+        speedup = gpu_latency["mean"] / max(latency["mean"], 1e-9)
+        speedup_str = f"  vs_gpu_solver={speedup:.2f}x"
+    print(
+        f"  Quota({locality_tag}) {format_latency(latency)}  "
+        f"imbalance={imbalance:.4f}  "
+        f"fill={metrics['total_filled_redundant']}/{metrics['max_possible_redundant']}  "
+        f"vs_master_only={improvement:.2f}x{speedup_str}"
+    )
+
+
 def print_solver_report(
     solver_name: str,
     latency: Dict[str, float],
@@ -246,6 +477,8 @@ def benchmark_one_distribution(
     quality_tolerance: float,
     seed: int,
     verbose: bool,
+    quota: bool = False,
+    locality_aware: bool = True,
 ) -> bool:
     num_experts = config.num_ranks * config.num_local_master
     loads = generate_loads(dist_name, num_experts, total_tokens, seed)
@@ -293,6 +526,28 @@ def benchmark_one_distribution(
         if not quality_ok:
             all_passed = False
 
+    # ---- Quota solver ----
+    quota_latency = quota_metrics = None
+    if quota:
+        if not torch.cuda.is_available():
+            print("  Quota SKIP  CUDA device is not available")
+            all_passed = False
+        else:
+            for loc in ([True, False] if config.num_local_redundant > 0 else [True]):
+                try:
+                    quota_latency, quota_metrics = run_quota_benchmark(
+                        config, loads, warmup_iters, bench_iters, verbose,
+                        locality_aware=loc,
+                    )
+                    print_quota_report(
+                        quota_latency, quota_metrics, baseline,
+                        gpu_latency=gpu_latency,
+                        locality_aware=loc,
+                    )
+                except AssertionError as exc:
+                    print(f"  Quota(locality={'on' if loc else 'off'}) FAIL  {exc}")
+                    all_passed = False
+
     return all_passed
 
 
@@ -306,6 +561,8 @@ def benchmark_workload(
     quality_tolerance: float,
     seed: int,
     verbose: bool,
+    quota: bool = False,
+    locality_aware: bool = True,
 ) -> bool:
     print("\n" + "=" * 100)
     print(f"Workload: {format_config(config)}")
@@ -324,6 +581,8 @@ def benchmark_workload(
             quality_tolerance=quality_tolerance,
             seed=dist_seed,
             verbose=verbose,
+            quota=quota,
+            locality_aware=locality_aware,
         ) and ok
     return ok
 
@@ -354,6 +613,22 @@ def main() -> None:
     parser.add_argument("--quality-tolerance", type=float, default=1.01)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--quota",
+        action="store_true",
+        help="同时跑 PlacementSolverQuota benchmark（locality=on 和 off 各一轮）",
+    )
+    parser.add_argument(
+        "--locality-aware",
+        action="store_true",
+        default=True,
+        help="quota solver 是否启用 locality-aware 放置（默认 True，--no-locality-aware 关闭）",
+    )
+    parser.add_argument(
+        "--no-locality-aware",
+        dest="locality_aware",
+        action="store_false",
+    )
     args = parser.parse_args()
 
     try:
@@ -367,6 +642,10 @@ def main() -> None:
         print("WARNING: CUDA is not available, falling back to CPU-only mode.")
         args.solver = "cpu"
 
+    if args.quota and not torch.cuda.is_available():
+        print("WARNING: CUDA is not available, --quota will be skipped.")
+        args.quota = False
+
     all_passed = True
     for config in workloads:
         all_passed = benchmark_workload(
@@ -379,6 +658,8 @@ def main() -> None:
             quality_tolerance=args.quality_tolerance,
             seed=args.seed,
             verbose=args.verbose,
+            quota=args.quota,
+            locality_aware=args.locality_aware,
         ) and all_passed
 
     print("\n" + ("ALL CHECKS PASSED" if all_passed else "SOME CHECKS FAILED"))

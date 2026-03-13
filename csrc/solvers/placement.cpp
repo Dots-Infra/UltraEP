@@ -109,7 +109,7 @@ void PlacementSolver::solve(const int32_t* __restrict__ expert_loads,
             }
 
             // Early-stop: all experts' per-replica load is within threshold of average
-            if (balance_threshold > 0.0f && avg_per_slot > 0.0 &&
+            if (balance_threshold > 1.0f && avg_per_slot > 0.0 &&
                 best_score <= avg_per_slot * balance_threshold) {
                 break;
             }

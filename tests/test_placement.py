@@ -70,7 +70,7 @@ def run_solver(
     p2l: torch.Tensor,
     l2p: torch.Tensor,
     lcnts: torch.Tensor,
-    balance_threshold: float = 0.0,
+    balance_threshold: float = 1.0,
 ):
     """Run solver and return the output tensors (modified in-place)."""
     solver.solve(expert_loads, p2l, l2p, lcnts, balance_threshold)
@@ -515,7 +515,7 @@ def run_gpu_solver(
     p2l: torch.Tensor,
     l2p: torch.Tensor,
     lcnts: torch.Tensor,
-    balance_threshold: float = 0.0,
+    balance_threshold: float = 1.0,
 ):
     """Run GPU solver and synchronize."""
     solver_gpu.solve(expert_loads, p2l, l2p, lcnts, balance_threshold)
@@ -837,8 +837,8 @@ def test_early_stop_skewed_load(config: EPConfig) -> bool:
 
 
 def test_early_stop_disabled(config: EPConfig) -> bool:
-    """threshold=0 与无 threshold 结果一致。"""
-    print(f"\n{'-'*40} Early-Stop: Disabled (threshold=0) {'-'*40}")
+    """threshold=1.0 (default) 与无 threshold 参数结果一致。"""
+    print(f"\n{'-'*40} Early-Stop: Disabled (threshold=1.0) {'-'*40}")
 
     num_global_logical = config.num_local_master * config.num_ranks
     solver, p2l_a, l2p_a, lcnts_a = make_solver_and_buffers(config)
@@ -846,8 +846,8 @@ def test_early_stop_disabled(config: EPConfig) -> bool:
 
     loads = gen_zipf(num_global_logical, alpha=1.5)
 
-    # Run with threshold=0 (explicit)
-    run_solver(solver, loads, p2l_a, l2p_a, lcnts_a, balance_threshold=0.0)
+    # Run with threshold=1.0 (explicit default)
+    run_solver(solver, loads, p2l_a, l2p_a, lcnts_a, balance_threshold=1.0)
     # Run without threshold (default)
     solver.solve(loads, p2l_b, l2p_b, lcnts_b)
 
@@ -862,12 +862,12 @@ def test_early_stop_disabled(config: EPConfig) -> bool:
         print("  FAIL — lcnts differs")
         ok = False
     if ok:
-        print("  PASS — threshold=0 produces same result as default")
+        print("  PASS — threshold=1.0 produces same result as default")
     return ok
 
 
 def test_early_stop_reduces_replicas(config: EPConfig) -> bool:
-    """threshold > 0 产生的 replica 数 ≤ 无 threshold 时的 replica 数。"""
+    """threshold > 1 产生的 replica 数 ≤ threshold=1 时的 replica 数。"""
     print(f"\n{'-'*40} Early-Stop: Reduces Replicas {'-'*40}")
 
     num_global_logical = config.num_local_master * config.num_ranks
@@ -880,7 +880,7 @@ def test_early_stop_reduces_replicas(config: EPConfig) -> bool:
 
         # Full replication (no early-stop)
         p2l_full.fill_(-1); l2p_full.fill_(-1); lcnts_full.fill_(0)
-        run_solver(solver, loads, p2l_full, l2p_full, lcnts_full, balance_threshold=0.0)
+        run_solver(solver, loads, p2l_full, l2p_full, lcnts_full, balance_threshold=1.0)
         full_replicas = lcnts_full.sum().item() - num_global_logical
 
         # With early-stop

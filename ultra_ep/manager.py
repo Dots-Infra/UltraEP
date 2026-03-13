@@ -24,7 +24,11 @@ class Manager:
         explicitly_destroy: bool = False,
         max_microbatches: int = 1,
         use_gpu_solver: bool = False,
-        balance_threshold: float = 0.0,
+        balance_threshold: float = 1.0,
+        use_quota_solver: bool = False,
+        quota_locality_aware: bool = True,
+        quota_min_tokens_per_replica: int = 1,
+        quota_allow_zero_master_quota: bool = True,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -86,6 +90,7 @@ class Manager:
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
         self.use_gpu_solver = use_gpu_solver
+        self.use_quota_solver = use_quota_solver
         self.runtime = _C.Manager(
             self.num_alloc_layers,
             num_local_master_experts,
@@ -96,6 +101,10 @@ class Manager:
             explicitly_destroy,
             use_gpu_solver,
             balance_threshold,
+            use_quota_solver,
+            quota_locality_aware,
+            quota_min_tokens_per_replica,
+            quota_allow_zero_master_quota,
         )
         assert self.runtime.is_available()
 
@@ -109,6 +118,15 @@ class Manager:
         )
         self._logical_replica_counts: torch.Tensor = (
             self.runtime.get_logical_replica_counts_tensor()
+        )
+        self._logical_instance_quota: torch.Tensor = (
+            self.runtime.get_logical_instance_quota_tensor()
+        )
+        self._logical_instance_quota_prefix: torch.Tensor = (
+            self.runtime.get_logical_instance_quota_prefix_tensor()
+        )
+        self._rank_quota_prefix: torch.Tensor = (
+            self.runtime.get_rank_quota_prefix_tensor()
         )
         # Replica weight buffer shared by layers on GPU
         self.local_replica_weight_buffer: torch.Tensor = (
@@ -143,6 +161,31 @@ class Manager:
     def logical_replica_counts(self) -> torch.Tensor:
         self.sync_placement_to_cpu()
         return self._logical_replica_counts
+
+    @property
+    def logical_instance_quota(self) -> torch.Tensor:
+        self.sync_placement_to_cpu()
+        return self._logical_instance_quota
+
+    @property
+    def logical_instance_quota_prefix(self) -> torch.Tensor:
+        self.sync_placement_to_cpu()
+        return self._logical_instance_quota_prefix
+
+    @property
+    def rank_quota_prefix(self) -> torch.Tensor:
+        return self._rank_quota_prefix
+
+    def get_quota_tensor(self, layer_id: int) -> torch.Tensor:
+        self.sync_placement_to_cpu(layer_id)
+        return self._logical_instance_quota[layer_id]
+
+    def get_quota_prefix_tensor(self, layer_id: int) -> torch.Tensor:
+        self.sync_placement_to_cpu(layer_id)
+        return self._logical_instance_quota_prefix[layer_id]
+
+    def get_rank_quota_prefix_tensor(self, layer_id: int) -> torch.Tensor:
+        return self._rank_quota_prefix[layer_id]
 
     def destroy(self):
         assert self.explicitly_destroy
@@ -415,6 +458,8 @@ class Manager:
                 layer_id, probs, routing_map
             )
         elif backend == "cpu":
+            if self.use_quota_solver:
+                raise ValueError("CPU reroute is not supported when use_quota_solver=True")
             expanded_probs, expanded_routing_map = self._reroute_cpu(
                 layer_id, probs, routing_map
             )
@@ -520,6 +565,8 @@ class Manager:
         topk_ids: torch.Tensor,
     ):
         assert layer_id < self.num_alloc_layers
+        if self.use_quota_solver:
+            raise ValueError("Sparse reroute is not supported when use_quota_solver=True")
 
         if self.log_expert_loads:
             # Compute original logical expert loads before rerouting.
@@ -566,11 +613,15 @@ class Manager:
             self._physical_to_logical_map.device == torch.device("cpu")
             and self._logical_to_physical_map.device == torch.device("cpu")
             and self._logical_replica_counts.device == torch.device("cpu")
+            and self._logical_instance_quota.device == torch.device("cpu")
+            and self._logical_instance_quota_prefix.device == torch.device("cpu")
         )
         assert (
             self._physical_to_logical_map.dtype == torch.int32
             and self._logical_to_physical_map.dtype == torch.int32
             and self._logical_replica_counts.dtype == torch.int32
+            and self._logical_instance_quota.dtype == torch.int32
+            and self._logical_instance_quota_prefix.dtype == torch.int32
         )
         assert (
             self._physical_to_logical_map.shape
@@ -585,6 +636,17 @@ class Manager:
                 self.num_alloc_layers,
                 self.num_global_logical_experts,
             )
+            and self._logical_instance_quota.shape
+            == (self.num_alloc_layers, self.num_global_logical_experts, self.num_ranks)
+            and self._logical_instance_quota_prefix.shape
+            == (self.num_alloc_layers, self.num_global_logical_experts, self.num_ranks)
+        )
+        assert self._rank_quota_prefix.device == torch.device("cuda", self.device)
+        assert self._rank_quota_prefix.dtype == torch.int32
+        assert self._rank_quota_prefix.shape == (
+            self.num_alloc_layers,
+            self.num_global_logical_experts,
+            self.num_ranks,
         )
         assert self.local_replica_weight_buffer.device == torch.device(
             "cuda", self.device

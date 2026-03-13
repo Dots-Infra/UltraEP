@@ -54,7 +54,7 @@ public:
                int32_t* __restrict__ p2l_map,
                int32_t* __restrict__ l2p_map,
                int32_t* __restrict__ lcnts,
-               float balance_threshold = 0.0f) const;
+               float balance_threshold = 1.0f) const;
 
 private:
     // ---- Configuration (immutable after construction) ----
@@ -138,7 +138,59 @@ public:
                int32_t* l2p_gpu,
                int32_t* lcnts_gpu,
                cudaStream_t stream,
-               float balance_threshold = 0.0f) const;
+               float balance_threshold = 1.0f) const;
+
+private:
+    int num_global_logical_experts_;
+    int num_ranks_;
+    int num_local_master_;
+    int num_local_redundant_;
+    int num_nvl_ranks_;
+    int max_replicas_dim_;
+    int num_local_physical_;
+    int num_global_physical_;
+    int num_nvl_domains_;
+    int num_logical_per_nvl_;
+    int num_redundant_per_nvl_;
+};
+
+/**
+ * PlacementSolverQuota: quota-aware placement solver.
+ *
+ * Runs entirely on GPU.  For each NVL domain, a single CUDA block:
+ *   - binary-searches the minimum feasible quota threshold
+ *   - uses warp-cooperative feasibility oracles and multi-warp probing to
+ *     accelerate the skewed-load search path
+ *   - materializes p2l/l2p/lcnts and per-instance quotas
+ *   - fuses the locality-aware per-rank quota decomposition
+ *
+ * The locality phase bulk-loads per-rank expert loads into shared memory and
+ * writes the current rank's `rank_quota_prefix` slice directly on device, so
+ * the dense reroute path stays on the pure-CUDA fast path.
+ */
+class PlacementSolverQuota {
+public:
+    PlacementSolverQuota(int num_global_logical_experts,
+                         int num_ranks,
+                         int num_local_master_experts,
+                         int num_local_redundant_experts,
+                         int num_nvl_ranks,
+                         int max_replicas_dim);
+    ~PlacementSolverQuota();
+
+    void solve(const int32_t* expert_loads_gpu,
+               const int32_t* expert_loads_per_rank_gpu,
+               int32_t* p2l_gpu,
+               int32_t* l2p_gpu,
+               int32_t* lcnts_gpu,
+               int32_t* quota_gpu,
+               int32_t* quota_prefix_gpu,
+               int32_t* rank_quota_prefix_gpu,
+               cudaStream_t stream,
+               float balance_threshold = 1.0f,
+               int32_t min_tokens_per_replica = 1,
+               bool allow_zero_master_quota = true,
+               bool locality_aware = true) const;
 
 private:
     int num_global_logical_experts_;
@@ -227,7 +279,7 @@ inline void register_apis(pybind11::module_& m) {
              pybind11::arg("p2l_map"),
              pybind11::arg("l2p_map"),
              pybind11::arg("lcnts"),
-             pybind11::arg("balance_threshold") = 0.0f);
+             pybind11::arg("balance_threshold") = 1.0f);
 
     pybind11::class_<PlacementSolverGPU>(m, "PlacementSolverGPU")
         .def(pybind11::init<int, int, int, int, int, int>())
@@ -256,7 +308,65 @@ inline void register_apis(pybind11::module_& m) {
              pybind11::arg("p2l_map"),
              pybind11::arg("l2p_map"),
              pybind11::arg("lcnts"),
-             pybind11::arg("balance_threshold") = 0.0f);
+             pybind11::arg("balance_threshold") = 1.0f);
+
+    pybind11::class_<PlacementSolverQuota>(m, "PlacementSolverQuota")
+        .def(pybind11::init<int, int, int, int, int, int>())
+        .def("solve",
+             [](const PlacementSolverQuota& self,
+                torch::Tensor& expert_loads,
+                torch::Tensor& expert_loads_per_rank,
+                torch::Tensor& p2l_map,
+                torch::Tensor& l2p_map,
+                torch::Tensor& lcnts,
+                torch::Tensor& quota,
+                torch::Tensor& quota_prefix,
+                torch::Tensor& rank_quota_prefix,
+                float balance_threshold,
+                int32_t min_tokens_per_replica,
+                bool allow_zero_master_quota,
+                bool locality_aware) {
+                 EP_HOST_ASSERT(expert_loads.device().is_cuda() && expert_loads.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(expert_loads_per_rank.device().is_cuda() &&
+                                expert_loads_per_rank.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(p2l_map.device().is_cuda() && p2l_map.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(l2p_map.device().is_cuda() && l2p_map.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(lcnts.device().is_cuda() && lcnts.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(quota.device().is_cuda() && quota.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(quota_prefix.device().is_cuda() && quota_prefix.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(rank_quota_prefix.device().is_cuda() &&
+                                rank_quota_prefix.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(expert_loads.is_contiguous() && expert_loads_per_rank.is_contiguous());
+                 EP_HOST_ASSERT(p2l_map.is_contiguous() && l2p_map.is_contiguous() && lcnts.is_contiguous());
+                 EP_HOST_ASSERT(quota.is_contiguous() && quota_prefix.is_contiguous() &&
+                                rank_quota_prefix.is_contiguous());
+                 auto stream = at::cuda::getCurrentCUDAStream();
+                 self.solve(expert_loads.data_ptr<int32_t>(),
+                            expert_loads_per_rank.data_ptr<int32_t>(),
+                            p2l_map.data_ptr<int32_t>(),
+                            l2p_map.data_ptr<int32_t>(),
+                            lcnts.data_ptr<int32_t>(),
+                            quota.data_ptr<int32_t>(),
+                            quota_prefix.data_ptr<int32_t>(),
+                            rank_quota_prefix.data_ptr<int32_t>(),
+                            stream.stream(),
+                            balance_threshold,
+                            min_tokens_per_replica,
+                            allow_zero_master_quota,
+                            locality_aware);
+             },
+             pybind11::arg("expert_loads"),
+             pybind11::arg("expert_loads_per_rank"),
+             pybind11::arg("p2l_map"),
+             pybind11::arg("l2p_map"),
+             pybind11::arg("lcnts"),
+             pybind11::arg("quota"),
+             pybind11::arg("quota_prefix"),
+             pybind11::arg("rank_quota_prefix"),
+             pybind11::arg("balance_threshold") = 1.0f,
+             pybind11::arg("min_tokens_per_replica") = 1,
+             pybind11::arg("allow_zero_master_quota") = true,
+             pybind11::arg("locality_aware") = true);
 
     pybind11::class_<RerouteSolver>(m, "RerouteSolver")
         .def(pybind11::init<int, int, int>())

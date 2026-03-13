@@ -358,7 +358,7 @@ __global__ void placement_solve_kernel_v3(
     } else {
         // Early-stop: compute effective_B based on balance_threshold
         int effective_B = B;
-        if (balance_threshold > 0.0f) {
+        if (balance_threshold > 1.0f) {
             int total_load_local = 0;
 #pragma unroll
             for (int k = 0; k < EPL; ++k) {

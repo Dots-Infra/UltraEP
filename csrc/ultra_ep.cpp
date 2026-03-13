@@ -19,7 +19,10 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
     p2l_numel = P;
     l2p_numel = L * R;
     lcnts_numel = L;
-    per_layer_data_numel = p2l_numel + l2p_numel + lcnts_numel;
+    quota_numel = L * R;
+    quota_prefix_numel = L * R;
+    rank_quota_numel = L * R;
+    per_layer_data_numel = p2l_numel + l2p_numel + lcnts_numel + quota_numel + quota_prefix_numel;
     per_layer_data_bytes = per_layer_data_numel * static_cast<int>(sizeof(int32_t));
 
     // Align stride so each layer starts on a 256-byte boundary (good for DMA)
@@ -29,13 +32,19 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
 
     // Allocate CPU pinned buffer
     CUDA_RUNTIME_CHECK(cudaMallocHost(&cpu_buffer, total_bytes));
+    quota_buf_cpu = cpu_buffer + p2l_numel + l2p_numel + lcnts_numel;
 
-    // Initialize: p2l and l2p → -1, lcnts → 0, padding → 0
+    // Initialize: p2l/l2p -> -1, lcnts/quota/quota_prefix -> 0, padding -> 0
     std::memset(cpu_buffer, 0xFF, total_bytes);
     for (int i = 0; i < num_layers; ++i) {
         int32_t* layer_base = cpu_buffer + i * per_layer_stride_numel;
         // Zero out lcnts
         std::memset(layer_base + p2l_numel + l2p_numel, 0, lcnts_numel * sizeof(int32_t));
+        // Zero out quota arrays
+        std::memset(layer_base + p2l_numel + l2p_numel + lcnts_numel, 0, quota_numel * sizeof(int32_t));
+        std::memset(layer_base + p2l_numel + l2p_numel + lcnts_numel + quota_numel,
+                    0,
+                    quota_prefix_numel * sizeof(int32_t));
         // Zero out padding
         int pad_numel = per_layer_stride_numel - per_layer_data_numel;
         if (pad_numel > 0) {
@@ -46,6 +55,7 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
     // Allocate GPU buffer (zero-initialized)
     CUDA_RUNTIME_CHECK(cudaMalloc(&gpu_buffer, total_bytes));
     CUDA_RUNTIME_CHECK(cudaMemset(gpu_buffer, 0, total_bytes));
+    quota_buf_gpu = gpu_buffer + p2l_numel + l2p_numel + lcnts_numel;
 
     // Create CPU tensor views with strides
     // Shape [num_layers, X] with stride[0] = per_layer_stride_numel
@@ -55,6 +65,15 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
         torch::from_blob(cpu_buffer + p2l_numel, {num_layers, L, R}, {per_layer_stride_numel, R, 1}, cpu_opts);
     logical_replica_counts =
         torch::from_blob(cpu_buffer + p2l_numel + l2p_numel, {num_layers, L}, {per_layer_stride_numel, 1}, cpu_opts);
+    logical_instance_quota = torch::from_blob(cpu_buffer + p2l_numel + l2p_numel + lcnts_numel,
+                                              {num_layers, L, R},
+                                              {per_layer_stride_numel, R, 1},
+                                              cpu_opts);
+    logical_instance_quota_prefix =
+        torch::from_blob(cpu_buffer + p2l_numel + l2p_numel + lcnts_numel + quota_numel,
+                         {num_layers, L, R},
+                         {per_layer_stride_numel, R, 1},
+                         cpu_opts);
 
     // Create GPU tensor views with strides
     auto gpu_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::Device(torch::kCUDA, device_id));
@@ -63,17 +82,30 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
         torch::from_blob(gpu_buffer + p2l_numel, {num_layers, L, R}, {per_layer_stride_numel, R, 1}, gpu_opts);
     logical_replica_counts_gpu =
         torch::from_blob(gpu_buffer + p2l_numel + l2p_numel, {num_layers, L}, {per_layer_stride_numel, 1}, gpu_opts);
+    logical_instance_quota_gpu = torch::from_blob(gpu_buffer + p2l_numel + l2p_numel + lcnts_numel,
+                                                  {num_layers, L, R},
+                                                  {per_layer_stride_numel, R, 1},
+                                                  gpu_opts);
+    logical_instance_quota_prefix_gpu =
+        torch::from_blob(gpu_buffer + p2l_numel + l2p_numel + lcnts_numel + quota_numel,
+                         {num_layers, L, R},
+                         {per_layer_stride_numel, R, 1},
+                         gpu_opts);
+    rank_quota_prefix_gpu = torch::zeros({num_layers, L, R}, gpu_opts);
 }
 
 void GlobalExpertPlacement::cleanup() {
     if (cpu_buffer != nullptr) {
         cudaFreeHost(cpu_buffer);
         cpu_buffer = nullptr;
+        quota_buf_cpu = nullptr;
     }
     if (gpu_buffer != nullptr) {
         cudaFree(gpu_buffer);
         gpu_buffer = nullptr;
+        quota_buf_gpu = nullptr;
     }
+    rank_quota_prefix_gpu = torch::Tensor();
 }
 
 void GlobalExpertPlacement::to_gpu(const int layer_id, const bool async, std::optional<at::cuda::CUDAStream> s) const {
@@ -126,6 +158,23 @@ std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_gpu_ptrs(int
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
     int32_t* base = gpu_buffer + layer_id * per_layer_stride_numel;
     return std::make_tuple(base, base + p2l_numel, base + p2l_numel + l2p_numel);
+}
+
+std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_quota_cpu_ptrs(int layer_id) const {
+    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
+    int32_t* base = cpu_buffer + layer_id * per_layer_stride_numel;
+    return std::make_tuple(base + p2l_numel + l2p_numel + lcnts_numel,
+                           base + p2l_numel + l2p_numel + lcnts_numel + quota_numel,
+                           nullptr);
+}
+
+std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_quota_gpu_ptrs(int layer_id) const {
+    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
+    int32_t* base = gpu_buffer + layer_id * per_layer_stride_numel;
+    int32_t* rank_quota_base = rank_quota_prefix_gpu.data_ptr<int32_t>() + static_cast<int64_t>(layer_id) * rank_quota_numel;
+    return std::make_tuple(base + p2l_numel + l2p_numel + lcnts_numel,
+                           base + p2l_numel + l2p_numel + lcnts_numel + quota_numel,
+                           rank_quota_base);
 }
 
 // ============================================================================
@@ -260,7 +309,11 @@ Manager::Manager(const int& num_layers,
                  const bool& is_train,
                  const bool& explicitly_destroy,
                  const bool& use_gpu_solver,
-                 const float& balance_threshold)
+                 const float& balance_threshold,
+                 const bool& use_quota_solver,
+                 const bool& quota_locality_aware,
+                 const int32_t& quota_min_tokens_per_replica,
+                 const bool& quota_allow_zero_master_quota)
     : num_layers(num_layers),
       num_local_master_experts(num_local_master_experts),
       num_local_redundant_experts(num_local_redundant_experts),
@@ -271,6 +324,10 @@ Manager::Manager(const int& num_layers,
       is_train(is_train),
       explicitly_destroy(explicitly_destroy),
       use_gpu_solver_(use_gpu_solver),
+      use_quota_solver_(use_quota_solver),
+      quota_locality_aware_(quota_locality_aware),
+      quota_min_tokens_per_replica_(quota_min_tokens_per_replica),
+      quota_allow_zero_master_quota_(quota_allow_zero_master_quota),
       balance_threshold_(balance_threshold),
       placement_cpu_dirty_(num_layers, false),
       comm_stream(at::cuda::getStreamFromPool(true)),
@@ -280,6 +337,8 @@ Manager::Manager(const int& num_layers,
 {
     // Common checks
     EP_HOST_ASSERT(runtime::is_runtime_initialized and "Runtime must be initialized before creating Manager");
+    EP_HOST_ASSERT(!(use_quota_solver_ && use_gpu_solver_) &&
+                   "use_quota_solver and use_gpu_solver are mutually exclusive; quota solver runs on GPU independently");
     num_global_physical_experts = num_local_physical_experts * runtime::num_ranks;
     num_global_logical_experts = num_local_master_experts * runtime::num_ranks;
 
@@ -420,9 +479,24 @@ Manager::Manager(const int& num_layers,
                                                                               runtime::num_ranks
         );
     }
+    if (use_quota_solver_) {
+        placement_solver_quota_ = std::make_unique<solver::PlacementSolverQuota>(num_global_logical_experts,
+                                                                                  runtime::num_ranks,
+                                                                                  num_local_master_experts,
+                                                                                  num_local_redundant_experts,
+                                                                                  runtime::num_nvl_ranks,
+                                                                                  runtime::num_ranks);
+    }
     // Allocate global logical expert load buffer
     global_logical_expert_loads_gpu =
         reinterpret_cast<int*>(nvshmem::alloc(num_global_logical_experts * sizeof(int), NVSHMEM_ALIGNMENT));
+    if (use_quota_solver_) {
+        local_expert_loads_gpu =
+            reinterpret_cast<int32_t*>(nvshmem::alloc(num_global_logical_experts * sizeof(int32_t), NVSHMEM_ALIGNMENT));
+        expert_loads_per_rank_gpu = reinterpret_cast<int32_t*>(
+            nvshmem::alloc(static_cast<size_t>(runtime::num_ranks) * num_global_logical_experts * sizeof(int32_t),
+                           NVSHMEM_ALIGNMENT));
+    }
     CUDA_RUNTIME_CHECK(
         cudaMallocHost((void**)&global_logical_expert_loads_cpu, num_global_logical_experts * sizeof(int)));
     // Create pre-allocated reroute solver
@@ -472,6 +546,15 @@ void Manager::destroy() {
         local_replica_grad_buffer = nullptr;
     }
     nvshmem::free(global_logical_expert_loads_gpu);
+    global_logical_expert_loads_gpu = nullptr;
+    if (local_expert_loads_gpu != nullptr) {
+        nvshmem::free(local_expert_loads_gpu);
+        local_expert_loads_gpu = nullptr;
+    }
+    if (expert_loads_per_rank_gpu != nullptr) {
+        nvshmem::free(expert_loads_per_rank_gpu);
+        expert_loads_per_rank_gpu = nullptr;
+    }
 
     // Clear remote pointers
     for (int i = 0; i < runtime::num_nvl_ranks; ++i) {
@@ -541,7 +624,7 @@ void Manager::sync_placement_to_cpu(const int layer_id) {
     EP_HOST_ASSERT(is_available());
     EP_HOST_ASSERT(layer_id >= -1 && layer_id < num_layers);
 
-    if (!use_gpu_solver_) {
+    if (!use_gpu_solver_ && !use_quota_solver_) {
         return;
     }
 
@@ -606,13 +689,44 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
                             global_logical_expert_loads_gpu,
                             curr_stream.stream());
 
-    nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, curr_stream.stream());
-
     // Zero-out reroute buffer on the same stream as solver/reroute to avoid
     // cross-stream event synchronization in the hot path.
     reroute_output_buffer_->zero_out_fwd_bufs(layer_id, curr_stream);
 
-    if (use_gpu_solver_) {
+    if (use_quota_solver_) {
+        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(local_expert_loads_gpu,
+                                           global_logical_expert_loads_gpu,
+                                           num_global_logical_experts * sizeof(int32_t),
+                                           cudaMemcpyDeviceToDevice,
+                                           curr_stream.stream()));
+        nvshmem::int32_fcollect(expert_loads_per_rank_gpu,
+                                local_expert_loads_gpu,
+                                num_global_logical_experts,
+                                curr_stream.stream());
+        kernels::reduce_per_rank_loads(expert_loads_per_rank_gpu,
+                                       global_logical_expert_loads_gpu,
+                                       runtime::num_ranks,
+                                       num_global_logical_experts,
+                                       curr_stream.stream());
+
+        auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
+        auto [quota_gpu, quota_prefix_gpu, rank_quota_prefix_gpu] = placement.get_quota_gpu_ptrs(layer_id);
+        placement_solver_quota_->solve(global_logical_expert_loads_gpu,
+                                       expert_loads_per_rank_gpu,
+                                       p2l_gpu,
+                                       l2p_gpu,
+                                       lcnts_gpu,
+                                       quota_gpu,
+                                       quota_prefix_gpu,
+                                       rank_quota_prefix_gpu,
+                                       curr_stream.stream(),
+                                       balance_threshold_,
+                                       quota_min_tokens_per_replica_,
+                                       quota_allow_zero_master_quota_,
+                                       quota_locality_aware_);
+        placement_cpu_dirty_[layer_id] = true;
+    } else if (use_gpu_solver_) {
+        nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, curr_stream.stream());
         // GPU path: solver reads directly from GPU loads, writes to GPU placement buffer.
         // No D2H/sync/H2D on the hot path: the CPU mirror is refreshed only on demand.
         auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
@@ -622,6 +736,7 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
                                      balance_threshold_);
         placement_cpu_dirty_[layer_id] = true;
     } else {
+        nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, curr_stream.stream());
         // CPU path (original): D2H → sync → CPU solve → H2D
         CUDA_RUNTIME_CHECK(cudaMemcpyAsync(global_logical_expert_loads_cpu,
                                            global_logical_expert_loads_gpu,
@@ -662,9 +777,42 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
                             num_global_logical_experts,
                             global_logical_expert_loads_gpu,
                             comm_stream.stream());
-    nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, comm_stream.stream());
 
-    if (use_gpu_solver_) {
+    if (use_quota_solver_) {
+        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(local_expert_loads_gpu,
+                                           global_logical_expert_loads_gpu,
+                                           num_global_logical_experts * sizeof(int32_t),
+                                           cudaMemcpyDeviceToDevice,
+                                           comm_stream.stream()));
+        nvshmem::int32_fcollect(expert_loads_per_rank_gpu,
+                                local_expert_loads_gpu,
+                                num_global_logical_experts,
+                                comm_stream.stream());
+        kernels::reduce_per_rank_loads(expert_loads_per_rank_gpu,
+                                       global_logical_expert_loads_gpu,
+                                       runtime::num_ranks,
+                                       num_global_logical_experts,
+                                       comm_stream.stream());
+
+        auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
+        auto [quota_gpu, quota_prefix_gpu, rank_quota_prefix_gpu] = placement.get_quota_gpu_ptrs(layer_id);
+        placement_solver_quota_->solve(global_logical_expert_loads_gpu,
+                                       expert_loads_per_rank_gpu,
+                                       p2l_gpu,
+                                       l2p_gpu,
+                                       lcnts_gpu,
+                                       quota_gpu,
+                                       quota_prefix_gpu,
+                                       rank_quota_prefix_gpu,
+                                       comm_stream.stream(),
+                                       balance_threshold_,
+                                       quota_min_tokens_per_replica_,
+                                       quota_allow_zero_master_quota_,
+                                       quota_locality_aware_);
+        placement_cpu_dirty_[layer_id] = true;
+        record_placement_ready(layer_id, comm_stream);
+    } else if (use_gpu_solver_) {
+        nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, comm_stream.stream());
         // GPU path: solver on comm_stream after allreduce
         auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
         placement_solver_gpu_->solve(global_logical_expert_loads_gpu,
@@ -674,6 +822,7 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
         placement_cpu_dirty_[layer_id] = true;
         record_placement_ready(layer_id, comm_stream);
     } else {
+        nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, comm_stream.stream());
         // CPU path: D2H → sync → CPU solve → H2D
         CUDA_RUNTIME_CHECK(cudaMemcpyAsync(global_logical_expert_loads_cpu,
                                            global_logical_expert_loads_gpu,
@@ -697,6 +846,7 @@ void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
     EP_HOST_ASSERT(topk_ids.is_cuda() && topk_ids.dtype() == torch::kInt64);
     EP_HOST_ASSERT(topk_ids.dim() == 2);
+    EP_HOST_ASSERT(!use_quota_solver_ && "Sparse reroute is not supported in quota mode");
 
     int T = topk_ids.size(0);
     int K = topk_ids.size(1);
@@ -720,6 +870,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> Manager::reroute_cpu(con
                                                                              torch::Tensor& routing_map) {
     EP_HOST_ASSERT(is_available());
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
+    EP_HOST_ASSERT(!use_quota_solver_ && "CPU reroute path is not supported in quota mode");
 
     sync_placement_to_cpu(layer_id);
     auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
@@ -765,18 +916,35 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
 
         EP_HOST_ASSERT(probs.scalar_type() == torch::kFloat32);
 
-        kernels::run_reroute_forward(routing_map.data_ptr<bool>(),
-                                     probs.data_ptr(),
-                                     l2p_gpu,
-                                     lcnts_gpu,
-                                     expand_rmap_ptr,
-                                     expand_probs_ptr,
-                                     tile_counts_ptr,
-                                     T,
-                                     L,
-                                     P,
-                                     runtime::num_ranks,
-                                     stream);
+        if (use_quota_solver_) {
+            auto [quota_gpu, quota_prefix_gpu, rank_quota_prefix_gpu] = placement.get_quota_gpu_ptrs(layer_id);
+            kernels::run_reroute_forward_quota(routing_map.data_ptr<bool>(),
+                                               probs.data_ptr(),
+                                               l2p_gpu,
+                                               lcnts_gpu,
+                                               rank_quota_prefix_gpu,
+                                               expand_rmap_ptr,
+                                               expand_probs_ptr,
+                                               tile_counts_ptr,
+                                               T,
+                                               L,
+                                               P,
+                                               runtime::num_ranks,
+                                               stream);
+        } else {
+            kernels::run_reroute_forward(routing_map.data_ptr<bool>(),
+                                         probs.data_ptr(),
+                                         l2p_gpu,
+                                         lcnts_gpu,
+                                         expand_rmap_ptr,
+                                         expand_probs_ptr,
+                                         tile_counts_ptr,
+                                         T,
+                                         L,
+                                         P,
+                                         runtime::num_ranks,
+                                         stream);
+        }
     }
 
     // Return fresh from_blob views — independent version counters so autograd
