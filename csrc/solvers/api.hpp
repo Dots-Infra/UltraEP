@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -51,7 +53,8 @@ public:
     void solve(const int32_t* __restrict__ expert_loads,
                int32_t* __restrict__ p2l_map,
                int32_t* __restrict__ l2p_map,
-               int32_t* __restrict__ lcnts) const;
+               int32_t* __restrict__ lcnts,
+               float balance_threshold = 0.0f) const;
 
 private:
     // ---- Configuration (immutable after construction) ----
@@ -83,6 +86,72 @@ private:
     // Per-rank expert occupancy bitmap, flat [num_nvl_ranks * num_logical_per_nvl].
     // 1 = this expert already occupies this rank (master or replica).
     mutable std::vector<uint8_t> expert_on_rank_;
+};
+
+/**
+ * PlacementSolverGPU: GPU-based expert replication and placement solver (V3).
+ *
+ * Runs entirely on GPU after the NVSHMEM allreduce, eliminating:
+ *   - D2H copy of expert_loads
+ *   - cudaStreamSynchronize (blocking CPU)
+ *   - H2D copy of placement results
+ *
+ * V3 optimizations (NCU data-driven):
+ *   - 2-warp cooperative kernel (64 threads) for G <= 64:
+ *     hides shuffle latency (Stall Wait) and smem latency (Short Scoreboard)
+ *   - Phase C parallel argmin: each warp handles 32 GPUs independently,
+ *     reducing shuffle count per round from 11 to 6
+ *   - Template specialization on EPL and COMPACT_EOR:
+ *     eliminates runtime branches, enables precise loop unrolling
+ *   - EOR union: compact (uint64) and packed (uint32) share smem via union
+ *   - External cudaMemsetAsync for p2l/l2p/lcnts initialization
+ *
+ * Algorithm (per NVL domain, in a single CUDA kernel):
+ *   Phase 0 — Place masters, init smem (2-warp: warp 0 masters, warp 1 smem init)
+ *   Phase A — Binary search for replica counts (both warps redundantly execute)
+ *   Phase B — Build + bitonic-sort replica list (64 threads parallel sort)
+ *   Phase C — Greedy bin-pack with 2-warp cooperative argmin
+ *
+ * Deterministic: same expert_loads → identical p2l/l2p/lcnts on every rank.
+ * Results satisfy the same 8 invariants as PlacementSolver (CPU).
+ */
+class PlacementSolverGPU {
+public:
+    PlacementSolverGPU(int num_global_logical_experts,
+                       int num_ranks,
+                       int num_local_master_experts,
+                       int num_local_redundant_experts,
+                       int num_nvl_ranks,
+                       int max_replicas_dim);
+
+    /**
+     * Compute placement for one layer entirely on GPU.
+     *
+     * @param expert_loads_gpu  [num_global_logical_experts] int32 device ptr
+     * @param p2l_gpu           [num_global_physical_experts] int32 device ptr – output
+     * @param l2p_gpu           [num_global_logical_experts * max_replicas_dim] int32 device ptr – output
+     * @param lcnts_gpu         [num_global_logical_experts] int32 device ptr – output
+     * @param stream            CUDA stream to launch the kernel on
+     */
+    void solve(const int32_t* expert_loads_gpu,
+               int32_t* p2l_gpu,
+               int32_t* l2p_gpu,
+               int32_t* lcnts_gpu,
+               cudaStream_t stream,
+               float balance_threshold = 0.0f) const;
+
+private:
+    int num_global_logical_experts_;
+    int num_ranks_;
+    int num_local_master_;
+    int num_local_redundant_;
+    int num_nvl_ranks_;
+    int max_replicas_dim_;
+    int num_local_physical_;
+    int num_global_physical_;
+    int num_nvl_domains_;
+    int num_logical_per_nvl_;
+    int num_redundant_per_nvl_;
 };
 
 /**
@@ -146,12 +215,48 @@ inline void register_apis(pybind11::module_& m) {
                 torch::Tensor& expert_loads,
                 torch::Tensor& p2l_map,
                 torch::Tensor& l2p_map,
-                torch::Tensor& lcnts) {
+                torch::Tensor& lcnts,
+                float balance_threshold) {
                  self.solve(expert_loads.data<int32_t>(),
                             p2l_map.data<int32_t>(),
                             l2p_map.data<int32_t>(),
-                            lcnts.data<int32_t>());
-             });
+                            lcnts.data<int32_t>(),
+                            balance_threshold);
+             },
+             pybind11::arg("expert_loads"),
+             pybind11::arg("p2l_map"),
+             pybind11::arg("l2p_map"),
+             pybind11::arg("lcnts"),
+             pybind11::arg("balance_threshold") = 0.0f);
+
+    pybind11::class_<PlacementSolverGPU>(m, "PlacementSolverGPU")
+        .def(pybind11::init<int, int, int, int, int, int>())
+        .def("solve",
+             [](const PlacementSolverGPU& self,
+                torch::Tensor& expert_loads,
+                torch::Tensor& p2l_map,
+                torch::Tensor& l2p_map,
+                torch::Tensor& lcnts,
+                float balance_threshold) {
+                 EP_HOST_ASSERT(expert_loads.device().is_cuda() && expert_loads.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(p2l_map.device().is_cuda() && p2l_map.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(l2p_map.device().is_cuda() && l2p_map.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(lcnts.device().is_cuda() && lcnts.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(expert_loads.is_contiguous() && p2l_map.is_contiguous());
+                 EP_HOST_ASSERT(l2p_map.is_contiguous() && lcnts.is_contiguous());
+                 auto stream = at::cuda::getCurrentCUDAStream();
+                 self.solve(expert_loads.data_ptr<int32_t>(),
+                            p2l_map.data_ptr<int32_t>(),
+                            l2p_map.data_ptr<int32_t>(),
+                            lcnts.data_ptr<int32_t>(),
+                            stream.stream(),
+                            balance_threshold);
+             },
+             pybind11::arg("expert_loads"),
+             pybind11::arg("p2l_map"),
+             pybind11::arg("l2p_map"),
+             pybind11::arg("lcnts"),
+             pybind11::arg("balance_threshold") = 0.0f);
 
     pybind11::class_<RerouteSolver>(m, "RerouteSolver")
         .def(pybind11::init<int, int, int>())

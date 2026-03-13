@@ -15,6 +15,11 @@
 // Suppose FP32 grad data
 #define GRAD_ELEMENT_SIZE 4
 
+// Tile sizes for weight_sync and grad_reduce kernels (derived from kernel config).
+// Used by Manager for pre-computing grid size upper bounds.
+#define WEIGHT_SYNC_TILE_ELEMENTS (32 * 1024 / WEIGHT_ELEMENT_SIZE)  // 16384
+#define GRAD_REDUCE_TILE_ELEMENTS (64 * 1024 / GRAD_ELEMENT_SIZE)    // 16384
+
 // Reroute forward tile size (tokens per tile in the two-pass forward kernel).
 // Defined here so it is accessible from both .cu (via config.cuh) and .cpp files.
 #define REROUTE_FWD_TILE_T 128

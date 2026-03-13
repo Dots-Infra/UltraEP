@@ -43,7 +43,8 @@ PlacementSolver::PlacementSolver(int num_global_logical_experts,
 void PlacementSolver::solve(const int32_t* __restrict__ expert_loads,
                             int32_t* __restrict__ p2l_map,
                             int32_t* __restrict__ l2p_map,
-                            int32_t* __restrict__ lcnts) const {
+                            int32_t* __restrict__ lcnts,
+                            float balance_threshold) const {
     // ------------------------------------------------------------------
     // Initialize output maps
     // ------------------------------------------------------------------
@@ -80,6 +81,15 @@ void PlacementSolver::solve(const int32_t* __restrict__ expert_loads,
         // Phase A: Greedy replication (EPLB replicate_experts strategy)
         //   Hard cap per expert: max_extra_replicas_ == num_nvl_ranks_ - 1
         // ==============================================================
+
+        // Compute avg load per slot for early-stop check
+        double total_load = 0;
+        for (int i = 0; i < num_logical_per_nvl_; ++i) {
+            total_load += expert_loads[domain_start_log + i];
+        }
+        const double avg_per_slot = (total_load > 0) ?
+            total_load / (num_nvl_ranks_ * num_local_master_) : 0.0;
+
         for (int slot = 0; slot < num_redundant_per_nvl_; ++slot) {
             int best_l = -1;
             double best_score = -1.0;
@@ -96,6 +106,12 @@ void PlacementSolver::solve(const int32_t* __restrict__ expert_loads,
                     best_score = score;
                     best_l = l;
                 }
+            }
+
+            // Early-stop: all experts' per-replica load is within threshold of average
+            if (balance_threshold > 0.0f && avg_per_slot > 0.0 &&
+                best_score <= avg_per_slot * balance_threshold) {
+                break;
             }
 
             if (best_l < 0)

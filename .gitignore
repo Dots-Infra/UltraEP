@@ -19,3 +19,10 @@ build/
 *.so
 *.egg-info/
 dist/
+
+# Bench artifacts
+bench_result/
+
+# Docs and local notes
+*.md
+!README.md

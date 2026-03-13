@@ -80,6 +80,9 @@ if __name__ == "__main__":
     nvcc_dlink = []
     extra_link_args = []
 
+    # CUDA 13
+    include_dirs.extend(["/usr/local/cuda-13.0/include/cccl/"])
+
     # NVSHMEM flags
     include_dirs.extend([f"{nvshmem_dir}/include"])
     library_dirs.extend([f"{nvshmem_dir}/lib"])
@@ -115,9 +118,10 @@ if __name__ == "__main__":
                 "Set TORCH_CUDA_ARCH_LIST manually to override."
             )
 
+    # Device linking against NVSHMEM and multiple CUDA translation units requires RDC.
     nvcc_flags.extend(
         [
-            # "-rdc=true",
+            "-rdc=true",
             "--ptxas-options=--register-usage-level=10"
         ]
     )

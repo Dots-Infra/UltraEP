@@ -53,8 +53,9 @@ struct TaskMeta {
     int num_elements_last_tile;  // Last tile may be smaller
 };
 
-__global__ void grad_reduce_kernel_low_sm(const int total_tasks,
-                                          const GradReduceTask* grad_reduce_tasks,
+// task_metadata: device pointer to [total_tasks, total_tiles]
+__global__ void grad_reduce_kernel_low_sm(const GradReduceTask* grad_reduce_tasks,
+                                          const int* task_metadata,
                                           int* global_task_counter) {
     // Double-buffered shared memory
     extern __shared__ float smem_base[];
@@ -66,6 +67,12 @@ __global__ void grad_reduce_kernel_low_sm(const int total_tasks,
 
     const bool is_leader = (threadIdx.x == 0);
 
+    // Read total_tasks from device memory
+    __shared__ int total_tasks;
+    if (is_leader) {
+        total_tasks = task_metadata[0];
+    }
+
     // Initialize mbarriers
     if (is_leader) {
         for (int i = 0; i < 2; i++) {
@@ -74,6 +81,16 @@ __global__ void grad_reduce_kernel_low_sm(const int total_tasks,
         }
     }
     __syncthreads();
+
+    // Early exit if no work
+    if (total_tasks == 0) {
+        if (is_leader) {
+            for (int i = 0; i < 2; i++) {
+                ptx::mbarrier_invalidate(&mbarriers[i]);
+            }
+        }
+        return;
+    }
 
     // Persistent loop: each CTA grabs complete tasks
     while (true) {
@@ -222,22 +239,36 @@ __device__ __forceinline__ TileInfo get_tile_info(const GradReduceTask* tasks,
     return info;
 }
 
-__global__ void grad_reduce_kernel_high_sm(const int total_tasks,
-                                           const GradReduceTask* grad_reduce_tasks,
-                                           const int* task_tile_offsets,  // Prefix sum of tile counts
-                                           const int total_tiles,
+// task_metadata: device pointer to [total_tasks, total_tiles]
+__global__ void grad_reduce_kernel_high_sm(const GradReduceTask* grad_reduce_tasks,
+                                           const int* task_tile_offsets,
+                                           const int* task_metadata,
                                            int* global_tile_counter) {
     extern __shared__ float smem_pool[];
 
     ptx::mbarrier* mbarrier_ptr = ptx::create_mbarrier();
     __shared__ ptx::arrival_phase phase;
 
+    // Read task metadata from device memory
+    __shared__ int total_tasks;
+    __shared__ int total_tiles;
+
     // Initialize mbarrier (thread 0 only)
     if (threadIdx.x == 0) {
+        total_tasks = task_metadata[0];
+        total_tiles = task_metadata[1];
         ptx::mbarrier_init(mbarrier_ptr, 1);  // Expect 1 arrival (from TMA completion)
         phase = 0;
     }
     __syncthreads();
+
+    // Early exit if no work
+    if (total_tasks == 0) {
+        if (threadIdx.x == 0) {
+            ptx::mbarrier_invalidate(mbarrier_ptr);
+        }
+        return;
+    }
 
     // Persistent loop - each CTA grabs tiles until work is exhausted
     while (true) {
@@ -296,14 +327,61 @@ __global__ void grad_reduce_kernel_high_sm(const int total_tasks,
     }
 }
 
+// ============================================================================
+// Launch helpers
+// ============================================================================
+
+static void launch_grad_reduce_low_sm(GradReduceTask* grad_reduce_tasks_gpu,
+                                      int* task_metadata_gpu,
+                                      int* global_task_counter_gpu,
+                                      int num_ctas,
+                                      cudaStream_t stream) {
+    dim3 grid(num_ctas);
+    dim3 block(GRAD_REDUCE_THREADS_PER_BLOCK);
+    int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES * 2;
+
+    CUDA_RUNTIME_CHECK(
+        cudaFuncSetAttribute(grad_reduce_kernel_low_sm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    grad_reduce_kernel_low_sm<<<grid, block, smem_size, stream>>>(
+        grad_reduce_tasks_gpu, task_metadata_gpu, global_task_counter_gpu);
+}
+
+static void launch_grad_reduce_high_sm(GradReduceTask* grad_reduce_tasks_gpu,
+                                       int* task_tile_offsets_gpu,
+                                       int* task_metadata_gpu,
+                                       int* global_tile_counter_gpu,
+                                       int num_ctas,
+                                       cudaStream_t stream) {
+    dim3 grid(num_ctas);
+    dim3 block(GRAD_REDUCE_THREADS_PER_BLOCK);
+    int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES;
+
+    CUDA_RUNTIME_CHECK(
+        cudaFuncSetAttribute(grad_reduce_kernel_high_sm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    grad_reduce_kernel_high_sm<<<grid, block, smem_size, stream>>>(
+        grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu);
+}
+
+// ============================================================================
+// CPU task-build path (existing)
+// ============================================================================
+
 void run_grad_reduce_low_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                             GradReduceTask* grad_reduce_tasks_gpu,
                             int* global_task_counter_gpu,
+                            int* task_metadata_gpu,
                             const int total_tasks,
                             cudaStream_t stream,
                             const int num_device_sms) {
     if (total_tasks == 0)
         return;
+
+    // Write task metadata
+    int metadata[2] = {total_tasks, 0};  // total_tiles unused by low_sm
+    CUDA_RUNTIME_CHECK(
+        cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // Copy tasks to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(grad_reduce_tasks_gpu,
@@ -313,28 +391,17 @@ void run_grad_reduce_low_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                                        stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_task_counter_gpu, 0, sizeof(int), stream));
 
-    // Launch config: more CTAs for better parallelism
-    // But don't launch more CTAs than tasks
     int num_ctas = min(num_device_sms * 2, total_tasks);
     num_ctas = max(num_ctas, 1);
 
-    dim3 grid(num_ctas);
-    dim3 block(GRAD_REDUCE_THREADS_PER_BLOCK);
-
-    // Double buffer
-    int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES * 2;
-
-    CUDA_RUNTIME_CHECK(
-        cudaFuncSetAttribute(grad_reduce_kernel_low_sm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    grad_reduce_kernel_low_sm<<<grid, block, smem_size, stream>>>(
-        total_tasks, grad_reduce_tasks_gpu, global_task_counter_gpu);
+    launch_grad_reduce_low_sm(grad_reduce_tasks_gpu, task_metadata_gpu, global_task_counter_gpu, num_ctas, stream);
 }
 
 void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                              GradReduceTask* grad_reduce_tasks_gpu,
                              int* global_tile_counter_gpu,
-                             int* task_tile_offsets_gpu,  // New: prefix sum of tile counts
+                             int* task_tile_offsets_gpu,
+                             int* task_metadata_gpu,
                              const int total_tasks,
                              cudaStream_t stream,
                              const int num_device_sms) {
@@ -350,6 +417,11 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
     }
     int total_tiles = task_tile_offsets[total_tasks];
 
+    // Write task metadata
+    int metadata[2] = {total_tasks, total_tiles};
+    CUDA_RUNTIME_CHECK(
+        cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+
     // Copy tasks and tile offsets from CPU to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(grad_reduce_tasks_gpu,
                                        grad_reduce_tasks_cpu,
@@ -363,23 +435,42 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                                        stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
 
-    // Configure kernel launch
-    // Use all SMs to maximize parallelism across tiles
-    // Each CTA will grab tiles via atomic counter
-    int num_ctas = min(num_device_sms * 2, total_tiles);  // Don't launch more CTAs than tiles
+    int num_ctas = min(num_device_sms * 2, total_tiles);
     num_ctas = max(num_ctas, 1);
 
-    dim3 grid(num_ctas);
-    dim3 block(GRAD_REDUCE_THREADS_PER_BLOCK);
+    launch_grad_reduce_high_sm(grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu,
+                               global_tile_counter_gpu, num_ctas, stream);
+}
 
-    // Shared memory: one tile staging buffer (mbarrier is statically allocated)
-    int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES;
+// ============================================================================
+// GPU task-build path (tasks already on GPU from build kernel)
+// ============================================================================
 
-    CUDA_RUNTIME_CHECK(
-        cudaFuncSetAttribute(grad_reduce_kernel_high_sm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+void run_grad_reduce_low_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
+                                     int* global_task_counter_gpu,
+                                     int* task_metadata_gpu,
+                                     cudaStream_t stream,
+                                     int num_device_sms,
+                                     int max_possible_tasks) {
+    // Use conservative upper bound; persistent kernel handles over-launch gracefully
+    int num_ctas = min(num_device_sms * 2, max_possible_tasks);
+    num_ctas = max(num_ctas, 1);
 
-    grad_reduce_kernel_high_sm<<<grid, block, smem_size, stream>>>(
-        total_tasks, grad_reduce_tasks_gpu, task_tile_offsets_gpu, total_tiles, global_tile_counter_gpu);
+    launch_grad_reduce_low_sm(grad_reduce_tasks_gpu, task_metadata_gpu, global_task_counter_gpu, num_ctas, stream);
+}
+
+void run_grad_reduce_high_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
+                                      int* task_tile_offsets_gpu,
+                                      int* task_metadata_gpu,
+                                      int* global_tile_counter_gpu,
+                                      cudaStream_t stream,
+                                      int num_device_sms,
+                                      int max_possible_tiles) {
+    int num_ctas = min(num_device_sms * 2, max_possible_tiles);
+    num_ctas = max(num_ctas, 1);
+
+    launch_grad_reduce_high_sm(grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu,
+                               global_tile_counter_gpu, num_ctas, stream);
 }
 
 }  // namespace ultra_ep::kernels

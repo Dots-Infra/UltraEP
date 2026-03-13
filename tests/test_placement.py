@@ -3,6 +3,8 @@ Unit tests for the PlacementSolver (EPLB-style expert placement algorithm).
 
 Tests correctness invariants, load-balance quality, and CPU latency across
 different expert load distributions.
+
+Pass --gpu to also test the GPU-based PlacementSolverGPU.
 """
 
 import argparse
@@ -68,9 +70,10 @@ def run_solver(
     p2l: torch.Tensor,
     l2p: torch.Tensor,
     lcnts: torch.Tensor,
+    balance_threshold: float = 0.0,
 ):
     """Run solver and return the output tensors (modified in-place)."""
-    solver.solve(expert_loads, p2l, l2p, lcnts)
+    solver.solve(expert_loads, p2l, l2p, lcnts, balance_threshold)
     return p2l, l2p, lcnts
 
 
@@ -479,7 +482,433 @@ def report_load_balance(config: EPConfig):
 
 
 # ============================================================================
-# Main
+# GPU Solver helpers
+# ============================================================================
+
+
+def make_gpu_solver_and_buffers(config: EPConfig):
+    """Create PlacementSolverGPU + CUDA output tensors."""
+    num_global_logical = config.num_local_master * config.num_ranks
+    num_local_physical = config.num_local_master + config.num_local_redundant
+    num_global_physical = num_local_physical * config.num_ranks
+    max_replicas_dim = config.num_ranks
+
+    solver_gpu = _C.PlacementSolverGPU(
+        num_global_logical,
+        config.num_ranks,
+        config.num_local_master,
+        config.num_local_redundant,
+        config.num_nvl_ranks,
+        max_replicas_dim,
+    )
+
+    p2l = torch.full((num_global_physical,), -1, dtype=torch.int32, device="cuda")
+    l2p = torch.full((num_global_logical, max_replicas_dim), -1, dtype=torch.int32, device="cuda")
+    lcnts = torch.zeros(num_global_logical, dtype=torch.int32, device="cuda")
+
+    return solver_gpu, p2l, l2p, lcnts
+
+
+def run_gpu_solver(
+    solver_gpu,
+    expert_loads: torch.Tensor,
+    p2l: torch.Tensor,
+    l2p: torch.Tensor,
+    lcnts: torch.Tensor,
+    balance_threshold: float = 0.0,
+):
+    """Run GPU solver and synchronize."""
+    solver_gpu.solve(expert_loads, p2l, l2p, lcnts, balance_threshold)
+    torch.cuda.synchronize()
+    return p2l, l2p, lcnts
+
+
+# ============================================================================
+# GPU Solver: correctness
+# ============================================================================
+
+
+def test_gpu_correctness(config: EPConfig, verbose: bool = False) -> bool:
+    print(f"\n{'-'*40} GPU Correctness {'-'*40}")
+
+    if not torch.cuda.is_available():
+        print("  SKIP — no CUDA device available")
+        return True
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver_gpu, p2l, l2p, lcnts = make_gpu_solver_and_buffers(config)
+
+    all_passed = True
+    for dist_name, gen_fn in DISTRIBUTIONS.items():
+        loads = gen_fn(num_global_logical)
+        loads_gpu = loads.cuda()
+
+        # Reset
+        p2l.fill_(-1)
+        l2p.fill_(-1)
+        lcnts.fill_(0)
+
+        run_gpu_solver(solver_gpu, loads_gpu, p2l, l2p, lcnts)
+
+        # Validate on CPU
+        p2l_cpu = p2l.cpu()
+        l2p_cpu = l2p.cpu()
+        lcnts_cpu = lcnts.cpu()
+
+        try:
+            metrics = validate_placement(
+                loads, p2l_cpu, l2p_cpu, lcnts_cpu, config, verbose=verbose
+            )
+            status = "PASS"
+            detail = f"imbalance={metrics['imbalance_ratio']:.4f}"
+        except AssertionError as e:
+            status = "FAIL"
+            detail = str(e)
+            all_passed = False
+
+        print(f"  {dist_name:20s} ... {status}  ({detail})")
+
+    return all_passed
+
+
+# ============================================================================
+# GPU Solver: determinism
+# ============================================================================
+
+
+def test_gpu_determinism(config: EPConfig) -> bool:
+    print(f"\n{'-'*40} GPU Determinism {'-'*40}")
+
+    if not torch.cuda.is_available():
+        print("  SKIP — no CUDA device available")
+        return True
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver_gpu, p2l_a, l2p_a, lcnts_a = make_gpu_solver_and_buffers(config)
+    _, p2l_b, l2p_b, lcnts_b = make_gpu_solver_and_buffers(config)
+
+    loads = gen_zipf(num_global_logical, alpha=1.5)
+    loads_gpu = loads.cuda()
+
+    run_gpu_solver(solver_gpu, loads_gpu, p2l_a, l2p_a, lcnts_a)
+    run_gpu_solver(solver_gpu, loads_gpu, p2l_b, l2p_b, lcnts_b)
+
+    ok = True
+    if not torch.equal(p2l_a, p2l_b):
+        print("  FAIL — p2l not deterministic")
+        ok = False
+    if not torch.equal(l2p_a, l2p_b):
+        print("  FAIL — l2p not deterministic")
+        ok = False
+    if not torch.equal(lcnts_a, lcnts_b):
+        print("  FAIL — lcnts not deterministic")
+        ok = False
+    if ok:
+        print("  PASS — two runs with same input produce identical output")
+    return ok
+
+
+# ============================================================================
+# GPU vs CPU quality comparison
+# ============================================================================
+
+
+def compare_gpu_cpu_quality(config: EPConfig) -> bool:
+    """GPU solver imbalance must not be worse than 1.01× CPU solver."""
+    print(f"\n{'-'*40} GPU vs CPU Quality {'-'*40}")
+
+    if not torch.cuda.is_available():
+        print("  SKIP — no CUDA device available")
+        return True
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver_cpu, p2l_cpu_t, l2p_cpu_t, lcnts_cpu_t = make_solver_and_buffers(config)
+    solver_gpu, p2l_gpu_t, l2p_gpu_t, lcnts_gpu_t = make_gpu_solver_and_buffers(config)
+
+    all_passed = True
+    TOLERANCE = 1.01
+
+    for dist_name, gen_fn in DISTRIBUTIONS.items():
+        loads = gen_fn(num_global_logical)
+
+        # CPU solver
+        p2l_cpu_t.fill_(-1)
+        l2p_cpu_t.fill_(-1)
+        lcnts_cpu_t.fill_(0)
+        run_solver(solver_cpu, loads, p2l_cpu_t, l2p_cpu_t, lcnts_cpu_t)
+        cpu_metrics = validate_placement(loads, p2l_cpu_t, l2p_cpu_t, lcnts_cpu_t, config)
+
+        # GPU solver
+        p2l_gpu_t.fill_(-1)
+        l2p_gpu_t.fill_(-1)
+        lcnts_gpu_t.fill_(0)
+        run_gpu_solver(solver_gpu, loads.cuda(), p2l_gpu_t, l2p_gpu_t, lcnts_gpu_t)
+        gpu_metrics = validate_placement(
+            loads, p2l_gpu_t.cpu(), l2p_gpu_t.cpu(), lcnts_gpu_t.cpu(), config
+        )
+
+        cpu_imb = cpu_metrics["imbalance_ratio"]
+        gpu_imb = gpu_metrics["imbalance_ratio"]
+        passed = gpu_imb <= cpu_imb * TOLERANCE
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            all_passed = False
+
+        print(
+            f"  {dist_name:20s} ... {status}  "
+            f"cpu={cpu_imb:.4f}  gpu={gpu_imb:.4f}  "
+            f"ratio={gpu_imb/max(cpu_imb,1e-9):.3f}x"
+        )
+
+    return all_passed
+
+
+# ============================================================================
+# GPU Solver: latency benchmark
+# ============================================================================
+
+
+def bench_gpu_latency(config: EPConfig, num_warmup: int = 50, num_iters: int = 200):
+    print(f"\n{'-'*40} GPU Latency {'-'*40}")
+
+    if not torch.cuda.is_available():
+        print("  SKIP — no CUDA device available")
+        return
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver_gpu, p2l, l2p, lcnts = make_gpu_solver_and_buffers(config)
+
+    results = {}
+    for dist_name, gen_fn in DISTRIBUTIONS.items():
+        loads = gen_fn(num_global_logical).cuda()
+
+        # Warmup
+        for _ in range(num_warmup):
+            p2l.fill_(-1); l2p.fill_(-1); lcnts.fill_(0)
+            solver_gpu.solve(loads, p2l, l2p, lcnts)
+        torch.cuda.synchronize()
+
+        # Timed runs using CUDA events
+        times_us = []
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt = torch.cuda.Event(enable_timing=True)
+
+        for _ in range(num_iters):
+            p2l.fill_(-1); l2p.fill_(-1); lcnts.fill_(0)
+            start_evt.record()
+            solver_gpu.solve(loads, p2l, l2p, lcnts)
+            end_evt.record()
+            torch.cuda.synchronize()
+            times_us.append(start_evt.elapsed_time(end_evt) * 1000.0)  # ms→µs
+
+        times_arr = np.array(times_us)
+        # Remove outliers (top/bottom 5%)
+        n_trim = max(1, num_iters // 20)
+        times_arr = np.sort(times_arr)[n_trim:-n_trim]
+
+        mean_us = np.mean(times_arr)
+        p50_us = np.percentile(times_arr, 50)
+        p99_us = np.percentile(times_arr, 99)
+        min_us = np.min(times_arr)
+
+        results[dist_name] = {"mean_us": mean_us, "p50_us": p50_us, "p99_us": p99_us, "min_us": min_us}
+        print(
+            f"  {dist_name:20s}  mean={mean_us:7.2f} µs  "
+            f"p50={p50_us:7.2f} µs  p99={p99_us:7.2f} µs  min={min_us:7.2f} µs"
+        )
+
+    return results
+
+
+# ============================================================================
+# GPU vs CPU end-to-end latency comparison (solver only, no allreduce)
+# ============================================================================
+
+
+def bench_solver_comparison(config: EPConfig, num_warmup: int = 50, num_iters: int = 200):
+    print(f"\n{'-'*40} GPU vs CPU Solver Latency Comparison {'-'*40}")
+
+    if not torch.cuda.is_available():
+        print("  SKIP — no CUDA device available")
+        return
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver_cpu, p2l_cpu_t, l2p_cpu_t, lcnts_cpu_t = make_solver_and_buffers(config)
+    solver_gpu, p2l_gpu_t, l2p_gpu_t, lcnts_gpu_t = make_gpu_solver_and_buffers(config)
+
+    loads_cpu = gen_zipf(num_global_logical, alpha=1.2)
+    loads_gpu = loads_cpu.cuda()
+
+    # CPU benchmark
+    for _ in range(num_warmup):
+        run_solver(solver_cpu, loads_cpu, p2l_cpu_t, l2p_cpu_t, lcnts_cpu_t)
+
+    cpu_times_ns = []
+    for _ in range(num_iters):
+        t0 = time.perf_counter_ns()
+        run_solver(solver_cpu, loads_cpu, p2l_cpu_t, l2p_cpu_t, lcnts_cpu_t)
+        cpu_times_ns.append(time.perf_counter_ns() - t0)
+
+    cpu_times_us = np.sort(np.array(cpu_times_ns) / 1000.0)[num_iters // 20:-num_iters // 20]
+
+    # GPU benchmark
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    for _ in range(num_warmup):
+        p2l_gpu_t.fill_(-1); l2p_gpu_t.fill_(-1); lcnts_gpu_t.fill_(0)
+        solver_gpu.solve(loads_gpu, p2l_gpu_t, l2p_gpu_t, lcnts_gpu_t)
+    torch.cuda.synchronize()
+
+    gpu_times_us = []
+    for _ in range(num_iters):
+        p2l_gpu_t.fill_(-1); l2p_gpu_t.fill_(-1); lcnts_gpu_t.fill_(0)
+        start_evt.record()
+        solver_gpu.solve(loads_gpu, p2l_gpu_t, l2p_gpu_t, lcnts_gpu_t)
+        end_evt.record()
+        torch.cuda.synchronize()
+        gpu_times_us.append(start_evt.elapsed_time(end_evt) * 1000.0)
+
+    gpu_times_us = np.sort(np.array(gpu_times_us))[num_iters // 20:-num_iters // 20]
+
+    print(f"  CPU solver:  mean={np.mean(cpu_times_us):7.2f} µs  p50={np.percentile(cpu_times_us,50):7.2f} µs  min={np.min(cpu_times_us):7.2f} µs")
+    print(f"  GPU solver:  mean={np.mean(gpu_times_us):7.2f} µs  p50={np.percentile(gpu_times_us,50):7.2f} µs  min={np.min(gpu_times_us):7.2f} µs")
+    speedup = np.mean(cpu_times_us) / max(np.mean(gpu_times_us), 0.001)
+    print(f"  Speedup (GPU kernel alone): {speedup:.2f}x")
+    print(f"  Note: end-to-end benefit is larger — GPU path also eliminates D2H/sync/H2D (~30-70µs)")
+
+
+# ============================================================================
+# Early-stop balance_threshold tests
+# ============================================================================
+
+
+def test_early_stop_balanced_load(config: EPConfig) -> bool:
+    """均衡 load 下 threshold=1.1 应导致 0 replica。"""
+    print(f"\n{'-'*40} Early-Stop: Balanced Load {'-'*40}")
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver, p2l, l2p, lcnts = make_solver_and_buffers(config)
+
+    # Perfectly uniform load
+    loads = gen_uniform(num_global_logical, total_tokens=100000)
+    run_solver(solver, loads, p2l, l2p, lcnts, balance_threshold=1.1)
+
+    total_replicas = lcnts.sum().item() - num_global_logical
+    try:
+        metrics = validate_placement(loads, p2l, l2p, lcnts, config)
+        # With perfectly uniform loads, all experts have LPR = load/1 = load,
+        # and avg_per_slot = total_load / (G * M) = load.
+        # So best_score = load <= load * 1.1 → early stop immediately, 0 replicas.
+        assert total_replicas == 0, (
+            f"Expected 0 replicas for uniform load with threshold=1.1, got {total_replicas}"
+        )
+        print(f"  PASS — {total_replicas} replicas (expected 0)")
+        return True
+    except AssertionError as e:
+        print(f"  FAIL — {e}")
+        return False
+
+
+def test_early_stop_skewed_load(config: EPConfig) -> bool:
+    """不均衡 load 下 threshold=1.2 仍分配 replica。"""
+    print(f"\n{'-'*40} Early-Stop: Skewed Load {'-'*40}")
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver, p2l, l2p, lcnts = make_solver_and_buffers(config)
+
+    # Highly skewed load
+    loads = gen_single_hot(num_global_logical, hot_idx=0, hot_ratio=0.8)
+    run_solver(solver, loads, p2l, l2p, lcnts, balance_threshold=1.2)
+
+    total_replicas = lcnts.sum().item() - num_global_logical
+    try:
+        metrics = validate_placement(loads, p2l, l2p, lcnts, config)
+        assert total_replicas > 0, (
+            f"Expected >0 replicas for skewed load with threshold=1.2, got {total_replicas}"
+        )
+        print(
+            f"  PASS — {total_replicas} replicas allocated, "
+            f"imbalance={metrics['imbalance_ratio']:.4f}"
+        )
+        return True
+    except AssertionError as e:
+        print(f"  FAIL — {e}")
+        return False
+
+
+def test_early_stop_disabled(config: EPConfig) -> bool:
+    """threshold=0 与无 threshold 结果一致。"""
+    print(f"\n{'-'*40} Early-Stop: Disabled (threshold=0) {'-'*40}")
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver, p2l_a, l2p_a, lcnts_a = make_solver_and_buffers(config)
+    _, p2l_b, l2p_b, lcnts_b = make_solver_and_buffers(config)
+
+    loads = gen_zipf(num_global_logical, alpha=1.5)
+
+    # Run with threshold=0 (explicit)
+    run_solver(solver, loads, p2l_a, l2p_a, lcnts_a, balance_threshold=0.0)
+    # Run without threshold (default)
+    solver.solve(loads, p2l_b, l2p_b, lcnts_b)
+
+    ok = True
+    if not torch.equal(p2l_a, p2l_b):
+        print("  FAIL — p2l differs")
+        ok = False
+    if not torch.equal(l2p_a, l2p_b):
+        print("  FAIL — l2p differs")
+        ok = False
+    if not torch.equal(lcnts_a, lcnts_b):
+        print("  FAIL — lcnts differs")
+        ok = False
+    if ok:
+        print("  PASS — threshold=0 produces same result as default")
+    return ok
+
+
+def test_early_stop_reduces_replicas(config: EPConfig) -> bool:
+    """threshold > 0 产生的 replica 数 ≤ 无 threshold 时的 replica 数。"""
+    print(f"\n{'-'*40} Early-Stop: Reduces Replicas {'-'*40}")
+
+    num_global_logical = config.num_local_master * config.num_ranks
+    solver, p2l_full, l2p_full, lcnts_full = make_solver_and_buffers(config)
+    _, p2l_es, l2p_es, lcnts_es = make_solver_and_buffers(config)
+
+    all_passed = True
+    for dist_name, gen_fn in DISTRIBUTIONS.items():
+        loads = gen_fn(num_global_logical)
+
+        # Full replication (no early-stop)
+        p2l_full.fill_(-1); l2p_full.fill_(-1); lcnts_full.fill_(0)
+        run_solver(solver, loads, p2l_full, l2p_full, lcnts_full, balance_threshold=0.0)
+        full_replicas = lcnts_full.sum().item() - num_global_logical
+
+        # With early-stop
+        p2l_es.fill_(-1); l2p_es.fill_(-1); lcnts_es.fill_(0)
+        run_solver(solver, loads, p2l_es, l2p_es, lcnts_es, balance_threshold=1.3)
+        es_replicas = lcnts_es.sum().item() - num_global_logical
+
+        # Validate correctness of early-stop result
+        try:
+            validate_placement(loads, p2l_es, l2p_es, lcnts_es, config)
+        except AssertionError as e:
+            print(f"  {dist_name:20s} ... FAIL (invariant violation: {e})")
+            all_passed = False
+            continue
+
+        passed = es_replicas <= full_replicas
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            all_passed = False
+        print(
+            f"  {dist_name:20s} ... {status}  "
+            f"full={full_replicas}  early_stop={es_replicas}"
+        )
+
+    return all_passed
+
+
+# ============================================================================
 # ============================================================================
 
 
@@ -501,6 +930,10 @@ def main():
     parser.add_argument(
         "--verbose", action="store_true", help="Print detailed per-GPU loads"
     )
+    parser.add_argument(
+        "--gpu", action="store_true",
+        help="Also run GPU solver (PlacementSolverGPU) tests"
+    )
     args = parser.parse_args()
 
     cfg = EPConfig(
@@ -513,16 +946,38 @@ def main():
 
     all_passed = True
 
+    # --- CPU solver tests (always run) ---
     if not test_correctness(cfg, verbose=args.verbose):
         all_passed = False
     test_determinism(cfg)
     report_load_balance(cfg)
     bench_latency(cfg)
 
+    # --- Early-stop tests (always run) ---
+    if not test_early_stop_balanced_load(cfg):
+        all_passed = False
+    if not test_early_stop_skewed_load(cfg):
+        all_passed = False
+    if not test_early_stop_disabled(cfg):
+        all_passed = False
+    if not test_early_stop_reduces_replicas(cfg):
+        all_passed = False
+
+    # --- GPU solver tests (--gpu flag) ---
+    if args.gpu:
+        if not test_gpu_correctness(cfg, verbose=args.verbose):
+            all_passed = False
+        if not test_gpu_determinism(cfg):
+            all_passed = False
+        if not compare_gpu_cpu_quality(cfg):
+            all_passed = False
+        bench_gpu_latency(cfg)
+        bench_solver_comparison(cfg)
+
     if all_passed:
-        print("ALL TESTS PASSED")
+        print("\nALL TESTS PASSED")
     else:
-        print("SOME TESTS FAILED")
+        print("\nSOME TESTS FAILED")
         sys.exit(1)
 
 

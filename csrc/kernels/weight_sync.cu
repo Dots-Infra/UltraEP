@@ -71,10 +71,11 @@ __device__ __forceinline__ WeightSyncTileInfo get_weight_sync_tile_info(const We
 // Weight sync kernel with double buffering for true pipelining
 // Pipeline: TMA_Load[N+1] overlaps with TMA_Store[N]
 // This achieves true overlap of local HBM reads and remote NVLINK writes.
-__global__ void weight_sync_kernel(const int total_tasks,
-                                   const WeightSyncTask* weight_sync_tasks,
+//
+// task_metadata: device pointer to [total_tasks, total_tiles] (set by CPU or GPU task build)
+__global__ void weight_sync_kernel(const WeightSyncTask* weight_sync_tasks,
                                    const int* task_tile_offsets,
-                                   const int total_tiles,
+                                   const int* task_metadata,
                                    int* global_tile_counter) {
     // Double-buffered shared memory
     extern __shared__ __nv_bfloat16 smem_base[];
@@ -86,6 +87,14 @@ __global__ void weight_sync_kernel(const int total_tasks,
 
     const bool is_leader = (threadIdx.x == 0);
 
+    // Read task metadata from device memory
+    __shared__ int total_tasks;
+    __shared__ int total_tiles;
+    if (is_leader) {
+        total_tasks = task_metadata[0];
+        total_tiles = task_metadata[1];
+    }
+
     // Initialize mbarriers
     if (is_leader) {
         for (int i = 0; i < 2; i++) {
@@ -94,6 +103,16 @@ __global__ void weight_sync_kernel(const int total_tasks,
         }
     }
     __syncthreads();
+
+    // Early exit if no work
+    if (total_tasks == 0) {
+        if (is_leader) {
+            for (int i = 0; i < 2; i++) {
+                ptx::mbarrier_invalidate(&mbarriers[i]);
+            }
+        }
+        return;
+    }
 
     // Shared tile indices
     __shared__ int tile_indices[2];
@@ -189,11 +208,33 @@ __global__ void weight_sync_kernel(const int total_tasks,
     }
 }
 
+// Helper to configure and launch the weight sync kernel
+static void launch_weight_sync_kernel(WeightSyncTask* weight_sync_tasks_gpu,
+                                      int* task_tile_offsets_gpu,
+                                      int* task_metadata_gpu,
+                                      int* global_tile_counter_gpu,
+                                      int num_ctas,
+                                      cudaStream_t stream) {
+    dim3 grid(num_ctas);
+    dim3 block(WEIGHT_SYNC_THREADS_PER_BLOCK);
+
+    // Double buffer shared memory
+    int smem_size = WEIGHT_SYNC_TILE_SIZE_BYTES * WEIGHT_SYNC_PIPELINE_STAGES;
+
+    CUDA_RUNTIME_CHECK(
+        cudaFuncSetAttribute(weight_sync_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    weight_sync_kernel<<<grid, block, smem_size, stream>>>(
+        weight_sync_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu);
+}
+
+// CPU task-build path: H2D copy tasks + tile offsets, write metadata, then launch kernel
 void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                      WeightSyncTask* weight_sync_tasks_gpu,
                      int* global_tile_counter_gpu,
                      int* task_tile_offsets_gpu,
                      int* task_tile_offsets_cpu,
+                     int* task_metadata_gpu,
                      const int total_tasks,
                      cudaStream_t stream,
                      const int num_device_sms) {
@@ -208,6 +249,11 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
     }
     int total_tiles = task_tile_offsets_cpu[total_tasks];
 
+    // Write task metadata to GPU
+    int metadata[2] = {total_tasks, total_tiles};
+    CUDA_RUNTIME_CHECK(
+        cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+
     // Copy tasks and tile offsets from CPU to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(weight_sync_tasks_gpu,
                                        weight_sync_tasks_cpu,
@@ -219,21 +265,27 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
 
     // Configure kernel launch
-    // Use enough CTAs to keep all SMs busy, but not more than tiles
     int num_ctas = min(num_device_sms * 2, total_tiles);
     num_ctas = max(num_ctas, 1);
 
-    dim3 grid(num_ctas);
-    dim3 block(WEIGHT_SYNC_THREADS_PER_BLOCK);
+    launch_weight_sync_kernel(
+        weight_sync_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu, num_ctas, stream);
+}
 
-    // Double buffer shared memory
-    int smem_size = WEIGHT_SYNC_TILE_SIZE_BYTES * WEIGHT_SYNC_PIPELINE_STAGES;
+// GPU task-build path: tasks already on GPU (written by build_weight_sync_tasks kernel)
+void run_weight_sync_from_gpu(WeightSyncTask* tasks_gpu,
+                              int* task_tile_offsets_gpu,
+                              int* task_metadata_gpu,
+                              int* global_tile_counter_gpu,
+                              cudaStream_t stream,
+                              int num_device_sms,
+                              int max_possible_tiles) {
+    // Use conservative upper bound for grid size; persistent kernel handles over-launch
+    int num_ctas = min(num_device_sms * 2, max_possible_tiles);
+    num_ctas = max(num_ctas, 1);
 
-    CUDA_RUNTIME_CHECK(
-        cudaFuncSetAttribute(weight_sync_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    weight_sync_kernel<<<grid, block, smem_size, stream>>>(
-        total_tasks, weight_sync_tasks_gpu, task_tile_offsets_gpu, total_tiles, global_tile_counter_gpu);
+    launch_weight_sync_kernel(tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu,
+                              num_ctas, stream);
 }
 
 }  // namespace ultra_ep::kernels

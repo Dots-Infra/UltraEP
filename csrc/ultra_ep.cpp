@@ -96,6 +96,26 @@ void GlobalExpertPlacement::to_gpu(const int layer_id, const bool async, std::op
     }
 }
 
+void GlobalExpertPlacement::to_cpu(const int layer_id, const bool async, std::optional<at::cuda::CUDAStream> s) const {
+    EP_HOST_ASSERT(cpu_buffer != nullptr && gpu_buffer != nullptr);
+    auto stream = s.value_or(at::cuda::getCurrentCUDAStream());
+    if (layer_id >= 0) {
+        EP_HOST_ASSERT(layer_id < num_layers_);
+        int32_t* src = gpu_buffer + layer_id * per_layer_stride_numel;
+        int32_t* dst = cpu_buffer + layer_id * per_layer_stride_numel;
+        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, per_layer_data_bytes, cudaMemcpyDeviceToHost, stream));
+    } else {
+        // Sync all layers
+        int32_t* src = gpu_buffer;
+        int32_t* dst = cpu_buffer;
+        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, total_bytes, cudaMemcpyDeviceToHost, stream));
+    }
+
+    if (!async) {
+        CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
+    }
+}
+
 std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_cpu_ptrs(int layer_id) const {
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
     int32_t* base = cpu_buffer + layer_id * per_layer_stride_numel;
@@ -238,7 +258,9 @@ Manager::Manager(const int& num_layers,
                  const int64_t& expert_fc1_numel,
                  const int64_t& expert_fc2_numel,
                  const bool& is_train,
-                 const bool& explicitly_destroy)
+                 const bool& explicitly_destroy,
+                 const bool& use_gpu_solver,
+                 const float& balance_threshold)
     : num_layers(num_layers),
       num_local_master_experts(num_local_master_experts),
       num_local_redundant_experts(num_local_redundant_experts),
@@ -248,8 +270,12 @@ Manager::Manager(const int& num_layers,
       expert_total_numel(expert_fc1_numel + expert_fc2_numel),
       is_train(is_train),
       explicitly_destroy(explicitly_destroy),
+      use_gpu_solver_(use_gpu_solver),
+      balance_threshold_(balance_threshold),
+      placement_cpu_dirty_(num_layers, false),
       comm_stream(at::cuda::getStreamFromPool(true)),
-      memset_stream(at::cuda::getStreamFromPool(false))
+      placement_ready_events_(is_train ? num_layers : 1),
+      placement_ready_stream_ids_(is_train ? num_layers : 1, -1)
 
 {
     // Common checks
@@ -327,6 +353,52 @@ Manager::Manager(const int& num_layers,
     CUDA_RUNTIME_CHECK(
         cudaMalloc((void**)&_weight_sync_tasks_gpu, MAX_WEIGHT_SYNC_TASK_NUM * sizeof(kernels::WeightSyncTask)));
 
+    // Task metadata buffer: [total_tasks, total_tiles] — shared between weight_sync and grad_reduce
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_metadata_gpu, 2 * sizeof(int)));
+
+    // GPU task build support (only when GPU solver is enabled)
+    if (use_gpu_solver_) {
+        // Copy immutable config to GPU (once)
+        kernels::TaskBuildConfig config_cpu;
+        config_cpu.rank_idx = runtime::rank_idx;
+        config_cpu.nvl_rank_idx = runtime::nvl_rank_idx;
+        config_cpu.num_nvl_ranks = runtime::num_nvl_ranks;
+        config_cpu.num_local_master_experts = num_local_master_experts;
+        config_cpu.num_local_physical_experts = num_local_physical_experts;
+        config_cpu.num_local_redundant_experts = num_local_redundant_experts;
+        config_cpu.expert_fc1_numel = expert_fc1_numel;
+        config_cpu.expert_fc2_numel = expert_fc2_numel;
+        config_cpu.expert_total_numel = expert_total_numel;
+        config_cpu.max_replicas_dim = runtime::num_ranks;
+        CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_build_config_gpu, sizeof(kernels::TaskBuildConfig)));
+        CUDA_RUNTIME_CHECK(cudaMemcpy(_task_build_config_gpu, &config_cpu,
+                                       sizeof(kernels::TaskBuildConfig), cudaMemcpyHostToDevice));
+
+        // Copy remote pointer tables to GPU (one-time, immutable after constructor)
+        CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_weight_ptrs_gpu, MAX_NVL_DOMAIN_SIZE * sizeof(void*)));
+        CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_weight_ptrs_gpu, global_replica_weight_buffer_ptrs,
+                                       MAX_NVL_DOMAIN_SIZE * sizeof(void*), cudaMemcpyHostToDevice));
+        if (is_train) {
+            CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_grad_ptrs_gpu, MAX_NVL_DOMAIN_SIZE * sizeof(void*)));
+            CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_grad_ptrs_gpu, global_replica_grad_buffer_ptrs,
+                                           MAX_NVL_DOMAIN_SIZE * sizeof(void*), cudaMemcpyHostToDevice));
+        }
+
+        // Staging buffer for master pointers (H2D copied each call, ~64 bytes)
+        CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_local_master_ptrs_staging_gpu,
+                                       2 * num_local_master_experts * sizeof(int64_t)));
+
+        // Pre-compute upper bounds for GPU-path grid sizing
+        int64_t max_fc_numel = std::max(expert_fc1_numel, expert_fc2_numel);
+        int ws_tiles_per_task = static_cast<int>((max_fc_numel + WEIGHT_SYNC_TILE_ELEMENTS - 1) / WEIGHT_SYNC_TILE_ELEMENTS);
+        _max_ws_total_tiles = 2 * num_local_master_experts * ws_tiles_per_task;
+
+        int max_replicas = runtime::num_nvl_ranks - 1;
+        _max_gr_total_tasks = 2 * num_local_master_experts * max_replicas;
+        int gr_tiles_per_task = static_cast<int>((max_fc_numel + GRAD_REDUCE_TILE_ELEMENTS - 1) / GRAD_REDUCE_TILE_ELEMENTS);
+        _max_gr_total_tiles = _max_gr_total_tasks * gr_tiles_per_task;
+    }
+
     // Sparse reroute counters
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_reroute_sparse_counters_gpu, num_global_logical_experts * sizeof(int)));
 
@@ -338,6 +410,16 @@ Manager::Manager(const int& num_layers,
                                                                   runtime::num_nvl_ranks,
                                                                   runtime::num_ranks  // max_replicas_dim = num_ranks
     );
+    // Optionally create GPU placement solver
+    if (use_gpu_solver_) {
+        placement_solver_gpu_ = std::make_unique<solver::PlacementSolverGPU>(num_global_logical_experts,
+                                                                              runtime::num_ranks,
+                                                                              num_local_master_experts,
+                                                                              num_local_redundant_experts,
+                                                                              runtime::num_nvl_ranks,
+                                                                              runtime::num_ranks
+        );
+    }
     // Allocate global logical expert load buffer
     global_logical_expert_loads_gpu =
         reinterpret_cast<int*>(nvshmem::alloc(num_global_logical_experts * sizeof(int), NVSHMEM_ALIGNMENT));
@@ -415,6 +497,28 @@ void Manager::destroy() {
     _weight_sync_tasks_cpu = nullptr;
     _weight_sync_tasks_gpu = nullptr;
 
+    // Free task metadata buffer
+    CUDA_RUNTIME_CHECK(cudaFree(_task_metadata_gpu));
+    _task_metadata_gpu = nullptr;
+
+    // Free GPU task build buffers
+    if (_task_build_config_gpu) {
+        CUDA_RUNTIME_CHECK(cudaFree(_task_build_config_gpu));
+        _task_build_config_gpu = nullptr;
+    }
+    if (_remote_weight_ptrs_gpu) {
+        CUDA_RUNTIME_CHECK(cudaFree(_remote_weight_ptrs_gpu));
+        _remote_weight_ptrs_gpu = nullptr;
+    }
+    if (_remote_grad_ptrs_gpu) {
+        CUDA_RUNTIME_CHECK(cudaFree(_remote_grad_ptrs_gpu));
+        _remote_grad_ptrs_gpu = nullptr;
+    }
+    if (_local_master_ptrs_staging_gpu) {
+        CUDA_RUNTIME_CHECK(cudaFree(_local_master_ptrs_staging_gpu));
+        _local_master_ptrs_staging_gpu = nullptr;
+    }
+
     // Free sparse reroute counters
     CUDA_RUNTIME_CHECK(cudaFree(_reroute_sparse_counters_gpu));
     _reroute_sparse_counters_gpu = nullptr;
@@ -433,6 +537,61 @@ void Manager::destroy() {
     _available = false;
 }
 
+void Manager::sync_placement_to_cpu(const int layer_id) {
+    EP_HOST_ASSERT(is_available());
+    EP_HOST_ASSERT(layer_id >= -1 && layer_id < num_layers);
+
+    if (!use_gpu_solver_) {
+        return;
+    }
+
+    bool need_sync = false;
+    if (layer_id >= 0) {
+        need_sync = placement_cpu_dirty_[layer_id];
+    } else {
+        for (bool dirty : placement_cpu_dirty_) {
+            if (dirty) {
+                need_sync = true;
+                break;
+            }
+        }
+    }
+    if (!need_sync) {
+        return;
+    }
+
+    // Placement writes may have been enqueued on either the caller's current stream
+    // or comm_stream. For CPU consumers we can take the slow path and fully
+    // synchronize the device before refreshing the host mirror.
+    CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
+    placement.to_cpu(layer_id, /*async=*/false);
+
+    if (layer_id >= 0) {
+        placement_cpu_dirty_[layer_id] = false;
+    } else {
+        std::fill(placement_cpu_dirty_.begin(), placement_cpu_dirty_.end(), false);
+    }
+}
+
+void Manager::record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream) {
+    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
+    const int slot = placement_sync_slot(layer_id);
+    placement_ready_events_[slot] = EventHandle(stream);
+    placement_ready_stream_ids_[slot] = static_cast<int64_t>(stream.id());
+}
+
+void Manager::wait_for_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream) const {
+    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
+    const int slot = placement_sync_slot(layer_id);
+    if (!placement_ready_events_[slot].has_value()) {
+        return;
+    }
+    if (placement_ready_stream_ids_[slot] == static_cast<int64_t>(stream.id())) {
+        return;
+    }
+    stream_wait(stream, placement_ready_events_[slot].value());
+}
+
 void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) {
     EP_HOST_ASSERT(is_available());
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
@@ -449,26 +608,39 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
 
     nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, curr_stream.stream());
 
-    // Copy global logical expert loads from GPU to CPU
-    // Must use current stream to ensure data readiness
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(global_logical_expert_loads_cpu,
-                                       global_logical_expert_loads_gpu,
-                                       num_global_logical_experts * sizeof(int),
-                                       cudaMemcpyDeviceToHost,
-                                       curr_stream.stream()));
+    // Zero-out reroute buffer on the same stream as solver/reroute to avoid
+    // cross-stream event synchronization in the hot path.
+    reroute_output_buffer_->zero_out_fwd_bufs(layer_id, curr_stream);
 
-    // Zero-out reroute buffer in advance for overlapping
-    reroute_output_buffer_->zero_out_fwd_bufs(layer_id, memset_stream);
+    if (use_gpu_solver_) {
+        // GPU path: solver reads directly from GPU loads, writes to GPU placement buffer.
+        // No D2H/sync/H2D on the hot path: the CPU mirror is refreshed only on demand.
+        auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
+        placement_solver_gpu_->solve(global_logical_expert_loads_gpu,
+                                     p2l_gpu, l2p_gpu, lcnts_gpu,
+                                     curr_stream.stream(),
+                                     balance_threshold_);
+        placement_cpu_dirty_[layer_id] = true;
+    } else {
+        // CPU path (original): D2H → sync → CPU solve → H2D
+        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(global_logical_expert_loads_cpu,
+                                           global_logical_expert_loads_gpu,
+                                           num_global_logical_experts * sizeof(int),
+                                           cudaMemcpyDeviceToHost,
+                                           curr_stream.stream()));
 
-    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
+        auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
 
-    // Ensure data readiness for CPU-side placement solver
-    CUDA_RUNTIME_CHECK(cudaStreamSynchronize(curr_stream.stream()));
+        // Ensure data readiness for CPU-side placement solver
+        CUDA_RUNTIME_CHECK(cudaStreamSynchronize(curr_stream.stream()));
 
-    placement_solver_->solve(global_logical_expert_loads_cpu, p2l_ptr, l2p_ptr, lcnts_ptr);
+        placement_solver_->solve(global_logical_expert_loads_cpu, p2l_ptr, l2p_ptr, lcnts_ptr,
+                                 balance_threshold_);
 
-    // Move placement to GPU for later use
-    placement.to_gpu(layer_id);
+        // Move placement to GPU for later use
+        placement.to_gpu(layer_id);
+    }
+    record_placement_ready(layer_id, curr_stream);
 }
 
 void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_ids) {
@@ -480,7 +652,7 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
     int T = topk_ids.size(0);
     int K = topk_ids.size(1);
 
-    // Use comm_stream for histogram + allreduce + D2H (same pattern as update_placement)
+    // Use comm_stream for histogram + allreduce (same pattern as update_placement)
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     stream_wait(comm_stream, compute_stream);
 
@@ -492,20 +664,32 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
                             comm_stream.stream());
     nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, comm_stream.stream());
 
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(global_logical_expert_loads_cpu,
-                                       global_logical_expert_loads_gpu,
-                                       num_global_logical_experts * sizeof(int),
-                                       cudaMemcpyDeviceToHost,
-                                       comm_stream.stream()));
+    if (use_gpu_solver_) {
+        // GPU path: solver on comm_stream after allreduce
+        auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
+        placement_solver_gpu_->solve(global_logical_expert_loads_gpu,
+                                     p2l_gpu, l2p_gpu, lcnts_gpu,
+                                     comm_stream.stream(),
+                                     balance_threshold_);
+        placement_cpu_dirty_[layer_id] = true;
+        record_placement_ready(layer_id, comm_stream);
+    } else {
+        // CPU path: D2H → sync → CPU solve → H2D
+        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(global_logical_expert_loads_cpu,
+                                           global_logical_expert_loads_gpu,
+                                           num_global_logical_experts * sizeof(int),
+                                           cudaMemcpyDeviceToHost,
+                                           comm_stream.stream()));
 
-    // Ensure data readiness for CPU-side placement solver
-    CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+        CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream.stream()));
 
-    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
-    placement_solver_->solve(global_logical_expert_loads_cpu, p2l_ptr, l2p_ptr, lcnts_ptr);
+        auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
+        placement_solver_->solve(global_logical_expert_loads_cpu, p2l_ptr, l2p_ptr, lcnts_ptr,
+                                 balance_threshold_);
 
-    // Move placement to GPU
-    placement.to_gpu(layer_id);
+        placement.to_gpu(layer_id);
+        record_placement_ready(layer_id, compute_stream);
+    }
 }
 
 void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
@@ -517,6 +701,7 @@ void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
     int T = topk_ids.size(0);
     int K = topk_ids.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
+    wait_for_placement_ready(layer_id, stream);
 
     auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
 
@@ -536,6 +721,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> Manager::reroute_cpu(con
     EP_HOST_ASSERT(is_available());
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
 
+    sync_placement_to_cpu(layer_id);
     auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
     return reroute_solver_->solve(routing_map, l2p_ptr, lcnts_ptr);
 }
@@ -556,6 +742,7 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
     const int P = num_global_physical_experts;
     auto device = routing_map.device();
     auto stream = at::cuda::getCurrentCUDAStream();
+    wait_for_placement_ready(layer_id, stream);
 
     // Lazy allocation / reallocation of output buffers
     // These buffers are async zero-out during update_placement for zero-overhead
@@ -566,10 +753,8 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
     auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
 
     if (!reroute_output_buffer_->get_fwd_valid_flag(layer_id)) {  // not zero-out
-        reroute_output_buffer_->zero_out_fwd_bufs(layer_id, memset_stream);
+        reroute_output_buffer_->zero_out_fwd_bufs(layer_id, stream);
     }
-    // Can wait for memset in update_place or here above
-    stream_wait(stream, memset_stream);
     // Reset layer valid flag
     reroute_output_buffer_->set_fwd_valid_flag(layer_id, false);
 
@@ -672,66 +857,138 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
         stream_wait(comm_stream, compute_stream);
     }
 
-    void** local_master_fc1_grad_ptrs = reinterpret_cast<void**>(local_master_fc1_grad_ptr_tensor.data<int64_t>());
-    void** local_master_fc2_grad_ptrs = reinterpret_cast<void**>(local_master_fc2_grad_ptr_tensor.data<int64_t>());
+    EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.dtype() == torch::kInt64);
+    EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.dtype() == torch::kInt64);
+    EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.numel() == num_local_master_experts);
+    EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.numel() == num_local_master_experts);
 
-    // Flatten task list (host-side)
-    int num_tasks = 0;
-    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
-    for (int i = 0; i < num_local_master_experts; ++i) {
-        int master_global_phy_idx = runtime::rank_idx * num_local_physical_experts + i;
-        int master_global_log_idx = p2l_ptr[master_global_phy_idx];
-        int num_replicas = lcnts_ptr[master_global_log_idx];
-        float* local_master_fc1_grad_ptr = reinterpret_cast<float*>(local_master_fc1_grad_ptrs[i]);
-        float* local_master_fc2_grad_ptr = reinterpret_cast<float*>(local_master_fc2_grad_ptrs[i]);
-
-        for (int j = 1; j < num_replicas; ++j) {  // skip the master itself
-            int replica_global_phy_idx = l2p_ptr[master_global_log_idx * runtime::num_ranks + j];
-            int replica_global_rank_idx = replica_global_phy_idx / num_local_physical_experts;
-            EP_HOST_ASSERT(is_in_same_nvl_domain(runtime::rank_idx, replica_global_rank_idx, runtime::num_nvl_ranks) &&
-                           "Replica rank is not in the same NVL domain as the master rank");
-            int replica_nvl_rank_idx = replica_global_rank_idx % runtime::num_nvl_ranks;
-            EP_HOST_ASSERT(replica_nvl_rank_idx != runtime::nvl_rank_idx &&
-                           "Replica rank is the same as the master rank, which is not allowed");
-            EP_HOST_ASSERT(global_replica_grad_buffer_ptrs[replica_nvl_rank_idx] != nullptr);
-            int replica_local_offset = replica_global_phy_idx % num_local_physical_experts - num_local_master_experts;
-            EP_HOST_ASSERT(replica_local_offset >= 0 and replica_local_offset < num_local_redundant_experts);
-            float* replica_remote_grad_buffer_ptr =
-                reinterpret_cast<float*>(global_replica_grad_buffer_ptrs[replica_nvl_rank_idx]);
-            float* replica_remote_fc1_grad_ptr =
-                replica_remote_grad_buffer_ptr + replica_local_offset * expert_total_numel;
-            float* replica_remote_fc2_grad_ptr = replica_remote_fc1_grad_ptr + expert_fc1_numel;
-            _grad_reduce_tasks_cpu[num_tasks++] = {
-                local_master_fc1_grad_ptr, replica_remote_fc1_grad_ptr, static_cast<size_t>(expert_fc1_numel)};
-            _grad_reduce_tasks_cpu[num_tasks++] = {
-                local_master_fc2_grad_ptr, replica_remote_fc2_grad_ptr, static_cast<size_t>(expert_fc2_numel)};
+    if (use_gpu_solver_) {
+        // GPU task build path: tasks built entirely on GPU
+        int64_t* local_master_fc1_grad_ptrs_gpu = nullptr;
+        int64_t* local_master_fc2_grad_ptrs_gpu = nullptr;
+        if (local_master_fc1_grad_ptr_tensor.is_cuda()) {
+            EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.is_cuda());
+            local_master_fc1_grad_ptrs_gpu = local_master_fc1_grad_ptr_tensor.data_ptr<int64_t>();
+            local_master_fc2_grad_ptrs_gpu = local_master_fc2_grad_ptr_tensor.data_ptr<int64_t>();
+        } else {
+            // Legacy compatibility: accept CPU ptr tensors and stage them to GPU.
+            void** local_master_fc1_grad_ptrs = reinterpret_cast<void**>(local_master_fc1_grad_ptr_tensor.data_ptr<int64_t>());
+            void** local_master_fc2_grad_ptrs = reinterpret_cast<void**>(local_master_fc2_grad_ptr_tensor.data_ptr<int64_t>());
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(_local_master_ptrs_staging_gpu,
+                                               local_master_fc1_grad_ptrs,
+                                               num_local_master_experts * sizeof(int64_t),
+                                               cudaMemcpyHostToDevice,
+                                               comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(_local_master_ptrs_staging_gpu + num_local_master_experts,
+                                               local_master_fc2_grad_ptrs,
+                                               num_local_master_experts * sizeof(int64_t),
+                                               cudaMemcpyHostToDevice,
+                                               comm_stream));
+            local_master_fc1_grad_ptrs_gpu = _local_master_ptrs_staging_gpu;
+            local_master_fc2_grad_ptrs_gpu = _local_master_ptrs_staging_gpu + num_local_master_experts;
         }
-    }
-    if (num_tasks == 0) {
-        if (async) {
-            event = EventHandle(comm_stream);
-        }
-        return event;
-    }
 
-    // Call device-side kernels
-    if (mode == "low_sm") {
-        kernels::run_grad_reduce_low_sm(_grad_reduce_tasks_cpu,
-                                        _grad_reduce_tasks_gpu,
-                                        _global_task_or_tile_counter_gpu,
-                                        num_tasks,
-                                        comm_stream,
-                                        runtime::num_device_sms);
-    } else if (mode == "high_sm") {
-        kernels::run_grad_reduce_high_sm(_grad_reduce_tasks_cpu,
-                                         _grad_reduce_tasks_gpu,
-                                         _global_task_or_tile_counter_gpu,
-                                         _task_tile_offsets_gpu,
-                                         num_tasks,
-                                         comm_stream,
-                                         runtime::num_device_sms);
+        // Build tasks on GPU
+        auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
+        kernels::build_grad_reduce_tasks(
+            _task_build_config_gpu,
+            p2l_gpu, l2p_gpu, lcnts_gpu,
+            _remote_grad_ptrs_gpu,
+            local_master_fc1_grad_ptrs_gpu,
+            local_master_fc2_grad_ptrs_gpu,
+            _grad_reduce_tasks_gpu,
+            _task_tile_offsets_gpu,
+            _task_metadata_gpu,
+            _global_task_or_tile_counter_gpu,
+            comm_stream);
+
+        // Launch main kernel using GPU-resident tasks
+        if (mode == "low_sm") {
+            kernels::run_grad_reduce_low_sm_from_gpu(
+                _grad_reduce_tasks_gpu,
+                _global_task_or_tile_counter_gpu,
+                _task_metadata_gpu,
+                comm_stream,
+                runtime::num_device_sms,
+                _max_gr_total_tasks);
+        } else if (mode == "high_sm") {
+            kernels::run_grad_reduce_high_sm_from_gpu(
+                _grad_reduce_tasks_gpu,
+                _task_tile_offsets_gpu,
+                _task_metadata_gpu,
+                _global_task_or_tile_counter_gpu,
+                comm_stream,
+                runtime::num_device_sms,
+                _max_gr_total_tiles);
+        } else {
+            EP_HOST_ASSERT(false && "Invalid grad reduce mode");
+        }
     } else {
-        EP_HOST_ASSERT(false && "Invalid grad reduce mode");
+        // CPU task build path (original)
+        EP_HOST_ASSERT(!local_master_fc1_grad_ptr_tensor.is_cuda());
+        EP_HOST_ASSERT(!local_master_fc2_grad_ptr_tensor.is_cuda());
+        void** local_master_fc1_grad_ptrs = reinterpret_cast<void**>(local_master_fc1_grad_ptr_tensor.data_ptr<int64_t>());
+        void** local_master_fc2_grad_ptrs = reinterpret_cast<void**>(local_master_fc2_grad_ptr_tensor.data_ptr<int64_t>());
+        int num_tasks = 0;
+        sync_placement_to_cpu(layer_id);
+        auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
+        for (int i = 0; i < num_local_master_experts; ++i) {
+            int master_global_phy_idx = runtime::rank_idx * num_local_physical_experts + i;
+            int master_global_log_idx = p2l_ptr[master_global_phy_idx];
+            int num_replicas = lcnts_ptr[master_global_log_idx];
+            float* local_master_fc1_grad_ptr = reinterpret_cast<float*>(local_master_fc1_grad_ptrs[i]);
+            float* local_master_fc2_grad_ptr = reinterpret_cast<float*>(local_master_fc2_grad_ptrs[i]);
+
+            for (int j = 1; j < num_replicas; ++j) {  // skip the master itself
+                int replica_global_phy_idx = l2p_ptr[master_global_log_idx * runtime::num_ranks + j];
+                int replica_global_rank_idx = replica_global_phy_idx / num_local_physical_experts;
+                EP_HOST_ASSERT(is_in_same_nvl_domain(runtime::rank_idx, replica_global_rank_idx, runtime::num_nvl_ranks) &&
+                               "Replica rank is not in the same NVL domain as the master rank");
+                int replica_nvl_rank_idx = replica_global_rank_idx % runtime::num_nvl_ranks;
+                EP_HOST_ASSERT(replica_nvl_rank_idx != runtime::nvl_rank_idx &&
+                               "Replica rank is the same as the master rank, which is not allowed");
+                EP_HOST_ASSERT(global_replica_grad_buffer_ptrs[replica_nvl_rank_idx] != nullptr);
+                int replica_local_offset = replica_global_phy_idx % num_local_physical_experts - num_local_master_experts;
+                EP_HOST_ASSERT(replica_local_offset >= 0 and replica_local_offset < num_local_redundant_experts);
+                float* replica_remote_grad_buffer_ptr =
+                    reinterpret_cast<float*>(global_replica_grad_buffer_ptrs[replica_nvl_rank_idx]);
+                float* replica_remote_fc1_grad_ptr =
+                    replica_remote_grad_buffer_ptr + replica_local_offset * expert_total_numel;
+                float* replica_remote_fc2_grad_ptr = replica_remote_fc1_grad_ptr + expert_fc1_numel;
+                _grad_reduce_tasks_cpu[num_tasks++] = {
+                    local_master_fc1_grad_ptr, replica_remote_fc1_grad_ptr, static_cast<size_t>(expert_fc1_numel)};
+                _grad_reduce_tasks_cpu[num_tasks++] = {
+                    local_master_fc2_grad_ptr, replica_remote_fc2_grad_ptr, static_cast<size_t>(expert_fc2_numel)};
+            }
+        }
+        if (num_tasks == 0) {
+            if (async) {
+                event = EventHandle(comm_stream);
+            }
+            return event;
+        }
+
+        // Call device-side kernels
+        if (mode == "low_sm") {
+            kernels::run_grad_reduce_low_sm(_grad_reduce_tasks_cpu,
+                                            _grad_reduce_tasks_gpu,
+                                            _global_task_or_tile_counter_gpu,
+                                            _task_metadata_gpu,
+                                            num_tasks,
+                                            comm_stream,
+                                            runtime::num_device_sms);
+        } else if (mode == "high_sm") {
+            kernels::run_grad_reduce_high_sm(_grad_reduce_tasks_cpu,
+                                             _grad_reduce_tasks_gpu,
+                                             _global_task_or_tile_counter_gpu,
+                                             _task_tile_offsets_gpu,
+                                             _task_metadata_gpu,
+                                             num_tasks,
+                                             comm_stream,
+                                             runtime::num_device_sms);
+        } else {
+            EP_HOST_ASSERT(false && "Invalid grad reduce mode");
+        }
     }
 
     // Wait streams
@@ -760,83 +1017,139 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         stream_wait(comm_stream, compute_stream);
     }
 
-    void** local_master_fc1_weight_ptrs = reinterpret_cast<void**>(local_master_fc1_weight_ptr_tensor.data<int64_t>());
-    void** local_master_fc2_weight_ptrs = reinterpret_cast<void**>(local_master_fc2_weight_ptr_tensor.data<int64_t>());
+    EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);
+    EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.dtype() == torch::kInt64);
+    EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.numel() == num_local_master_experts);
+    EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.numel() == num_local_master_experts);
 
-    // Build broadcast tasks: each local master broadcasts to all its replicas
-    // Each master creates two tasks: one for FC1, one for FC2
-    int num_tasks = 0;
-    auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
-    for (int i = 0; i < num_local_master_experts; ++i) {
-        int master_global_phy_idx = runtime::rank_idx * num_local_physical_experts + i;
-        int master_global_log_idx = p2l_ptr[master_global_phy_idx];
-        int num_replicas = lcnts_ptr[master_global_log_idx] - 1;  // Exclude master itself
-
-        if (num_replicas == 0) {
-            continue;  // No replicas to sync to
+    if (use_gpu_solver_) {
+        // GPU task build path: tasks built entirely on GPU
+        int64_t* local_master_fc1_weight_ptrs_gpu = nullptr;
+        int64_t* local_master_fc2_weight_ptrs_gpu = nullptr;
+        if (local_master_fc1_weight_ptr_tensor.is_cuda()) {
+            EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.is_cuda());
+            local_master_fc1_weight_ptrs_gpu = local_master_fc1_weight_ptr_tensor.data_ptr<int64_t>();
+            local_master_fc2_weight_ptrs_gpu = local_master_fc2_weight_ptr_tensor.data_ptr<int64_t>();
+        } else {
+            // Legacy compatibility: accept CPU ptr tensors and stage them to GPU.
+            void** local_master_fc1_weight_ptrs = reinterpret_cast<void**>(local_master_fc1_weight_ptr_tensor.data_ptr<int64_t>());
+            void** local_master_fc2_weight_ptrs = reinterpret_cast<void**>(local_master_fc2_weight_ptr_tensor.data_ptr<int64_t>());
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(_local_master_ptrs_staging_gpu,
+                                               local_master_fc1_weight_ptrs,
+                                               num_local_master_experts * sizeof(int64_t),
+                                               cudaMemcpyHostToDevice,
+                                               comm_stream));
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(_local_master_ptrs_staging_gpu + num_local_master_experts,
+                                               local_master_fc2_weight_ptrs,
+                                               num_local_master_experts * sizeof(int64_t),
+                                               cudaMemcpyHostToDevice,
+                                               comm_stream));
+            local_master_fc1_weight_ptrs_gpu = _local_master_ptrs_staging_gpu;
+            local_master_fc2_weight_ptrs_gpu = _local_master_ptrs_staging_gpu + num_local_master_experts;
         }
 
-        __nv_bfloat16* local_master_fc1_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc1_weight_ptrs[i]);
-        __nv_bfloat16* local_master_fc2_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc2_weight_ptrs[i]);
+        auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
+        kernels::build_weight_sync_tasks(
+            _task_build_config_gpu,
+            p2l_gpu, l2p_gpu, lcnts_gpu,
+            _remote_weight_ptrs_gpu,
+            local_master_fc1_weight_ptrs_gpu,
+            local_master_fc2_weight_ptrs_gpu,
+            _weight_sync_tasks_gpu,
+            _task_tile_offsets_gpu,
+            _task_metadata_gpu,
+            _global_task_or_tile_counter_gpu,
+            comm_stream);
 
-        // Create FC1 task
-        kernels::WeightSyncTask& fc1_task = _weight_sync_tasks_cpu[num_tasks];
-        fc1_task.master_local_addr = local_master_fc1_weight_ptr;
-        fc1_task.num_replicas = num_replicas;
-        fc1_task.numel = static_cast<size_t>(expert_fc1_numel);
+        kernels::run_weight_sync_from_gpu(
+            _weight_sync_tasks_gpu,
+            _task_tile_offsets_gpu,
+            _task_metadata_gpu,
+            _global_task_or_tile_counter_gpu,
+            comm_stream,
+            runtime::num_device_sms,
+            _max_ws_total_tiles);
+    } else {
+        // CPU task build path (original)
+        EP_HOST_ASSERT(!local_master_fc1_weight_ptr_tensor.is_cuda());
+        EP_HOST_ASSERT(!local_master_fc2_weight_ptr_tensor.is_cuda());
+        void** local_master_fc1_weight_ptrs = reinterpret_cast<void**>(local_master_fc1_weight_ptr_tensor.data_ptr<int64_t>());
+        void** local_master_fc2_weight_ptrs = reinterpret_cast<void**>(local_master_fc2_weight_ptr_tensor.data_ptr<int64_t>());
+        int num_tasks = 0;
+        sync_placement_to_cpu(layer_id);
+        auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(layer_id);
+        for (int i = 0; i < num_local_master_experts; ++i) {
+            int master_global_phy_idx = runtime::rank_idx * num_local_physical_experts + i;
+            int master_global_log_idx = p2l_ptr[master_global_phy_idx];
+            int num_replicas = lcnts_ptr[master_global_log_idx] - 1;  // Exclude master itself
 
-        // Create FC2 task
-        kernels::WeightSyncTask& fc2_task = _weight_sync_tasks_cpu[num_tasks + 1];
-        fc2_task.master_local_addr = local_master_fc2_weight_ptr;
-        fc2_task.num_replicas = num_replicas;
-        fc2_task.numel = static_cast<size_t>(expert_fc2_numel);
+            if (num_replicas == 0) {
+                continue;  // No replicas to sync to
+            }
 
-        // Fill replica addresses for both tasks
-        for (int j = 0; j < num_replicas; ++j) {
-            // j+1 because index 0 is the master itself in logical_to_physical_map
-            int replica_global_phy_idx = l2p_ptr[master_global_log_idx * runtime::num_ranks + j + 1];
-            int replica_global_rank_idx = replica_global_phy_idx / num_local_physical_experts;
-            EP_HOST_ASSERT(is_in_same_nvl_domain(runtime::rank_idx, replica_global_rank_idx, runtime::num_nvl_ranks) &&
-                           "Replica rank is not in the same NVL domain as the master rank");
-            int replica_nvl_rank_idx = replica_global_rank_idx % runtime::num_nvl_ranks;
-            EP_HOST_ASSERT(replica_nvl_rank_idx != runtime::nvl_rank_idx &&
-                           "Replica rank is the same as the master rank, which is not allowed");
-            EP_HOST_ASSERT(global_replica_weight_buffer_ptrs[replica_nvl_rank_idx] != nullptr);
+            __nv_bfloat16* local_master_fc1_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc1_weight_ptrs[i]);
+            __nv_bfloat16* local_master_fc2_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc2_weight_ptrs[i]);
 
-            int replica_local_offset = replica_global_phy_idx % num_local_physical_experts - num_local_master_experts;
-            EP_HOST_ASSERT(replica_local_offset >= 0 && replica_local_offset < num_local_redundant_experts);
+            // Create FC1 task
+            kernels::WeightSyncTask& fc1_task = _weight_sync_tasks_cpu[num_tasks];
+            fc1_task.master_local_addr = local_master_fc1_weight_ptr;
+            fc1_task.num_replicas = num_replicas;
+            fc1_task.numel = static_cast<size_t>(expert_fc1_numel);
 
-            __nv_bfloat16* replica_remote_weight_buffer_ptr =
-                reinterpret_cast<__nv_bfloat16*>(global_replica_weight_buffer_ptrs[replica_nvl_rank_idx]);
-            __nv_bfloat16* replica_remote_fc1_weight_ptr =
-                replica_remote_weight_buffer_ptr + replica_local_offset * expert_total_numel;
-            __nv_bfloat16* replica_remote_fc2_weight_ptr = replica_remote_fc1_weight_ptr + expert_fc1_numel;
+            // Create FC2 task
+            kernels::WeightSyncTask& fc2_task = _weight_sync_tasks_cpu[num_tasks + 1];
+            fc2_task.master_local_addr = local_master_fc2_weight_ptr;
+            fc2_task.num_replicas = num_replicas;
+            fc2_task.numel = static_cast<size_t>(expert_fc2_numel);
 
-            fc1_task.replica_remote_addrs[j] = replica_remote_fc1_weight_ptr;
-            fc2_task.replica_remote_addrs[j] = replica_remote_fc2_weight_ptr;
+            // Fill replica addresses for both tasks
+            for (int j = 0; j < num_replicas; ++j) {
+                // j+1 because index 0 is the master itself in logical_to_physical_map
+                int replica_global_phy_idx = l2p_ptr[master_global_log_idx * runtime::num_ranks + j + 1];
+                int replica_global_rank_idx = replica_global_phy_idx / num_local_physical_experts;
+                EP_HOST_ASSERT(is_in_same_nvl_domain(runtime::rank_idx, replica_global_rank_idx, runtime::num_nvl_ranks) &&
+                               "Replica rank is not in the same NVL domain as the master rank");
+                int replica_nvl_rank_idx = replica_global_rank_idx % runtime::num_nvl_ranks;
+                EP_HOST_ASSERT(replica_nvl_rank_idx != runtime::nvl_rank_idx &&
+                               "Replica rank is the same as the master rank, which is not allowed");
+                EP_HOST_ASSERT(global_replica_weight_buffer_ptrs[replica_nvl_rank_idx] != nullptr);
+
+                int replica_local_offset = replica_global_phy_idx % num_local_physical_experts - num_local_master_experts;
+                EP_HOST_ASSERT(replica_local_offset >= 0 && replica_local_offset < num_local_redundant_experts);
+
+                __nv_bfloat16* replica_remote_weight_buffer_ptr =
+                    reinterpret_cast<__nv_bfloat16*>(global_replica_weight_buffer_ptrs[replica_nvl_rank_idx]);
+                __nv_bfloat16* replica_remote_fc1_weight_ptr =
+                    replica_remote_weight_buffer_ptr + replica_local_offset * expert_total_numel;
+                __nv_bfloat16* replica_remote_fc2_weight_ptr = replica_remote_fc1_weight_ptr + expert_fc1_numel;
+
+                fc1_task.replica_remote_addrs[j] = replica_remote_fc1_weight_ptr;
+                fc2_task.replica_remote_addrs[j] = replica_remote_fc2_weight_ptr;
+            }
+
+            num_tasks += 2;
         }
 
-        num_tasks += 2;
+        if (num_tasks == 0) {
+            if (async) {
+                event = EventHandle(comm_stream);
+            }
+            return event;
+        }
+        // Ensure the task tile offsets buffer is large enough
+        EP_HOST_ASSERT(num_tasks + 1 < 3 * num_local_master_experts);
+
+        // Call device-side kernel
+        kernels::run_weight_sync(_weight_sync_tasks_cpu,
+                                 _weight_sync_tasks_gpu,
+                                 _global_task_or_tile_counter_gpu,
+                                 _task_tile_offsets_gpu,
+                                 _task_tile_offsets_cpu,
+                                 _task_metadata_gpu,
+                                 num_tasks,
+                                 comm_stream,
+                                 runtime::num_device_sms);
     }
-
-    if (num_tasks == 0) {
-        if (async) {
-            event = EventHandle(comm_stream);
-        }
-        return event;
-    }
-    // Ensure the task tile offsets buffer is large enough
-    EP_HOST_ASSERT(num_tasks + 1 < 3 * num_local_master_experts);
-
-    // Call device-side kernel
-    kernels::run_weight_sync(_weight_sync_tasks_cpu,
-                             _weight_sync_tasks_gpu,
-                             _global_task_or_tile_counter_gpu,
-                             _task_tile_offsets_gpu,
-                             _task_tile_offsets_cpu,
-                             num_tasks,
-                             comm_stream,
-                             runtime::num_device_sms);
 
     // Wait streams
     if (async) {

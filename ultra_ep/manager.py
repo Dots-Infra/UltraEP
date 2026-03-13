@@ -23,6 +23,8 @@ class Manager:
         is_train: bool = True,
         explicitly_destroy: bool = False,
         max_microbatches: int = 1,
+        use_gpu_solver: bool = False,
+        balance_threshold: float = 0.0,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -60,8 +62,12 @@ class Manager:
         # These don't depend on micro-batch because the physical memory is the same.
         self.local_master_fc1_weight_pool = [None] * self.real_num_alloc_layers
         self.local_master_fc2_weight_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc1_weight_pool_gpu = [None] * self.real_num_alloc_layers
+        self.local_master_fc2_weight_pool_gpu = [None] * self.real_num_alloc_layers
         self.local_master_fc1_grad_pool = [None] * self.real_num_alloc_layers
         self.local_master_fc2_grad_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc1_grad_pool_gpu = [None] * self.real_num_alloc_layers
+        self.local_master_fc2_grad_pool_gpu = [None] * self.real_num_alloc_layers
 
         # Per-real-layer micro-batch slot counters (wraps modulo max_microbatches)
         self._mb_counters = [0] * self.real_num_alloc_layers
@@ -79,6 +85,7 @@ class Manager:
 
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
+        self.use_gpu_solver = use_gpu_solver
         self.runtime = _C.Manager(
             self.num_alloc_layers,
             num_local_master_experts,
@@ -87,17 +94,20 @@ class Manager:
             expert_fc2_numel,
             is_train,
             explicitly_destroy,
+            use_gpu_solver,
+            balance_threshold,
         )
         assert self.runtime.is_available()
 
-        # Placement on CPU
-        self.physical_to_logical_map: torch.Tensor = (
+        # Host-visible placement mirror. When use_gpu_solver=True the authoritative
+        # copy lives on GPU and this mirror is refreshed on demand.
+        self._physical_to_logical_map: torch.Tensor = (
             self.runtime.get_physical_to_logical_map_tensor()
         )
-        self.logical_to_physical_map: torch.Tensor = (
+        self._logical_to_physical_map: torch.Tensor = (
             self.runtime.get_logical_to_physical_map_tensor()
         )
-        self.logical_replica_counts: torch.Tensor = (
+        self._logical_replica_counts: torch.Tensor = (
             self.runtime.get_logical_replica_counts_tensor()
         )
         # Replica weight buffer shared by layers on GPU
@@ -113,6 +123,26 @@ class Manager:
             self.local_replica_grad_buffer = None
 
         self.check_tensors_blob_from_cpp()
+
+    def sync_placement_to_cpu(self, layer_id: Optional[int] = None):
+        if layer_id is not None:
+            assert layer_id < self.num_alloc_layers
+        self.runtime.sync_placement_to_cpu(-1 if layer_id is None else layer_id)
+
+    @property
+    def physical_to_logical_map(self) -> torch.Tensor:
+        self.sync_placement_to_cpu()
+        return self._physical_to_logical_map
+
+    @property
+    def logical_to_physical_map(self) -> torch.Tensor:
+        self.sync_placement_to_cpu()
+        return self._logical_to_physical_map
+
+    @property
+    def logical_replica_counts(self) -> torch.Tensor:
+        self.sync_placement_to_cpu()
+        return self._logical_replica_counts
 
     def destroy(self):
         assert self.explicitly_destroy
@@ -165,13 +195,25 @@ class Manager:
         check_tensors_dtype(fc1_weights, torch.bfloat16)
         check_tensors_dtype(fc2_weights, torch.bfloat16)
 
-        def _to_dataptr_tensor(tensors: List[torch.Tensor]) -> torch.Tensor:
+        def _to_dataptr_tensor(tensors: List[torch.Tensor], device) -> torch.Tensor:
             return torch.tensor(
-                [t.data_ptr() for t in tensors], dtype=torch.int64, device="cpu"
+                [t.data_ptr() for t in tensors], dtype=torch.int64, device=device
             ).contiguous()
 
-        self.local_master_fc1_weight_pool[layer_id] = _to_dataptr_tensor(fc1_weights)
-        self.local_master_fc2_weight_pool[layer_id] = _to_dataptr_tensor(fc2_weights)
+        gpu_ptr_device = torch.device("cuda", self.device)
+        self.local_master_fc1_weight_pool[layer_id] = _to_dataptr_tensor(
+            fc1_weights, device="cpu"
+        )
+        self.local_master_fc2_weight_pool[layer_id] = _to_dataptr_tensor(
+            fc2_weights, device="cpu"
+        )
+        if self.use_gpu_solver:
+            self.local_master_fc1_weight_pool_gpu[layer_id] = _to_dataptr_tensor(
+                fc1_weights, device=gpu_ptr_device
+            )
+            self.local_master_fc2_weight_pool_gpu[layer_id] = _to_dataptr_tensor(
+                fc2_weights, device=gpu_ptr_device
+            )
 
         if self.is_train:
             assert (
@@ -181,8 +223,19 @@ class Manager:
             assert len(fc2_grads) == self.num_local_master_experts
             check_tensors_dtype(fc1_grads, torch.float32)
             check_tensors_dtype(fc2_grads, torch.float32)
-            self.local_master_fc1_grad_pool[layer_id] = _to_dataptr_tensor(fc1_grads)
-            self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(fc2_grads)
+            self.local_master_fc1_grad_pool[layer_id] = _to_dataptr_tensor(
+                fc1_grads, device="cpu"
+            )
+            self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(
+                fc2_grads, device="cpu"
+            )
+            if self.use_gpu_solver:
+                self.local_master_fc1_grad_pool_gpu[layer_id] = _to_dataptr_tensor(
+                    fc1_grads, device=gpu_ptr_device
+                )
+                self.local_master_fc2_grad_pool_gpu[layer_id] = _to_dataptr_tensor(
+                    fc2_grads, device=gpu_ptr_device
+                )
 
     def grad_reduce(
         self,
@@ -204,10 +257,25 @@ class Manager:
             self.local_master_fc1_grad_pool[real_lid] is not None
             and self.local_master_fc2_grad_pool[real_lid] is not None
         )
+        if self.use_gpu_solver:
+            assert (
+                self.local_master_fc1_grad_pool_gpu[real_lid] is not None
+                and self.local_master_fc2_grad_pool_gpu[real_lid] is not None
+            )
+        fc1_grad_ptr_pool = (
+            self.local_master_fc1_grad_pool_gpu[real_lid]
+            if self.use_gpu_solver
+            else self.local_master_fc1_grad_pool[real_lid]
+        )
+        fc2_grad_ptr_pool = (
+            self.local_master_fc2_grad_pool_gpu[real_lid]
+            if self.use_gpu_solver
+            else self.local_master_fc2_grad_pool[real_lid]
+        )
         event = self.runtime.grad_reduce(
             layer_id,
-            self.local_master_fc1_grad_pool[real_lid],
-            self.local_master_fc2_grad_pool[real_lid],
+            fc1_grad_ptr_pool,
+            fc2_grad_ptr_pool,
             mode,
             getattr(previous_event, "event", None),
             async_finish,
@@ -242,11 +310,26 @@ class Manager:
             self.local_master_fc1_weight_pool[real_lid] is not None
             and self.local_master_fc2_weight_pool[real_lid] is not None
         )
+        if self.use_gpu_solver:
+            assert (
+                self.local_master_fc1_weight_pool_gpu[real_lid] is not None
+                and self.local_master_fc2_weight_pool_gpu[real_lid] is not None
+            )
+        fc1_weight_ptr_pool = (
+            self.local_master_fc1_weight_pool_gpu[real_lid]
+            if self.use_gpu_solver
+            else self.local_master_fc1_weight_pool[real_lid]
+        )
+        fc2_weight_ptr_pool = (
+            self.local_master_fc2_weight_pool_gpu[real_lid]
+            if self.use_gpu_solver
+            else self.local_master_fc2_weight_pool[real_lid]
+        )
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
             event = self.runtime.weight_sync(
                 layer_id,
-                self.local_master_fc1_weight_pool[real_lid],
-                self.local_master_fc2_weight_pool[real_lid],
+                fc1_weight_ptr_pool,
+                fc2_weight_ptr_pool,
                 getattr(previous_event, "event", None),
                 async_finish,
             )
@@ -261,7 +344,8 @@ class Manager:
         """
         Update expert placement for a single layer based on real-time load statistics.
 
-        Runs the EPLB-style placement algorithm entirely on CPU:
+        Runs the EPLB-style placement algorithm on CPU or GPU depending on
+        ``use_gpu_solver``:
           1. Masters remain fixed at their pre-assigned positions.
           2. Per NVL domain, greedily replicates the most loaded experts.
           3. Per NVL domain, packs replicas to GPU slots via LPT bin-packing,
@@ -323,7 +407,8 @@ class Manager:
             orig_log_expert_loads, balanced_phys_expert_loads = None, None
             orig_log_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
             dist.all_reduce(orig_log_expert_loads, group=self.group)
-            max_replica_cnt = self.logical_replica_counts[layer_id].cpu().max().item()
+            self.sync_placement_to_cpu(layer_id)
+            max_replica_cnt = self._logical_replica_counts[layer_id].cpu().max().item()
 
         if backend == "cuda":
             expanded_probs, expanded_routing_map = self._reroute_cuda(
@@ -444,7 +529,8 @@ class Manager:
             orig_log_expert_loads = (
                 self.runtime.get_global_logical_expert_loads_tensor().cpu().clone()
             )
-            max_replica_cnt = self.logical_replica_counts[layer_id].cpu().max().item()
+            self.sync_placement_to_cpu(layer_id)
+            max_replica_cnt = self._logical_replica_counts[layer_id].cpu().max().item()
 
         self.runtime.reroute_sparse(layer_id, topk_ids)
 
@@ -477,24 +563,24 @@ class Manager:
 
     def check_tensors_blob_from_cpp(self):
         assert (
-            self.physical_to_logical_map.device == torch.device("cpu")
-            and self.logical_to_physical_map.device == torch.device("cpu")
-            and self.logical_replica_counts.device == torch.device("cpu")
+            self._physical_to_logical_map.device == torch.device("cpu")
+            and self._logical_to_physical_map.device == torch.device("cpu")
+            and self._logical_replica_counts.device == torch.device("cpu")
         )
         assert (
-            self.physical_to_logical_map.dtype == torch.int32
-            and self.logical_to_physical_map.dtype == torch.int32
-            and self.logical_replica_counts.dtype == torch.int32
+            self._physical_to_logical_map.dtype == torch.int32
+            and self._logical_to_physical_map.dtype == torch.int32
+            and self._logical_replica_counts.dtype == torch.int32
         )
         assert (
-            self.physical_to_logical_map.shape
+            self._physical_to_logical_map.shape
             == (
                 self.num_alloc_layers,
                 self.num_global_physical_experts,
             )
-            and self.logical_to_physical_map.shape
+            and self._logical_to_physical_map.shape
             == (self.num_alloc_layers, self.num_global_logical_experts, self.num_ranks)
-            and self.logical_replica_counts.shape
+            and self._logical_replica_counts.shape
             == (
                 self.num_alloc_layers,
                 self.num_global_logical_experts,
