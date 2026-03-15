@@ -190,7 +190,8 @@ public:
                float balance_threshold = 1.0f,
                int32_t min_tokens_per_replica = 1,
                bool allow_zero_master_quota = true,
-               bool locality_aware = true) const;
+               bool locality_aware = true,
+               int solver_version = 1) const;
 
 private:
     int num_global_logical_experts_;
@@ -325,7 +326,8 @@ inline void register_apis(pybind11::module_& m) {
                 float balance_threshold,
                 int32_t min_tokens_per_replica,
                 bool allow_zero_master_quota,
-                bool locality_aware) {
+                bool locality_aware,
+                int solver_version) {
                  EP_HOST_ASSERT(expert_loads.device().is_cuda() && expert_loads.dtype() == torch::kInt32);
                  EP_HOST_ASSERT(expert_loads_per_rank.device().is_cuda() &&
                                 expert_loads_per_rank.dtype() == torch::kInt32);
@@ -353,7 +355,8 @@ inline void register_apis(pybind11::module_& m) {
                             balance_threshold,
                             min_tokens_per_replica,
                             allow_zero_master_quota,
-                            locality_aware);
+                            locality_aware,
+                            solver_version);
              },
              pybind11::arg("expert_loads"),
              pybind11::arg("expert_loads_per_rank"),
@@ -366,7 +369,8 @@ inline void register_apis(pybind11::module_& m) {
              pybind11::arg("balance_threshold") = 1.0f,
              pybind11::arg("min_tokens_per_replica") = 1,
              pybind11::arg("allow_zero_master_quota") = true,
-             pybind11::arg("locality_aware") = true);
+             pybind11::arg("locality_aware") = true,
+             pybind11::arg("solver_version") = 1);
 
     pybind11::class_<RerouteSolver>(m, "RerouteSolver")
         .def(pybind11::init<int, int, int>())

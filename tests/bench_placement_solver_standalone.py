@@ -352,6 +352,7 @@ def run_quota_benchmark(
     verbose: bool,
     locality_aware: bool = True,
     min_tokens_per_replica: int = 1,
+    solver_version: int = 1,
 ) -> Tuple[Dict[str, float], Dict[str, object]]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device is required for PlacementSolverQuota")
@@ -381,6 +382,7 @@ def run_quota_benchmark(
             min_tokens_per_replica,  # min_tokens_per_replica
             True,                    # allow_zero_master_quota
             locality_aware,
+            solver_version,
         )
 
     # Warmup
@@ -479,6 +481,7 @@ def benchmark_one_distribution(
     verbose: bool,
     quota: bool = False,
     locality_aware: bool = True,
+    quota_solver_version: int = 1,
 ) -> bool:
     num_experts = config.num_ranks * config.num_local_master
     loads = generate_loads(dist_name, num_experts, total_tokens, seed)
@@ -538,6 +541,7 @@ def benchmark_one_distribution(
                     quota_latency, quota_metrics = run_quota_benchmark(
                         config, loads, warmup_iters, bench_iters, verbose,
                         locality_aware=loc,
+                        solver_version=quota_solver_version,
                     )
                     print_quota_report(
                         quota_latency, quota_metrics, baseline,
@@ -563,6 +567,7 @@ def benchmark_workload(
     verbose: bool,
     quota: bool = False,
     locality_aware: bool = True,
+    quota_solver_version: int = 1,
 ) -> bool:
     print("\n" + "=" * 100)
     print(f"Workload: {format_config(config)}")
@@ -583,6 +588,7 @@ def benchmark_workload(
             verbose=verbose,
             quota=quota,
             locality_aware=locality_aware,
+            quota_solver_version=quota_solver_version,
         ) and ok
     return ok
 
@@ -619,6 +625,11 @@ def main() -> None:
         help="同时跑 PlacementSolverQuota benchmark（locality=on 和 off 各一轮）",
     )
     parser.add_argument(
+        "--quota-v2",
+        action="store_true",
+        help="quota solver 使用 V2 kernel（solver_version=2）",
+    )
+    parser.add_argument(
         "--locality-aware",
         action="store_true",
         default=True,
@@ -630,6 +641,8 @@ def main() -> None:
         action="store_false",
     )
     args = parser.parse_args()
+    if args.quota_v2:
+        args.quota = True
 
     try:
         workloads = parse_workloads(args)
@@ -647,6 +660,7 @@ def main() -> None:
         args.quota = False
 
     all_passed = True
+    quota_solver_version = 2 if args.quota_v2 else 1
     for config in workloads:
         all_passed = benchmark_workload(
             config=config,
@@ -660,6 +674,7 @@ def main() -> None:
             verbose=args.verbose,
             quota=args.quota,
             locality_aware=args.locality_aware,
+            quota_solver_version=quota_solver_version,
         ) and all_passed
 
     print("\n" + ("ALL CHECKS PASSED" if all_passed else "SOME CHECKS FAILED"))
