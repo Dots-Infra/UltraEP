@@ -114,7 +114,16 @@ def validate_quota_state(
             prev = curr
 
 
-def run_case(config: EPConfig, expert_loads: torch.Tensor, locality_aware: bool):
+def run_case(
+    config: EPConfig,
+    expert_loads: torch.Tensor,
+    locality_aware: bool,
+    solver_version: int = 1,
+    v1_oracle_mode: int = 0,
+    v1_oracle_eps: float = 0.01,
+    v1_oracle_batch_k: int = 4,
+    v1_kernel_stage: int = 0,
+):
     expert_loads = expert_loads.to(torch.int32)
     expert_loads_per_rank = split_loads_per_rank(expert_loads, config.num_ranks)
     solver, p2l, l2p, lcnts, quota, quota_prefix, rank_quota_prefix = (
@@ -134,6 +143,11 @@ def run_case(config: EPConfig, expert_loads: torch.Tensor, locality_aware: bool)
         1,
         True,
         locality_aware,
+        solver_version,
+        v1_oracle_mode,
+        v1_oracle_eps,
+        v1_oracle_batch_k,
+        v1_kernel_stage,
     )
     torch.cuda.synchronize()
 
@@ -206,6 +220,10 @@ def test_e2e_reroute_quota():
             1,
             True,
             locality_aware,
+            1,     # solver_version
+            0,     # v1_oracle_mode
+            0.01,  # v1_oracle_eps
+            4,     # v1_oracle_batch_k
         )
         torch.cuda.synchronize()
 
@@ -290,6 +308,40 @@ def main():
                 f"case {idx}, locality_aware={locality_aware}: PASS",
                 flush=True,
             )
+
+    # V1 oracle optimization modes sanity check (A/B correctness)
+    for mode in (1, 2):
+        run_case(
+            config,
+            cases[1],  # skewed case
+            locality_aware=True,
+            solver_version=1,
+            v1_oracle_mode=mode,
+            v1_oracle_eps=0.01,
+            v1_oracle_batch_k=4,
+        )
+        print(f"v1 oracle mode={mode} sanity: PASS", flush=True)
+
+    run_case(
+        config,
+        cases[1],  # skewed case
+        locality_aware=True,
+        solver_version=3,
+    )
+    print("v3 kernel sanity: PASS", flush=True)
+
+    for stage in (1, 2, 3):
+        run_case(
+            config,
+            cases[1],  # skewed case
+            locality_aware=True,
+            solver_version=1,
+            v1_oracle_mode=1,  # fast_t
+            v1_oracle_eps=0.01,
+            v1_oracle_batch_k=4,
+            v1_kernel_stage=stage,
+        )
+        print(f"v4 stage={stage} sanity: PASS", flush=True)
 
     # ---- Edge cases ----
 

@@ -191,7 +191,12 @@ public:
                int32_t min_tokens_per_replica = 1,
                bool allow_zero_master_quota = true,
                bool locality_aware = true,
-               int solver_version = 1) const;
+               int solver_version = 1,
+               int v1_oracle_mode = 0,
+               float v1_oracle_eps = 0.01f,
+               int v1_oracle_batch_k = 4,
+               int v1_kernel_stage = 0,
+               int32_t* v1_oracle_stats = nullptr) const;
 
 private:
     int num_global_logical_experts_;
@@ -327,7 +332,20 @@ inline void register_apis(pybind11::module_& m) {
                 int32_t min_tokens_per_replica,
                 bool allow_zero_master_quota,
                 bool locality_aware,
-                int solver_version) {
+                int solver_version,
+                int v1_oracle_mode,
+                float v1_oracle_eps,
+                int v1_oracle_batch_k,
+                int v1_kernel_stage,
+                pybind11::object v1_oracle_stats_obj) {
+                 int32_t* v1_oracle_stats = nullptr;
+                 if (!v1_oracle_stats_obj.is_none()) {
+                     torch::Tensor stats = v1_oracle_stats_obj.cast<torch::Tensor>();
+                     EP_HOST_ASSERT(stats.device().is_cuda() && stats.dtype() == torch::kInt32);
+                     EP_HOST_ASSERT(stats.is_contiguous());
+                     EP_HOST_ASSERT(stats.numel() >= 3);
+                     v1_oracle_stats = stats.data_ptr<int32_t>();
+                 }
                  EP_HOST_ASSERT(expert_loads.device().is_cuda() && expert_loads.dtype() == torch::kInt32);
                  EP_HOST_ASSERT(expert_loads_per_rank.device().is_cuda() &&
                                 expert_loads_per_rank.dtype() == torch::kInt32);
@@ -356,7 +374,12 @@ inline void register_apis(pybind11::module_& m) {
                             min_tokens_per_replica,
                             allow_zero_master_quota,
                             locality_aware,
-                            solver_version);
+                            solver_version,
+                            v1_oracle_mode,
+                            v1_oracle_eps,
+                            v1_oracle_batch_k,
+                            v1_kernel_stage,
+                            v1_oracle_stats);
              },
              pybind11::arg("expert_loads"),
              pybind11::arg("expert_loads_per_rank"),
@@ -370,7 +393,12 @@ inline void register_apis(pybind11::module_& m) {
              pybind11::arg("min_tokens_per_replica") = 1,
              pybind11::arg("allow_zero_master_quota") = true,
              pybind11::arg("locality_aware") = true,
-             pybind11::arg("solver_version") = 1);
+             pybind11::arg("solver_version") = 1,
+             pybind11::arg("v1_oracle_mode") = 0,
+             pybind11::arg("v1_oracle_eps") = 0.01f,
+             pybind11::arg("v1_oracle_batch_k") = 4,
+             pybind11::arg("v1_kernel_stage") = 0,
+             pybind11::arg("v1_oracle_stats") = pybind11::none());
 
     pybind11::class_<RerouteSolver>(m, "RerouteSolver")
         .def(pybind11::init<int, int, int>())

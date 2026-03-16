@@ -28,9 +28,17 @@ static constexpr int QUOTA_SOLVER_WARPS = QUOTA_SOLVER_THREADS / 32;
 static constexpr unsigned FULL_WARP_MASK = 0xFFFFFFFFu;
 static constexpr int QUOTA_FAST_REPLICA_LIMIT = 8;
 static constexpr float kInfLoad = 1e30f;
+static constexpr int QUOTA_ORACLE_MODE_BASELINE = 0;
+static constexpr int QUOTA_ORACLE_MODE_FAST_T = 1;
+static constexpr int QUOTA_ORACLE_MODE_FAST_T_BATCH = 2;
+static constexpr int QUOTA_ORACLE_MAX_BATCH_K = 8;
+static constexpr int QUOTA_ORACLE_FAST_MAX_RETRY = 2;
 static constexpr int QUOTA_D1_MAX_ROUNDS = 3;
 static constexpr int QUOTA_D1_IMBALANCE_NUM = 105;
 static constexpr int QUOTA_D1_IMBALANCE_DEN = 100;
+static constexpr int QUOTA_V3_D1_MAX_ROUNDS = 5;
+static constexpr int QUOTA_V3_D1_IMBALANCE_NUM = 102;
+static constexpr int QUOTA_V3_D1_IMBALANCE_DEN = 100;
 
 static_assert(QUOTA_SOLVER_THREADS % 32 == 0);
 static_assert(QUOTA_FAST_REPLICA_LIMIT <= MAX_GPUS_PER_NVL);
@@ -44,6 +52,19 @@ struct ExportPlanEntry {
     int expert_local;
     int target_rank_local;
     int quota;
+};
+
+struct V4OracleTask {
+    int source_rank_local;
+    int expert_local;
+    int expert_pos;
+    int need;
+    int available;
+    int min_tokens;
+    int target_1;
+    int quota_1;
+    int target_2;
+    int quota_2;
 };
 
 __device__ __forceinline__ bool occ_has(uint64_t low, uint64_t high, int rank_local) {
@@ -328,6 +349,133 @@ __device__ int warp_find_best_target_reg(int reg_slack_0,
     return my_best_target;
 }
 
+__device__ int warp_collect_topk_targets_reg(int reg_slack_0,
+                                             int reg_slack_1,
+                                             int reg_slots_0,
+                                             int reg_slots_1,
+                                             uint64_t occ_lo,
+                                             uint64_t occ_hi,
+                                             int need,
+                                             int available,
+                                             int min_tokens_per_replica,
+                                             int num_local_redundant,
+                                             int G,
+                                             int lane_id,
+                                             int batch_k,
+                                             int* out_targets,
+                                             int* out_quota) {
+    int cand_rank_0 = -1;
+    int cand_cap_0 = -1;
+    int cand_rank_1 = -1;
+    int cand_cap_1 = -1;
+
+    const int rank_0 = lane_id;
+    if (rank_0 < G && reg_slack_0 > 0 && reg_slots_0 < num_local_redundant && !occ_has(occ_lo, occ_hi, rank_0)) {
+        const int cap = min(min(need, reg_slack_0), available);
+        if (cap >= min_tokens_per_replica) {
+            cand_rank_0 = rank_0;
+            cand_cap_0 = cap;
+        }
+    }
+
+    const int rank_1 = lane_id + 32;
+    if (rank_1 < G && reg_slack_1 > 0 && reg_slots_1 < num_local_redundant && !occ_has(occ_lo, occ_hi, rank_1)) {
+        const int cap = min(min(need, reg_slack_1), available);
+        if (cap >= min_tokens_per_replica) {
+            cand_rank_1 = rank_1;
+            cand_cap_1 = cap;
+        }
+    }
+
+    int selected = 0;
+    int sel_rank[QUOTA_ORACLE_MAX_BATCH_K];
+    int sel_quota[QUOTA_ORACLE_MAX_BATCH_K];
+    int top_rank[QUOTA_ORACLE_MAX_BATCH_K];
+    int top_cap[QUOTA_ORACLE_MAX_BATCH_K];
+    int top_n = 0;
+    const int picks = min(batch_k, QUOTA_ORACLE_MAX_BATCH_K);
+    for (int src = 0; src < 32; ++src) {
+        const int r0 = __shfl_sync(FULL_WARP_MASK, cand_rank_0, src);
+        const int c0 = __shfl_sync(FULL_WARP_MASK, cand_cap_0, src);
+        if (lane_id == 0 && r0 >= 0 && c0 > 0 && picks > 0) {
+            int idx = top_n;
+            if (top_n < picks) {
+                top_rank[idx] = r0;
+                top_cap[idx] = c0;
+                ++top_n;
+            } else if (c0 > top_cap[picks - 1] || (c0 == top_cap[picks - 1] && r0 < top_rank[picks - 1])) {
+                idx = picks - 1;
+                top_rank[idx] = r0;
+                top_cap[idx] = c0;
+            } else {
+                idx = -1;
+            }
+            while (idx > 0 &&
+                   (top_cap[idx] > top_cap[idx - 1] ||
+                    (top_cap[idx] == top_cap[idx - 1] && top_rank[idx] < top_rank[idx - 1]))) {
+                const int tmp_rank = top_rank[idx - 1];
+                const int tmp_cap = top_cap[idx - 1];
+                top_rank[idx - 1] = top_rank[idx];
+                top_cap[idx - 1] = top_cap[idx];
+                top_rank[idx] = tmp_rank;
+                top_cap[idx] = tmp_cap;
+                --idx;
+            }
+        }
+        const int r1 = __shfl_sync(FULL_WARP_MASK, cand_rank_1, src);
+        const int c1 = __shfl_sync(FULL_WARP_MASK, cand_cap_1, src);
+        if (lane_id == 0 && r1 >= 0 && c1 > 0 && picks > 0) {
+            int idx = top_n;
+            if (top_n < picks) {
+                top_rank[idx] = r1;
+                top_cap[idx] = c1;
+                ++top_n;
+            } else if (c1 > top_cap[picks - 1] || (c1 == top_cap[picks - 1] && r1 < top_rank[picks - 1])) {
+                idx = picks - 1;
+                top_rank[idx] = r1;
+                top_cap[idx] = c1;
+            } else {
+                idx = -1;
+            }
+            while (idx > 0 &&
+                   (top_cap[idx] > top_cap[idx - 1] ||
+                    (top_cap[idx] == top_cap[idx - 1] && top_rank[idx] < top_rank[idx - 1]))) {
+                const int tmp_rank = top_rank[idx - 1];
+                const int tmp_cap = top_cap[idx - 1];
+                top_rank[idx - 1] = top_rank[idx];
+                top_cap[idx - 1] = top_cap[idx];
+                top_rank[idx] = tmp_rank;
+                top_cap[idx] = tmp_cap;
+                --idx;
+            }
+        }
+    }
+
+    if (lane_id == 0) {
+        int need_left = need;
+        int available_left = available;
+        for (int pick = 0; pick < top_n && need_left > 0 && available_left > 0; ++pick) {
+            const int q = min(min(need_left, top_cap[pick]), available_left);
+            if (q < min_tokens_per_replica) {
+                break;
+            }
+            sel_rank[selected] = top_rank[pick];
+            sel_quota[selected] = q;
+            ++selected;
+
+            need_left -= q;
+            available_left -= q;
+        }
+    }
+
+    selected = __shfl_sync(FULL_WARP_MASK, selected, 0);
+    for (int i = 0; i < selected; ++i) {
+        out_targets[i] = __shfl_sync(FULL_WARP_MASK, sel_rank[i], 0);
+        out_quota[i] = __shfl_sync(FULL_WARP_MASK, sel_quota[i], 0);
+    }
+    return selected;
+}
+
 template <bool STORE_PLAN>
 __device__ bool warp_build_export_plan(const int32_t* loads,
                                        const int* sorted_experts,
@@ -347,7 +495,9 @@ __device__ bool warp_build_export_plan(const int32_t* loads,
                                        int num_local_redundant,
                                        int min_tokens_per_replica,
                                        bool allow_zero_master_quota,
-                                       int lane_id) {
+                                       int lane_id,
+                                       bool use_dynamic_q_floor = false,
+                                       int batch_k = 1) {
     if (lane_id == 0) {
         num_exports = 0;
     }
@@ -409,75 +559,159 @@ __device__ bool warp_build_export_plan(const int32_t* loads,
                 uint64_t local_occ_hi = occ_hi[expert_local];
                 int local_export_sum = export_sum[expert_local];
                 int available = max(loads[expert_local] - keep_on_master - local_export_sum, 0);
+                const int batch_k_local = min(max(batch_k, 1), QUOTA_ORACLE_MAX_BATCH_K);
 
                 while (need > 0 && available > 0) {
-                    const int best_target = warp_find_best_target_reg(reg_slack_0,
-                                                                      reg_slack_1,
-                                                                      reg_slots_0,
-                                                                      reg_slots_1,
-                                                                      local_occ_lo,
-                                                                      local_occ_hi,
-                                                                      need,
-                                                                      available,
-                                                                      min_tokens_per_replica,
-                                                                      num_local_redundant,
-                                                                      G,
-                                                                      lane_id);
-                    if (best_target < 0) {
-                        break;
-                    }
-
-                    if constexpr (STORE_PLAN) {
-                        int can_store = 1;
-                        if (lane_id == 0 && num_exports >= MAX_REPLICAS_PER_NVL) {
-                            can_store = 0;
+                    int effective_min_tokens = min_tokens_per_replica;
+                    if (use_dynamic_q_floor) {
+                        int local_feasible = 0;
+                        const int rank0 = lane_id;
+                        if (rank0 < G && reg_slack_0 > 0 && reg_slots_0 < num_local_redundant &&
+                            !occ_has(local_occ_lo, local_occ_hi, rank0) &&
+                            min(min(need, reg_slack_0), available) > 0) {
+                            local_feasible += 1;
                         }
-                        can_store = __shfl_sync(FULL_WARP_MASK, can_store, 0);
-                        if (!can_store) {
-                            return false;
+                        const int rank1 = lane_id + 32;
+                        if (rank1 < G && reg_slack_1 > 0 && reg_slots_1 < num_local_redundant &&
+                            !occ_has(local_occ_lo, local_occ_hi, rank1) &&
+                            min(min(need, reg_slack_1), available) > 0) {
+                            local_feasible += 1;
                         }
+                        const int feasible_slots = warp_reduce_sum(local_feasible);
+                        if (feasible_slots <= 0) {
+                            break;
+                        }
+                        effective_min_tokens = max(1, (need + feasible_slots - 1) / feasible_slots);
                     }
 
-                    int my_best_slack = 0;
-                    if (my_rank_0 == best_target) {
-                        my_best_slack = reg_slack_0;
-                    }
-                    if (my_rank_1 == best_target) {
-                        my_best_slack = reg_slack_1;
-                    }
-                    const int owner_lane = best_target & 31;
-                    const int best_slack = __shfl_sync(FULL_WARP_MASK, my_best_slack, owner_lane);
-                    int q = 0;
-                    if (lane_id == 0) {
-                        q = min(min(need, best_slack), available);
-                    }
-                    q = __shfl_sync(FULL_WARP_MASK, q, 0);
-                    if (q < min_tokens_per_replica) {
-                        break;
-                    }
+                    if (batch_k_local > 1) {
+                        int selected_targets[QUOTA_ORACLE_MAX_BATCH_K];
+                        int selected_quota[QUOTA_ORACLE_MAX_BATCH_K];
+                        const int selected = warp_collect_topk_targets_reg(reg_slack_0,
+                                                                           reg_slack_1,
+                                                                           reg_slots_0,
+                                                                           reg_slots_1,
+                                                                           local_occ_lo,
+                                                                           local_occ_hi,
+                                                                           need,
+                                                                           available,
+                                                                           effective_min_tokens,
+                                                                           num_local_redundant,
+                                                                           G,
+                                                                           lane_id,
+                                                                           batch_k_local,
+                                                                           selected_targets,
+                                                                           selected_quota);
+                        if (selected <= 0) {
+                            break;
+                        }
 
-                    if constexpr (STORE_PLAN) {
+                        if constexpr (STORE_PLAN) {
+                            int can_store = 1;
+                            if (lane_id == 0 && num_exports + selected > MAX_REPLICAS_PER_NVL) {
+                                can_store = 0;
+                            }
+                            can_store = __shfl_sync(FULL_WARP_MASK, can_store, 0);
+                            if (!can_store) {
+                                return false;
+                            }
+                        }
+
+                        for (int idx = 0; idx < selected; ++idx) {
+                            const int target = selected_targets[idx];
+                            const int q = selected_quota[idx];
+
+                            if constexpr (STORE_PLAN) {
+                                if (lane_id == 0) {
+                                    export_plan[num_exports++] = {expert_local, target, q};
+                                }
+                            }
+                            if (my_rank_0 == target) {
+                                reg_slack_0 -= q;
+                                reg_slots_0 += 1;
+                            }
+                            if (my_rank_1 == target) {
+                                reg_slack_1 -= q;
+                                reg_slots_1 += 1;
+                            }
+                            occ_set(local_occ_lo, local_occ_hi, target);
+                            if (lane_id == 0) {
+                                local_export_sum += q;
+                                running_excess -= q;
+                                running_slack -= q;
+                            }
+                            need -= q;
+                            available -= q;
+                        }
+                    } else {
+                        const int best_target = warp_find_best_target_reg(reg_slack_0,
+                                                                          reg_slack_1,
+                                                                          reg_slots_0,
+                                                                          reg_slots_1,
+                                                                          local_occ_lo,
+                                                                          local_occ_hi,
+                                                                          need,
+                                                                          available,
+                                                                          effective_min_tokens,
+                                                                          num_local_redundant,
+                                                                          G,
+                                                                          lane_id);
+                        if (best_target < 0) {
+                            break;
+                        }
+
+                        if constexpr (STORE_PLAN) {
+                            int can_store = 1;
+                            if (lane_id == 0 && num_exports >= MAX_REPLICAS_PER_NVL) {
+                                can_store = 0;
+                            }
+                            can_store = __shfl_sync(FULL_WARP_MASK, can_store, 0);
+                            if (!can_store) {
+                                return false;
+                            }
+                        }
+
+                        int my_best_slack = 0;
+                        if (my_rank_0 == best_target) {
+                            my_best_slack = reg_slack_0;
+                        }
+                        if (my_rank_1 == best_target) {
+                            my_best_slack = reg_slack_1;
+                        }
+                        const int owner_lane = best_target & 31;
+                        const int best_slack = __shfl_sync(FULL_WARP_MASK, my_best_slack, owner_lane);
+                        int q = 0;
                         if (lane_id == 0) {
-                            export_plan[num_exports++] = {expert_local, best_target, q};
+                            q = min(min(need, best_slack), available);
                         }
-                    }
-                    if (my_rank_0 == best_target) {
-                        reg_slack_0 -= q;
-                        reg_slots_0 += 1;
-                    }
-                    if (my_rank_1 == best_target) {
-                        reg_slack_1 -= q;
-                        reg_slots_1 += 1;
-                    }
-                    occ_set(local_occ_lo, local_occ_hi, best_target);
-                    if (lane_id == 0) {
-                        local_export_sum += q;
-                        running_excess -= q;
-                        running_slack -= q;
-                    }
+                        q = __shfl_sync(FULL_WARP_MASK, q, 0);
+                        if (q < effective_min_tokens) {
+                            break;
+                        }
 
-                    need -= q;
-                    available -= q;
+                        if constexpr (STORE_PLAN) {
+                            if (lane_id == 0) {
+                                export_plan[num_exports++] = {expert_local, best_target, q};
+                            }
+                        }
+                        if (my_rank_0 == best_target) {
+                            reg_slack_0 -= q;
+                            reg_slots_0 += 1;
+                        }
+                        if (my_rank_1 == best_target) {
+                            reg_slack_1 -= q;
+                            reg_slots_1 += 1;
+                        }
+                        occ_set(local_occ_lo, local_occ_hi, best_target);
+                        if (lane_id == 0) {
+                            local_export_sum += q;
+                            running_excess -= q;
+                            running_slack -= q;
+                        }
+
+                        need -= q;
+                        available -= q;
+                    }
                 }
 
                 if (lane_id == 0) {
@@ -490,6 +724,24 @@ __device__ bool warp_build_export_plan(const int32_t* loads,
                 int available = max(loads[expert_local] - keep_on_master - export_sum[expert_local], 0);
 
                 while (need > 0 && available > 0) {
+                    int effective_min_tokens = min_tokens_per_replica;
+                    if (use_dynamic_q_floor) {
+                        int local_feasible = 0;
+                        for (int target_rank_local = lane_id; target_rank_local < G; target_rank_local += 32) {
+                            if (slack[target_rank_local] > 0 &&
+                                slots_used[target_rank_local] < num_local_redundant &&
+                                !occ_has(occ_lo[expert_local], occ_hi[expert_local], target_rank_local) &&
+                                min(min(need, slack[target_rank_local]), available) > 0) {
+                                local_feasible += 1;
+                            }
+                        }
+                        const int feasible_slots = warp_reduce_sum(local_feasible);
+                        if (feasible_slots <= 0) {
+                            break;
+                        }
+                        effective_min_tokens = max(1, (need + feasible_slots - 1) / feasible_slots);
+                    }
+
                     const int best_target = warp_find_best_target(slack,
                                                                   slots_used,
                                                                   occ_lo,
@@ -497,7 +749,7 @@ __device__ bool warp_build_export_plan(const int32_t* loads,
                                                                   expert_local,
                                                                   need,
                                                                   available,
-                                                                  min_tokens_per_replica,
+                                                                  effective_min_tokens,
                                                                   num_local_redundant,
                                                                   G,
                                                                   lane_id);
@@ -517,6 +769,9 @@ __device__ bool warp_build_export_plan(const int32_t* loads,
                     }
 
                     const int q = min(min(need, slack[best_target]), available);
+                    if (q < effective_min_tokens) {
+                        break;
+                    }
                     if (lane_id == 0) {
                         if constexpr (STORE_PLAN) {
                             export_plan[num_exports++] = {expert_local, best_target, q};
@@ -554,6 +809,344 @@ __device__ bool warp_build_export_plan(const int32_t* loads,
     }
 
     return true;
+}
+
+template <bool STORE_PLAN>
+__device__ bool block_build_export_plan_parallel_v4c(const int32_t* loads,
+                                                     const int* sorted_experts,
+                                                     int32_t* export_sum,
+                                                     int32_t* excess,
+                                                     int32_t* slack,
+                                                     int32_t* slots_used,
+                                                     const int* source_order,
+                                                     uint64_t* occ_lo,
+                                                     uint64_t* occ_hi,
+                                                     ExportPlanEntry* export_plan,
+                                                     int& num_exports,
+                                                     int G,
+                                                     int num_local_master,
+                                                     int num_local_redundant,
+                                                     int min_tokens_per_replica,
+                                                     bool allow_zero_master_quota,
+                                                     bool use_dynamic_q_floor,
+                                                     int* source_pos,
+                                                     V4OracleTask* tasks,
+                                                     int* num_tasks_ptr,
+                                                     int* running_excess_ptr,
+                                                     int* running_slack_ptr,
+                                                     int* fail_flag_ptr) {
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
+
+    if (tid == 0) {
+        num_exports = 0;
+        *num_tasks_ptr = 0;
+        *running_excess_ptr = 0;
+        *running_slack_ptr = 0;
+        *fail_flag_ptr = 0;
+    }
+    for (int r = tid; r < G; r += blockDim.x) {
+        source_pos[r] = 0;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int total_excess = 0;
+        int total_slack = 0;
+        for (int r = 0; r < G; ++r) {
+            total_excess += excess[r];
+            total_slack += slack[r];
+        }
+        *running_excess_ptr = total_excess;
+        *running_slack_ptr = total_slack;
+        if (total_excess > total_slack) {
+            *fail_flag_ptr = 1;
+        }
+    }
+    __syncthreads();
+
+    if (*fail_flag_ptr) {
+        return false;
+    }
+    if (*running_excess_ptr == 0) {
+        return true;
+    }
+
+    const int max_rounds = MAX_REPLICAS_PER_NVL + MAX_EXPERTS_PER_NVL;
+    for (int round = 0; round < max_rounds; ++round) {
+        if (tid == 0) {
+            *num_tasks_ptr = 0;
+            if (*running_excess_ptr <= 0) {
+                *num_tasks_ptr = -1;
+            } else if (*running_excess_ptr > *running_slack_ptr) {
+                *fail_flag_ptr = 1;
+            } else {
+                int task_count = 0;
+                for (int ord = 0; ord < G && task_count < QUOTA_SOLVER_WARPS; ++ord) {
+                    const int source_rank_local = source_order[ord];
+                    const int need = excess[source_rank_local];
+                    if (need <= 0) {
+                        continue;
+                    }
+
+                    int pos = source_pos[source_rank_local];
+                    int expert_local = -1;
+                    int available = 0;
+                    while (pos < num_local_master) {
+                        const int candidate = sorted_experts[source_rank_local * num_local_master + pos];
+                        const int keep_on_master = (!allow_zero_master_quota && loads[candidate] > 0) ? 1 : 0;
+                        const int avail = max(loads[candidate] - keep_on_master - export_sum[candidate], 0);
+                        if (avail > 0) {
+                            expert_local = candidate;
+                            available = avail;
+                            break;
+                        }
+                        ++pos;
+                    }
+                    source_pos[source_rank_local] = pos;
+                    if (expert_local < 0) {
+                        *fail_flag_ptr = 1;
+                        break;
+                    }
+
+                    V4OracleTask& task = tasks[task_count];
+                    task.source_rank_local = source_rank_local;
+                    task.expert_local = expert_local;
+                    task.expert_pos = pos;
+                    task.need = need;
+                    task.available = available;
+                    task.min_tokens = min_tokens_per_replica;
+                    task.target_1 = -1;
+                    task.quota_1 = 0;
+                    task.target_2 = -1;
+                    task.quota_2 = 0;
+                    ++task_count;
+                }
+
+                if (!*fail_flag_ptr) {
+                    *num_tasks_ptr = task_count;
+                    if (task_count == 0) {
+                        *fail_flag_ptr = 1;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        if (*fail_flag_ptr) {
+            return false;
+        }
+        if (*num_tasks_ptr == -1) {
+            return true;
+        }
+        const int num_tasks = *num_tasks_ptr;
+        if (num_tasks <= 0) {
+            return false;
+        }
+
+        if (warp_id < num_tasks) {
+            const V4OracleTask task = tasks[warp_id];
+            const int need = task.need;
+            const int available = task.available;
+            const int expert_local = task.expert_local;
+            const uint64_t local_occ_lo = occ_lo[expert_local];
+            const uint64_t local_occ_hi = occ_hi[expert_local];
+
+            int reg_slack_0 = 0;
+            int reg_slack_1 = 0;
+            int reg_slots_0 = num_local_redundant;
+            int reg_slots_1 = num_local_redundant;
+            const int rank_0 = lane_id;
+            const int rank_1 = lane_id + 32;
+            if (rank_0 < G) {
+                reg_slack_0 = slack[rank_0];
+                reg_slots_0 = slots_used[rank_0];
+            }
+            if (rank_1 < G) {
+                reg_slack_1 = slack[rank_1];
+                reg_slots_1 = slots_used[rank_1];
+            }
+
+            int effective_min_tokens = min_tokens_per_replica;
+            if (use_dynamic_q_floor) {
+                int local_feasible = 0;
+                if (rank_0 < G && reg_slack_0 > 0 && reg_slots_0 < num_local_redundant &&
+                    !occ_has(local_occ_lo, local_occ_hi, rank_0) &&
+                    min(min(need, reg_slack_0), available) > 0) {
+                    local_feasible += 1;
+                }
+                if (rank_1 < G && reg_slack_1 > 0 && reg_slots_1 < num_local_redundant &&
+                    !occ_has(local_occ_lo, local_occ_hi, rank_1) &&
+                    min(min(need, reg_slack_1), available) > 0) {
+                    local_feasible += 1;
+                }
+                const int feasible_slots = warp_reduce_sum(local_feasible);
+                if (feasible_slots <= 0) {
+                    effective_min_tokens = INT_MAX;
+                } else {
+                    effective_min_tokens = max(1, (need + feasible_slots - 1) / feasible_slots);
+                }
+            }
+
+            int selected_targets[QUOTA_ORACLE_MAX_BATCH_K];
+            int selected_quota[QUOTA_ORACLE_MAX_BATCH_K];
+            int selected = 0;
+            if (effective_min_tokens != INT_MAX) {
+                selected = warp_collect_topk_targets_reg(reg_slack_0,
+                                                         reg_slack_1,
+                                                         reg_slots_0,
+                                                         reg_slots_1,
+                                                         local_occ_lo,
+                                                         local_occ_hi,
+                                                         need,
+                                                         available,
+                                                         effective_min_tokens,
+                                                         num_local_redundant,
+                                                         G,
+                                                         lane_id,
+                                                         2,
+                                                         selected_targets,
+                                                         selected_quota);
+            }
+
+            if (lane_id == 0) {
+                tasks[warp_id].min_tokens = (effective_min_tokens == INT_MAX) ? min_tokens_per_replica
+                                                                               : effective_min_tokens;
+                tasks[warp_id].target_1 = (selected > 0) ? selected_targets[0] : -1;
+                tasks[warp_id].quota_1 = (selected > 0) ? selected_quota[0] : 0;
+                tasks[warp_id].target_2 = (selected > 1) ? selected_targets[1] : -1;
+                tasks[warp_id].quota_2 = (selected > 1) ? selected_quota[1] : 0;
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            int progress = 0;
+
+            for (int w = 0; w < num_tasks; ++w) {
+                const V4OracleTask task = tasks[w];
+                const int source_rank_local = task.source_rank_local;
+                const int expert_local = task.expert_local;
+
+                int need = excess[source_rank_local];
+                if (need <= 0) {
+                    continue;
+                }
+
+                const int keep_on_master = (!allow_zero_master_quota && loads[expert_local] > 0) ? 1 : 0;
+                const int available = max(loads[expert_local] - keep_on_master - export_sum[expert_local], 0);
+                if (available <= 0) {
+                    source_pos[source_rank_local] = max(source_pos[source_rank_local], task.expert_pos + 1);
+                    continue;
+                }
+
+                const int min_tokens = max(task.min_tokens, 1);
+                int chosen_target = -1;
+                int chosen_quota = 0;
+                for (int candidate_idx = 0; candidate_idx < 2; ++candidate_idx) {
+                    const int target = (candidate_idx == 0) ? task.target_1 : task.target_2;
+                    if (target < 0 || target >= G) {
+                        continue;
+                    }
+                    if (slack[target] <= 0 || slots_used[target] >= num_local_redundant) {
+                        continue;
+                    }
+                    if (occ_has(occ_lo[expert_local], occ_hi[expert_local], target)) {
+                        continue;
+                    }
+
+                    const int q = min(min(need, slack[target]), available);
+                    if (q < min_tokens) {
+                        continue;
+                    }
+                    chosen_target = target;
+                    chosen_quota = q;
+                    break;
+                }
+
+                if (chosen_target < 0) {
+                    int best_cap = -1;
+                    for (int target = 0; target < G; ++target) {
+                        if (slack[target] <= 0 || slots_used[target] >= num_local_redundant) {
+                            continue;
+                        }
+                        if (occ_has(occ_lo[expert_local], occ_hi[expert_local], target)) {
+                            continue;
+                        }
+                        const int q = min(min(need, slack[target]), available);
+                        if (q < min_tokens) {
+                            continue;
+                        }
+                        if (q > best_cap || (q == best_cap && (chosen_target < 0 || target < chosen_target))) {
+                            chosen_target = target;
+                            chosen_quota = q;
+                            best_cap = q;
+                        }
+                    }
+                }
+
+                if (chosen_target >= 0) {
+                    if constexpr (STORE_PLAN) {
+                        if (num_exports >= MAX_REPLICAS_PER_NVL) {
+                            *fail_flag_ptr = 1;
+                            break;
+                        }
+                        export_plan[num_exports++] = {expert_local, chosen_target, chosen_quota};
+                    }
+                    export_sum[expert_local] += chosen_quota;
+                    excess[source_rank_local] -= chosen_quota;
+                    slack[chosen_target] -= chosen_quota;
+                    slots_used[chosen_target] += 1;
+                    occ_set(occ_lo[expert_local], occ_hi[expert_local], chosen_target);
+
+                    *running_excess_ptr -= chosen_quota;
+                    *running_slack_ptr -= chosen_quota;
+                    progress = 1;
+
+                    const int remain_available =
+                        max(loads[expert_local] - keep_on_master - export_sum[expert_local], 0);
+                    if (remain_available <= 0) {
+                        source_pos[source_rank_local] = max(source_pos[source_rank_local], task.expert_pos + 1);
+                    }
+                } else {
+                    source_pos[source_rank_local] = max(source_pos[source_rank_local], task.expert_pos + 1);
+                }
+            }
+
+            if (*running_excess_ptr > *running_slack_ptr) {
+                *fail_flag_ptr = 1;
+            } else if (!progress && *running_excess_ptr > 0) {
+                bool any_candidate = false;
+                for (int ord = 0; ord < G && !any_candidate; ++ord) {
+                    const int source_rank_local = source_order[ord];
+                    if (excess[source_rank_local] <= 0) {
+                        continue;
+                    }
+                    int pos = source_pos[source_rank_local];
+                    while (pos < num_local_master) {
+                        const int candidate = sorted_experts[source_rank_local * num_local_master + pos];
+                        const int keep_on_master = (!allow_zero_master_quota && loads[candidate] > 0) ? 1 : 0;
+                        const int available = max(loads[candidate] - keep_on_master - export_sum[candidate], 0);
+                        if (available > 0) {
+                            any_candidate = true;
+                            break;
+                        }
+                        ++pos;
+                    }
+                }
+                if (!any_candidate) {
+                    *fail_flag_ptr = 1;
+                }
+            }
+        }
+        __syncthreads();
+        if (*fail_flag_ptr) {
+            return false;
+        }
+    }
+
+    return (*running_excess_ptr == 0);
 }
 
 __device__ __noinline__ void build_rank_quota_prefix_slow(int expert_local,
@@ -676,7 +1269,7 @@ __device__ __noinline__ void build_rank_quota_prefix_slow(int expert_local,
     }
 }
 
-template <int EPL, bool COMPACT_EOR>
+template <int EPL, bool COMPACT_EOR, bool PARALLEL_D1 = false>
 __global__ void quota_placement_solve_kernel_v2(const int32_t* __restrict__ expert_loads,
                                                  const int32_t* __restrict__ expert_loads_per_rank,
                                                  int32_t* __restrict__ p2l_map,
@@ -737,6 +1330,7 @@ __global__ void quota_placement_solve_kernel_v2(const int32_t* __restrict__ expe
 
     __shared__ int32_t smem_my_loads[MAX_EXPERTS_PER_NVL];
     __shared__ int32_t smem_rank_load_d1[MAX_GPUS_PER_NVL];
+    __shared__ int smem_d1_imbalance_ok;
     __shared__ ptx::arrival_phase smem_tma_phase;
 
     int reg_load[EPL];
@@ -1287,125 +1881,227 @@ __global__ void quota_placement_solve_kernel_v2(const int32_t* __restrict__ expe
     }
     __syncthreads();
 
-    // Phase D1: iterative water-filling to reduce rank imbalance if needed.
-    for (int r = tid; r < G; r += N_THREADS) {
-        smem_rank_load_d1[r] = 0;
-    }
-    __syncthreads();
-
-    for (int i = tid; i < E; i += N_THREADS) {
-        int row_offset = (domain_start_log + i) * max_replicas_dim;
-        int C = smem_c[i];
-        for (int j = 0; j < C; ++j) {
-            int phys_idx = l2p_map[row_offset + j];
-            int host_local = phys_idx / num_local_physical - domain_start_rank;
-            EP_DEVICE_ASSERT(host_local >= 0 && host_local < G);
-            atomicAdd(&smem_rank_load_d1[host_local], quota[row_offset + j]);
+    // Phase D1: iterative water-filling to reduce rank imbalance.
+    if constexpr (!PARALLEL_D1) {
+        for (int r = tid; r < G; r += N_THREADS) {
+            smem_rank_load_d1[r] = 0;
         }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    if (tid == 0) {
-        int64_t total_load = 0;
-        int max_rank_load = 0;
-        for (int r = 0; r < G; ++r) {
-            int load_r = smem_rank_load_d1[r];
-            total_load += load_r;
-            max_rank_load = max(max_rank_load, load_r);
+        for (int i = tid; i < E; i += N_THREADS) {
+            int row_offset = (domain_start_log + i) * max_replicas_dim;
+            int C = smem_c[i];
+            for (int j = 0; j < C; ++j) {
+                int phys_idx = l2p_map[row_offset + j];
+                int host_local = phys_idx / num_local_physical - domain_start_rank;
+                EP_DEVICE_ASSERT(host_local >= 0 && host_local < G);
+                atomicAdd(&smem_rank_load_d1[host_local], quota[row_offset + j]);
+            }
         }
+        __syncthreads();
 
-        bool need_d1 = (total_load > 0) &&
-                       (static_cast<int64_t>(max_rank_load) * G * QUOTA_D1_IMBALANCE_DEN >
-                        total_load * QUOTA_D1_IMBALANCE_NUM);
+        if (tid == 0) {
+            int64_t total_load = 0;
+            int max_rank_load = 0;
+            for (int r = 0; r < G; ++r) {
+                int load_r = smem_rank_load_d1[r];
+                total_load += load_r;
+                max_rank_load = max(max_rank_load, load_r);
+            }
 
-        if (need_d1) {
-            for (int round = 0; round < QUOTA_D1_MAX_ROUNDS; ++round) {
-                bool changed = false;
-                for (int expert_local = 0; expert_local < E; ++expert_local) {
-                    int C = smem_c[expert_local];
-                    if (C <= 1 || smem_loads[expert_local] <= 0) {
-                        continue;
-                    }
+            bool need_d1 = (total_load > 0) &&
+                           (static_cast<int64_t>(max_rank_load) * G * QUOTA_D1_IMBALANCE_DEN >
+                            total_load * QUOTA_D1_IMBALANCE_NUM);
 
-                    int row_offset = (domain_start_log + expert_local) * max_replicas_dim;
-                    for (int move = 0; move < C; ++move) {
-                        int best_donor = -1;
-                        int best_receiver = -1;
-                        int best_donor_rank = -1;
-                        int best_receiver_rank = -1;
-                        int best_excess = 0;
-                        int best_slack = 0;
+            if (need_d1) {
+                for (int round = 0; round < QUOTA_D1_MAX_ROUNDS; ++round) {
+                    bool changed = false;
+                    for (int expert_local = 0; expert_local < E; ++expert_local) {
+                        int C = smem_c[expert_local];
+                        if (C <= 1 || smem_loads[expert_local] <= 0) {
+                            continue;
+                        }
 
-                        for (int j = 0; j < C; ++j) {
-                            int phys_idx = l2p_map[row_offset + j];
-                            int rank_local = phys_idx / num_local_physical - domain_start_rank;
-                            EP_DEVICE_ASSERT(rank_local >= 0 && rank_local < G);
+                        int row_offset = (domain_start_log + expert_local) * max_replicas_dim;
+                        for (int move = 0; move < C; ++move) {
+                            int best_donor = -1;
+                            int best_receiver = -1;
+                            int best_donor_rank = -1;
+                            int best_receiver_rank = -1;
+                            int best_excess = 0;
+                            int best_slack = 0;
 
-                            int qj = quota[row_offset + j];
-                            int rank_load = smem_rank_load_d1[rank_local];
+                            for (int j = 0; j < C; ++j) {
+                                int phys_idx = l2p_map[row_offset + j];
+                                int rank_local = phys_idx / num_local_physical - domain_start_rank;
+                                EP_DEVICE_ASSERT(rank_local >= 0 && rank_local < G);
 
-                            int64_t over_num = static_cast<int64_t>(rank_load) * G - total_load;
-                            if (qj > 0 && over_num > 0) {
-                                int excess = static_cast<int>((over_num + G - 1) / G);
-                                if (best_donor < 0 || excess > best_excess ||
-                                    (excess == best_excess &&
-                                     (rank_local < best_donor_rank ||
-                                      (rank_local == best_donor_rank && j < best_donor)))) {
-                                    best_donor = j;
-                                    best_donor_rank = rank_local;
-                                    best_excess = excess;
+                                int qj = quota[row_offset + j];
+                                int rank_load = smem_rank_load_d1[rank_local];
+
+                                int64_t over_num = static_cast<int64_t>(rank_load) * G - total_load;
+                                if (qj > 0 && over_num > 0) {
+                                    int excess = static_cast<int>((over_num + G - 1) / G);
+                                    if (best_donor < 0 || excess > best_excess ||
+                                        (excess == best_excess &&
+                                         (rank_local < best_donor_rank ||
+                                          (rank_local == best_donor_rank && j < best_donor)))) {
+                                        best_donor = j;
+                                        best_donor_rank = rank_local;
+                                        best_excess = excess;
+                                    }
+                                }
+
+                                int64_t under_num = total_load - static_cast<int64_t>(rank_load) * G;
+                                if (under_num > 0) {
+                                    int slack = static_cast<int>((under_num + G - 1) / G);
+                                    if (best_receiver < 0 || slack > best_slack ||
+                                        (slack == best_slack &&
+                                         (rank_local < best_receiver_rank ||
+                                          (rank_local == best_receiver_rank && j < best_receiver)))) {
+                                        best_receiver = j;
+                                        best_receiver_rank = rank_local;
+                                        best_slack = slack;
+                                    }
                                 }
                             }
 
-                            int64_t under_num = total_load - static_cast<int64_t>(rank_load) * G;
-                            if (under_num > 0) {
-                                int slack = static_cast<int>((under_num + G - 1) / G);
-                                if (best_receiver < 0 || slack > best_slack ||
-                                    (slack == best_slack &&
-                                     (rank_local < best_receiver_rank ||
-                                      (rank_local == best_receiver_rank && j < best_receiver)))) {
-                                    best_receiver = j;
-                                    best_receiver_rank = rank_local;
-                                    best_slack = slack;
-                                }
+                            if (best_donor < 0 || best_receiver < 0 || best_donor == best_receiver) {
+                                break;
                             }
-                        }
 
-                        if (best_donor < 0 || best_receiver < 0 || best_donor == best_receiver) {
-                            break;
-                        }
+                            int transfer = min(min(best_excess, best_slack), quota[row_offset + best_donor]);
+                            if (transfer <= 0) {
+                                break;
+                            }
 
-                        int transfer = min(min(best_excess, best_slack), quota[row_offset + best_donor]);
-                        if (transfer <= 0) {
-                            break;
+                            quota[row_offset + best_donor] -= transfer;
+                            quota[row_offset + best_receiver] += transfer;
+                            smem_rank_load_d1[best_donor_rank] -= transfer;
+                            smem_rank_load_d1[best_receiver_rank] += transfer;
+                            changed = true;
                         }
-
-                        quota[row_offset + best_donor] -= transfer;
-                        quota[row_offset + best_receiver] += transfer;
-                        smem_rank_load_d1[best_donor_rank] -= transfer;
-                        smem_rank_load_d1[best_receiver_rank] += transfer;
-                        changed = true;
                     }
-                }
 
-                if (!changed) {
-                    break;
-                }
+                    if (!changed) {
+                        break;
+                    }
 
-                int round_max_rank_load = 0;
-                for (int r = 0; r < G; ++r) {
-                    round_max_rank_load = max(round_max_rank_load, static_cast<int>(smem_rank_load_d1[r]));
-                }
-                bool good_enough =
-                    (static_cast<int64_t>(round_max_rank_load) * G * QUOTA_D1_IMBALANCE_DEN <=
-                     total_load * QUOTA_D1_IMBALANCE_NUM);
-                if (good_enough) {
-                    break;
+                    int round_max_rank_load = 0;
+                    for (int r = 0; r < G; ++r) {
+                        round_max_rank_load = max(round_max_rank_load, static_cast<int>(smem_rank_load_d1[r]));
+                    }
+                    bool good_enough =
+                        (static_cast<int64_t>(round_max_rank_load) * G * QUOTA_D1_IMBALANCE_DEN <=
+                         total_load * QUOTA_D1_IMBALANCE_NUM);
+                    if (good_enough) {
+                        break;
+                    }
                 }
             }
         }
+        __syncthreads();
+    } else {
+        for (int round = 0; round < QUOTA_V3_D1_MAX_ROUNDS; ++round) {
+            for (int r = tid; r < G; r += N_THREADS) {
+                smem_rank_load_d1[r] = 0;
+            }
+            __syncthreads();
+
+            for (int i = tid; i < E; i += N_THREADS) {
+                int row_offset = (domain_start_log + i) * max_replicas_dim;
+                int C = smem_c[i];
+                for (int j = 0; j < C; ++j) {
+                    int phys_idx = l2p_map[row_offset + j];
+                    int host_local = phys_idx / num_local_physical - domain_start_rank;
+                    EP_DEVICE_ASSERT(host_local >= 0 && host_local < G);
+                    atomicAdd(&smem_rank_load_d1[host_local], quota[row_offset + j]);
+                }
+            }
+            __syncthreads();
+
+            if (tid == 0) {
+                int64_t total_load = 0;
+                int max_rank_load = 0;
+                for (int r = 0; r < G; ++r) {
+                    int load_r = smem_rank_load_d1[r];
+                    total_load += load_r;
+                    max_rank_load = max(max_rank_load, load_r);
+                }
+                smem_d1_imbalance_ok =
+                    (total_load <= 0) ||
+                    (static_cast<int64_t>(max_rank_load) * G * QUOTA_V3_D1_IMBALANCE_DEN <=
+                     total_load * QUOTA_V3_D1_IMBALANCE_NUM);
+            }
+            __syncthreads();
+            if (smem_d1_imbalance_ok) {
+                break;
+            }
+
+            for (int expert_local = tid; expert_local < E; expert_local += N_THREADS) {
+                int C = smem_c[expert_local];
+                if (C <= 1 || smem_loads[expert_local] <= 0) {
+                    continue;
+                }
+
+                int row_offset = (domain_start_log + expert_local) * max_replicas_dim;
+                int donor_j = -1;
+                int donor_rank = -1;
+                int receiver_j = -1;
+                int receiver_rank = -1;
+
+                for (int j = 0; j < C; ++j) {
+                    int phys_idx = l2p_map[row_offset + j];
+                    int rank_local = phys_idx / num_local_physical - domain_start_rank;
+                    EP_DEVICE_ASSERT(rank_local >= 0 && rank_local < G);
+                    int rank_load = smem_rank_load_d1[rank_local];
+                    int qj = quota[row_offset + j];
+
+                    if (qj > 0) {
+                        bool better_donor = (donor_j < 0) ||
+                                            (rank_load > smem_rank_load_d1[donor_rank]) ||
+                                            (rank_load == smem_rank_load_d1[donor_rank] &&
+                                             (rank_local < donor_rank ||
+                                              (rank_local == donor_rank && j < donor_j)));
+                        if (better_donor) {
+                            donor_j = j;
+                            donor_rank = rank_local;
+                        }
+                    }
+
+                    bool better_receiver = (receiver_j < 0) ||
+                                           (rank_load < smem_rank_load_d1[receiver_rank]) ||
+                                           (rank_load == smem_rank_load_d1[receiver_rank] &&
+                                            (rank_local < receiver_rank ||
+                                             (rank_local == receiver_rank && j < receiver_j)));
+                    if (better_receiver) {
+                        receiver_j = j;
+                        receiver_rank = rank_local;
+                    }
+                }
+
+                if (donor_j < 0 || receiver_j < 0 || donor_j == receiver_j || donor_rank == receiver_rank) {
+                    continue;
+                }
+
+                int donor_rank_load = smem_rank_load_d1[donor_rank];
+                int receiver_rank_load = smem_rank_load_d1[receiver_rank];
+                if (donor_rank_load <= receiver_rank_load) {
+                    continue;
+                }
+
+                int transfer = min((donor_rank_load - receiver_rank_load) / 2, quota[row_offset + donor_j]);
+                transfer = max(transfer, 1);
+                transfer = min(transfer, quota[row_offset + donor_j]);
+
+                if (transfer > 0) {
+                    quota[row_offset + donor_j] -= transfer;
+                    quota[row_offset + receiver_j] += transfer;
+                }
+            }
+            __syncthreads();
+        }
     }
-    __syncthreads();
 
     // Build quota_prefix from final quota after D0/D1.
     for (int i = tid; i < E; i += N_THREADS) {
@@ -1588,6 +2284,11 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
                                              int32_t min_tokens_per_replica,
                                              bool allow_zero_master_quota,
                                              bool locality_aware,
+                                             int v1_oracle_mode,
+                                             float v1_oracle_eps,
+                                             int v1_oracle_batch_k,
+                                             int v1_kernel_stage,
+                                             int32_t* __restrict__ v1_oracle_stats,
                                              int my_rank) {
     (void)num_ranks;
 
@@ -1601,6 +2302,17 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
     const int E = num_logical_per_nvl;
     const int G = num_nvl_ranks;
     const int stride_elems = ((E + 3) / 4) * 4;
+    const int kernel_stage = max(v1_kernel_stage, 0);
+    const bool enable_v4a = (kernel_stage >= 1);
+    const bool enable_v4b = (kernel_stage >= 2);
+    const bool enable_v4c = (kernel_stage >= 3);
+    const bool use_fast_t_oracle =
+        (v1_oracle_mode == QUOTA_ORACLE_MODE_FAST_T || v1_oracle_mode == QUOTA_ORACLE_MODE_FAST_T_BATCH);
+    const bool use_batch_oracle =
+        (v1_oracle_mode == QUOTA_ORACLE_MODE_FAST_T_BATCH) ||
+        (enable_v4c && v1_oracle_mode == QUOTA_ORACLE_MODE_FAST_T);
+    const bool use_dynamic_q_floor = use_fast_t_oracle;
+    const int oracle_batch_k = use_batch_oracle ? min(max(v1_oracle_batch_k, 1), QUOTA_ORACLE_MAX_BATCH_K) : 1;
 
     // Layout dynamic shared memory: domain_loads | occ_lo | occ_hi
     size_t dyn_off = 0;
@@ -1615,19 +2327,33 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
 
     __shared__ int32_t smem_loads[MAX_EXPERTS_PER_NVL];
     __shared__ int32_t smem_c[MAX_EXPERTS_PER_NVL];
+    __shared__ int8_t smem_precompute_c1[MAX_EXPERTS_PER_NVL];
+    __shared__ int32_t smem_precompute_rqp0[MAX_EXPERTS_PER_NVL];
     __shared__ int32_t smem_rank_load[MAX_GPUS_PER_NVL];
+    __shared__ int32_t smem_rank_phys_base[MAX_GPUS_PER_NVL];
     __shared__ int32_t smem_my_loads[MAX_EXPERTS_PER_NVL];
+    __shared__ int32_t smem_plan_rank_slot[MAX_REPLICAS_PER_NVL];
+    __shared__ int32_t smem_plan_expert_slot[MAX_REPLICAS_PER_NVL];
     __shared__ int smem_sorted_experts[MAX_EXPERTS_PER_NVL];
     __shared__ int smem_presorted_source[MAX_GPUS_PER_NVL];
     __shared__ ExportPlanEntry smem_export_plan[MAX_REPLICAS_PER_NVL];
     __shared__ int smem_num_exports;
+    __shared__ volatile int smem_tma_wait_done;
+    __shared__ int smem_fast_threshold_hint;
     __shared__ ptx::arrival_phase smem_tma_phase;
     __shared__ int smem_next_slot[MAX_GPUS_PER_NVL];
     __shared__ int smem_expert_slot[MAX_EXPERTS_PER_NVL];
+    __shared__ int smem_v4_source_pos[MAX_GPUS_PER_NVL];
+    __shared__ V4OracleTask smem_v4_tasks[QUOTA_SOLVER_WARPS];
+    __shared__ int smem_v4_num_tasks;
+    __shared__ int smem_v4_running_excess;
+    __shared__ int smem_v4_running_slack;
+    __shared__ int smem_v4_fail;
 
     __shared__ int smem_bs_lo;
     __shared__ int smem_bs_hi;
     __shared__ bool smem_precheck_done;
+    __shared__ int smem_fast_plan_done;
     __shared__ int smem_probes[QUOTA_SOLVER_WARPS];
     __shared__ int smem_probe_valid[QUOTA_SOLVER_WARPS];
     __shared__ int smem_probe_feasible[QUOTA_SOLVER_WARPS];
@@ -1691,6 +2417,19 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
     for (int i = tid; i < E; i += blockDim.x) {
         smem_my_loads[i] = expert_loads_per_rank[my_rank * num_global_logical_experts + domain_start_log + i];
     }
+    for (int r = tid; r < G; r += blockDim.x) {
+        smem_rank_phys_base[r] = (domain_start_rank + r) * num_local_physical + num_local_master;
+    }
+    if (enable_v4c) {
+        for (int i = tid; i < E; i += blockDim.x) {
+            smem_precompute_c1[i] = 0;
+            smem_precompute_rqp0[i] = 0;
+        }
+    }
+    if (tid == 0) {
+        smem_tma_wait_done = 0;
+        smem_fast_threshold_hint = 0;
+    }
 
     const bool can_use_tma =
         (domain_start_log % 4 == 0) && (E % 4 == 0) && (num_global_logical_experts % 4 == 0);
@@ -1719,201 +2458,218 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
                 expert_loads_per_rank[(domain_start_rank + r) * num_global_logical_experts + domain_start_log + e];
         }
     }
-    __syncthreads();
-
-    if (tid == 0) {
-        smem_num_exports = 0;
-    }
-    __syncthreads();
-
     const bool do_binary_search = (num_local_redundant > 0 && G > 1);
-    if (do_binary_search) {
+    if (enable_v4a) {
         if (tid == 0) {
-            int total_rank_load = 0;
-            int max_rank_load = 0;
-            for (int r = 0; r < G; ++r) {
-                total_rank_load += smem_rank_load[r];
-                max_rank_load = max(max_rank_load, static_cast<int>(smem_rank_load[r]));
-            }
-            const float bt = fmaxf(balance_threshold, 1.0f);
-            smem_bs_lo = static_cast<int>(ceilf((static_cast<float>(total_rank_load) / G) * bt));
-            smem_bs_hi = max(max_rank_load, smem_bs_lo);
-            smem_precheck_done = false;
-        }
-        __syncthreads();
-
-        if (warp_id == 0) {
-            int coarse_lo = smem_bs_lo;
-            int coarse_hi = smem_bs_hi;
-            while (coarse_lo < coarse_hi) {
-                const int probe = coarse_lo + ((coarse_hi - coarse_lo) >> 1);
-                const bool feasible = warp_capacity_feasible(smem_rank_load, probe, G, lane_id);
-                if (lane_id == 0) {
-                    if (feasible) {
-                        coarse_hi = probe;
-                    } else {
-                        coarse_lo = probe + 1;
-                    }
+            smem_num_exports = 0;
+            smem_fast_plan_done = 0;
+            if (do_binary_search) {
+                int total_rank_load = 0;
+                int max_rank_load = 0;
+                for (int r = 0; r < G; ++r) {
+                    total_rank_load += smem_rank_load[r];
+                    max_rank_load = max(max_rank_load, static_cast<int>(smem_rank_load[r]));
                 }
-                coarse_lo = __shfl_sync(FULL_WARP_MASK, coarse_lo, 0);
-                coarse_hi = __shfl_sync(FULL_WARP_MASK, coarse_hi, 0);
-            }
-            if (lane_id == 0) {
-                smem_bs_lo = coarse_lo;
-            }
-            __syncwarp();
-
-            warp_init_oracle_state_parallel(smem_warp_export_sum[0],
-                                            smem_warp_occ_lo_base,
-                                            smem_warp_occ_hi_base,
-                                            smem_warp_excess[0],
-                                            smem_warp_slack[0],
-                                            smem_warp_slots_used[0],
-                                            smem_rank_load,
-                                            smem_bs_lo,
-                                            E,
-                                            G,
-                                            num_local_master,
-                                            lane_id);
-            __syncwarp();
-
-            int precheck_exports = 0;
-            const bool precheck_feasible = warp_build_export_plan<true>(smem_loads,
-                                                                        smem_sorted_experts,
-                                                                        smem_warp_export_sum[0],
-                                                                        smem_warp_excess[0],
-                                                                        smem_warp_slack[0],
-                                                                        smem_warp_slots_used[0],
-                                                                        smem_rank_load,
-                                                                        smem_presorted_source,
-                                                                        smem_warp_occ_lo_base,
-                                                                        smem_warp_occ_hi_base,
-                                                                        smem_export_plan,
-                                                                        precheck_exports,
-                                                                        smem_bs_lo,
-                                                                        G,
-                                                                        num_local_master,
-                                                                        num_local_redundant,
-                                                                        min_tokens_per_replica,
-                                                                        allow_zero_master_quota,
-                                                                        lane_id);
-            if (lane_id == 0) {
-                smem_precheck_done = precheck_feasible;
-                if (precheck_feasible) {
-                    smem_num_exports = precheck_exports;
-                } else {
-                    smem_bs_lo = min(smem_bs_lo + 1, smem_bs_hi);
-                }
+                const float bt = fmaxf(balance_threshold, 1.0f);
+                smem_bs_lo = static_cast<int>(ceilf((static_cast<float>(total_rank_load) / G) * bt));
+                smem_bs_hi = max(max_rank_load, smem_bs_lo);
+                smem_precheck_done = false;
             }
         }
         __syncthreads();
+    } else {
+        __syncthreads();
+        if (tid == 0) {
+            smem_num_exports = 0;
+        }
+        __syncthreads();
+    }
 
-        while (true) {
-            if (smem_precheck_done || smem_bs_lo >= smem_bs_hi) {
-                break;
-            }
-
+    if (do_binary_search) {
+        if (!enable_v4a) {
             if (tid == 0) {
-                const int range = smem_bs_hi - smem_bs_lo;
-                smem_probe_small_range = (range <= QUOTA_SOLVER_WARPS) ? 1 : 0;
-                if (smem_probe_small_range) {
-                    for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
-                        smem_probes[w] = smem_bs_lo + w;
-                        smem_probe_valid[w] = (smem_probes[w] < smem_bs_hi) ? 1 : 0;
-                        smem_probe_feasible[w] = 0;
+                smem_fast_plan_done = 0;
+                int total_rank_load = 0;
+                int max_rank_load = 0;
+                for (int r = 0; r < G; ++r) {
+                    total_rank_load += smem_rank_load[r];
+                    max_rank_load = max(max_rank_load, static_cast<int>(smem_rank_load[r]));
+                }
+                const float bt = fmaxf(balance_threshold, 1.0f);
+                smem_bs_lo = static_cast<int>(ceilf((static_cast<float>(total_rank_load) / G) * bt));
+                smem_bs_hi = max(max_rank_load, smem_bs_lo);
+                smem_precheck_done = false;
+            }
+            __syncthreads();
+        }
+
+        if (use_fast_t_oracle) {
+            int fast_threshold = smem_bs_lo;
+            if (warp_id == 0) {
+                if (lane_id == 0) {
+                    const float eps = fmaxf(v1_oracle_eps, 0.0f);
+                    fast_threshold = static_cast<int>(ceilf(static_cast<float>(smem_bs_lo) * (1.0f + eps)));
+                    fast_threshold = max(fast_threshold, smem_bs_lo);
+                }
+                fast_threshold = __shfl_sync(FULL_WARP_MASK, fast_threshold, 0);
+
+                if (enable_v4c && lane_id == 0) {
+                    smem_fast_threshold_hint = fast_threshold;
+                }
+            }
+            if (enable_v4c) {
+                __syncthreads();
+            }
+            const bool use_v4c_parallel_oracle = enable_v4c && (G <= 64);
+            if (use_v4c_parallel_oracle) {
+                const int fast_step = max(1, (smem_bs_hi + 99) / 100);
+                for (int retry = 0; retry <= QUOTA_ORACLE_FAST_MAX_RETRY; ++retry) {
+                    const int threshold_try = smem_fast_threshold_hint;
+                    for (int l = tid; l < E; l += blockDim.x) {
+                        smem_warp_export_sum[0][l] = 0;
+                        smem_warp_occ_lo_base[l] = 0ULL;
+                        smem_warp_occ_hi_base[l] = 0ULL;
+                        occ_set(smem_warp_occ_lo_base[l], smem_warp_occ_hi_base[l], l / num_local_master);
                     }
-                } else {
-                    for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
-                        smem_probes[w] =
-                            smem_bs_lo + static_cast<int>((static_cast<int64_t>(range) * (w + 1)) /
-                                                          (QUOTA_SOLVER_WARPS + 1));
-                        smem_probe_valid[w] = 1;
-                        smem_probe_feasible[w] = 0;
+                    for (int r = tid; r < G; r += blockDim.x) {
+                        smem_warp_excess[0][r] = max(smem_rank_load[r] - threshold_try, 0);
+                        smem_warp_slack[0][r] = max(threshold_try - smem_rank_load[r], 0);
+                        smem_warp_slots_used[0][r] = 0;
+                    }
+                    __syncthreads();
+
+                    int fast_exports = 0;
+                    const bool feasible_fast =
+                        block_build_export_plan_parallel_v4c<true>(smem_loads,
+                                                                   smem_sorted_experts,
+                                                                   smem_warp_export_sum[0],
+                                                                   smem_warp_excess[0],
+                                                                   smem_warp_slack[0],
+                                                                   smem_warp_slots_used[0],
+                                                                   smem_presorted_source,
+                                                                   smem_warp_occ_lo_base,
+                                                                   smem_warp_occ_hi_base,
+                                                                   smem_export_plan,
+                                                                   fast_exports,
+                                                                   G,
+                                                                   num_local_master,
+                                                                   num_local_redundant,
+                                                                   min_tokens_per_replica,
+                                                                   allow_zero_master_quota,
+                                                                   use_dynamic_q_floor,
+                                                                   smem_v4_source_pos,
+                                                                   smem_v4_tasks,
+                                                                   &smem_v4_num_tasks,
+                                                                   &smem_v4_running_excess,
+                                                                   &smem_v4_running_slack,
+                                                                   &smem_v4_fail);
+                    if (tid == 0) {
+                        if (feasible_fast) {
+                            smem_num_exports = fast_exports;
+                            smem_fast_plan_done = 1;
+                            smem_bs_lo = threshold_try;
+                        } else if (smem_fast_plan_done == 0) {
+                            smem_fast_threshold_hint = min(smem_bs_hi, threshold_try + fast_step);
+                        }
+                    }
+                    __syncthreads();
+                    if (smem_fast_plan_done) {
+                        break;
+                    }
+                }
+            } else if (warp_id == 0) {
+                const int fast_step = max(1, (smem_bs_hi + 99) / 100);
+                bool feasible_fast = false;
+                for (int retry = 0; retry <= QUOTA_ORACLE_FAST_MAX_RETRY && !feasible_fast; ++retry) {
+                    warp_init_oracle_state_parallel(smem_warp_export_sum[0],
+                                                    smem_warp_occ_lo_base,
+                                                    smem_warp_occ_hi_base,
+                                                    smem_warp_excess[0],
+                                                    smem_warp_slack[0],
+                                                    smem_warp_slots_used[0],
+                                                    smem_rank_load,
+                                                    fast_threshold,
+                                                    E,
+                                                    G,
+                                                    num_local_master,
+                                                    lane_id);
+                    __syncwarp();
+
+                    int fast_exports = 0;
+                    feasible_fast = warp_build_export_plan<true>(smem_loads,
+                                                                 smem_sorted_experts,
+                                                                 smem_warp_export_sum[0],
+                                                                 smem_warp_excess[0],
+                                                                 smem_warp_slack[0],
+                                                                 smem_warp_slots_used[0],
+                                                                 smem_rank_load,
+                                                                 smem_presorted_source,
+                                                                 smem_warp_occ_lo_base,
+                                                                 smem_warp_occ_hi_base,
+                                                                 smem_export_plan,
+                                                                 fast_exports,
+                                                                 fast_threshold,
+                                                                 G,
+                                                                 num_local_master,
+                                                                 num_local_redundant,
+                                                                 min_tokens_per_replica,
+                                                                 allow_zero_master_quota,
+                                                                 lane_id,
+                                                                 use_dynamic_q_floor,
+                                                                 oracle_batch_k);
+                    if (lane_id == 0) {
+                        if (feasible_fast) {
+                            smem_num_exports = fast_exports;
+                            smem_fast_plan_done = 1;
+                            smem_bs_lo = fast_threshold;
+                        } else {
+                            fast_threshold = min(smem_bs_hi, fast_threshold + fast_step);
+                        }
+                    }
+                    fast_threshold = __shfl_sync(FULL_WARP_MASK, fast_threshold, 0);
+                }
+            } else if (enable_v4c) {
+                if (can_use_tma) {
+                    if (warp_id == 1 && lane_id == 0 && smem_tma_wait_done == 0) {
+                        ptx::mbarrier_wait_and_flip_phase(mbar, smem_tma_phase);
+                        ptx::mbarrier_invalidate(mbar);
+                        smem_tma_wait_done = 1;
+                    }
+                    while (smem_tma_wait_done == 0) {
+                    }
+                }
+                const int threshold_hint = smem_fast_threshold_hint;
+                for (int expert_local = (warp_id - 1) * 32 + lane_id; expert_local < E; expert_local += 96) {
+                    if (smem_loads[expert_local] <= threshold_hint) {
+                        smem_precompute_c1[expert_local] = 1;
+                        smem_precompute_rqp0[expert_local] = smem_my_loads[expert_local];
                     }
                 }
             }
             __syncthreads();
-
-            bool feasible = false;
-            if (smem_probe_valid[warp_id]) {
-                warp_init_oracle_state_parallel(smem_warp_export_sum[warp_id],
-                                                smem_warp_occ_lo_base + warp_id * E,
-                                                smem_warp_occ_hi_base + warp_id * E,
-                                                smem_warp_excess[warp_id],
-                                                smem_warp_slack[warp_id],
-                                                smem_warp_slots_used[warp_id],
-                                                smem_rank_load,
-                                                smem_probes[warp_id],
-                                                E,
-                                                G,
-                                                num_local_master,
-                                                lane_id);
+        }
+        if (!smem_fast_plan_done) {
+            if (warp_id == 0) {
+                int coarse_lo = smem_bs_lo;
+                int coarse_hi = smem_bs_hi;
+                while (coarse_lo < coarse_hi) {
+                    const int probe = coarse_lo + ((coarse_hi - coarse_lo) >> 1);
+                    const bool feasible = warp_capacity_feasible(smem_rank_load, probe, G, lane_id);
+                    if (lane_id == 0) {
+                        if (feasible) {
+                            coarse_hi = probe;
+                        } else {
+                            coarse_lo = probe + 1;
+                        }
+                    }
+                    coarse_lo = __shfl_sync(FULL_WARP_MASK, coarse_lo, 0);
+                    coarse_hi = __shfl_sync(FULL_WARP_MASK, coarse_hi, 0);
+                }
+                if (lane_id == 0) {
+                    smem_bs_lo = coarse_lo;
+                }
                 __syncwarp();
 
-                int dummy_exports = 0;
-                feasible = warp_build_export_plan<false>(smem_loads,
-                                                         smem_sorted_experts,
-                                                         smem_warp_export_sum[warp_id],
-                                                         smem_warp_excess[warp_id],
-                                                         smem_warp_slack[warp_id],
-                                                         smem_warp_slots_used[warp_id],
-                                                         smem_rank_load,
-                                                         smem_presorted_source,
-                                                         smem_warp_occ_lo_base + warp_id * E,
-                                                         smem_warp_occ_hi_base + warp_id * E,
-                                                         nullptr,
-                                                         dummy_exports,
-                                                         smem_probes[warp_id],
-                                                         G,
-                                                         num_local_master,
-                                                         num_local_redundant,
-                                                         min_tokens_per_replica,
-                                                         allow_zero_master_quota,
-                                                         lane_id);
-            }
-            if (lane_id == 0) {
-                smem_probe_feasible[warp_id] = feasible ? 1 : 0;
-            }
-            __syncthreads();
-
-            if (tid == 0) {
-                if (smem_probe_small_range) {
-                    int best_probe = -1;
-                    for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
-                        if (smem_probe_valid[w] && smem_probe_feasible[w]) {
-                            best_probe = smem_probes[w];
-                            break;
-                        }
-                    }
-                    if (best_probe >= 0) {
-                        smem_bs_lo = best_probe;
-                        smem_bs_hi = best_probe;
-                    } else {
-                        smem_bs_lo = smem_bs_hi;
-                    }
-                } else {
-                    int first_feasible = -1;
-                    for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
-                        if (smem_probe_feasible[w]) {
-                            first_feasible = w;
-                            break;
-                        }
-                    }
-                    if (first_feasible >= 0) {
-                        smem_bs_hi = smem_probes[first_feasible];
-                        if (first_feasible > 0) {
-                            smem_bs_lo = smem_probes[first_feasible - 1] + 1;
-                        }
-                    } else {
-                        smem_bs_lo = smem_probes[QUOTA_SOLVER_WARPS - 1] + 1;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-
-        if (!smem_precheck_done) {
-            if (warp_id == 0) {
                 warp_init_oracle_state_parallel(smem_warp_export_sum[0],
                                                 smem_warp_occ_lo_base,
                                                 smem_warp_occ_hi_base,
@@ -1928,33 +2684,200 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
                                                 lane_id);
                 __syncwarp();
 
-                int final_exports = 0;
-                const bool final_feasible = warp_build_export_plan<true>(smem_loads,
-                                                                         smem_sorted_experts,
-                                                                         smem_warp_export_sum[0],
-                                                                         smem_warp_excess[0],
-                                                                         smem_warp_slack[0],
-                                                                         smem_warp_slots_used[0],
-                                                                         smem_rank_load,
-                                                                         smem_presorted_source,
-                                                                         smem_warp_occ_lo_base,
-                                                                         smem_warp_occ_hi_base,
-                                                                         smem_export_plan,
-                                                                         final_exports,
-                                                                         smem_bs_lo,
-                                                                         G,
-                                                                         num_local_master,
-                                                                         num_local_redundant,
-                                                                         min_tokens_per_replica,
-                                                                         allow_zero_master_quota,
-                                                                         lane_id);
+                int precheck_exports = 0;
+                const bool precheck_feasible = warp_build_export_plan<true>(smem_loads,
+                                                                            smem_sorted_experts,
+                                                                            smem_warp_export_sum[0],
+                                                                            smem_warp_excess[0],
+                                                                            smem_warp_slack[0],
+                                                                            smem_warp_slots_used[0],
+                                                                            smem_rank_load,
+                                                                            smem_presorted_source,
+                                                                            smem_warp_occ_lo_base,
+                                                                            smem_warp_occ_hi_base,
+                                                                            smem_export_plan,
+                                                                            precheck_exports,
+                                                                            smem_bs_lo,
+                                                                            G,
+                                                                            num_local_master,
+                                                                            num_local_redundant,
+                                                                            min_tokens_per_replica,
+                                                                            allow_zero_master_quota,
+                                                                            lane_id,
+                                                                            false,
+                                                                            1);
                 if (lane_id == 0) {
-                    EP_DEVICE_ASSERT(final_feasible);
-                    smem_num_exports = final_exports;
+                    smem_precheck_done = precheck_feasible;
+                    if (precheck_feasible) {
+                        smem_num_exports = precheck_exports;
+                    } else {
+                        smem_bs_lo = min(smem_bs_lo + 1, smem_bs_hi);
+                    }
                 }
             }
             __syncthreads();
+
+            while (true) {
+                if (smem_precheck_done || smem_bs_lo >= smem_bs_hi) {
+                    break;
+                }
+
+                if (tid == 0) {
+                    const int range = smem_bs_hi - smem_bs_lo;
+                    smem_probe_small_range = (range <= QUOTA_SOLVER_WARPS) ? 1 : 0;
+                    if (smem_probe_small_range) {
+                        for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
+                            smem_probes[w] = smem_bs_lo + w;
+                            smem_probe_valid[w] = (smem_probes[w] < smem_bs_hi) ? 1 : 0;
+                            smem_probe_feasible[w] = 0;
+                        }
+                    } else {
+                        for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
+                            smem_probes[w] =
+                                smem_bs_lo + static_cast<int>((static_cast<int64_t>(range) * (w + 1)) /
+                                                              (QUOTA_SOLVER_WARPS + 1));
+                            smem_probe_valid[w] = 1;
+                            smem_probe_feasible[w] = 0;
+                        }
+                    }
+                }
+                __syncthreads();
+
+                bool feasible = false;
+                if (smem_probe_valid[warp_id]) {
+                    warp_init_oracle_state_parallel(smem_warp_export_sum[warp_id],
+                                                    smem_warp_occ_lo_base + warp_id * E,
+                                                    smem_warp_occ_hi_base + warp_id * E,
+                                                    smem_warp_excess[warp_id],
+                                                    smem_warp_slack[warp_id],
+                                                    smem_warp_slots_used[warp_id],
+                                                    smem_rank_load,
+                                                    smem_probes[warp_id],
+                                                    E,
+                                                    G,
+                                                    num_local_master,
+                                                    lane_id);
+                    __syncwarp();
+
+                    int dummy_exports = 0;
+                    feasible = warp_build_export_plan<false>(smem_loads,
+                                                             smem_sorted_experts,
+                                                             smem_warp_export_sum[warp_id],
+                                                             smem_warp_excess[warp_id],
+                                                             smem_warp_slack[warp_id],
+                                                             smem_warp_slots_used[warp_id],
+                                                             smem_rank_load,
+                                                             smem_presorted_source,
+                                                             smem_warp_occ_lo_base + warp_id * E,
+                                                             smem_warp_occ_hi_base + warp_id * E,
+                                                             nullptr,
+                                                             dummy_exports,
+                                                             smem_probes[warp_id],
+                                                             G,
+                                                             num_local_master,
+                                                             num_local_redundant,
+                                                             min_tokens_per_replica,
+                                                             allow_zero_master_quota,
+                                                             lane_id,
+                                                             false,
+                                                             1);
+                }
+                if (lane_id == 0) {
+                    smem_probe_feasible[warp_id] = feasible ? 1 : 0;
+                }
+                __syncthreads();
+
+                if (tid == 0) {
+                    if (smem_probe_small_range) {
+                        int best_probe = -1;
+                        for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
+                            if (smem_probe_valid[w] && smem_probe_feasible[w]) {
+                                best_probe = smem_probes[w];
+                                break;
+                            }
+                        }
+                        if (best_probe >= 0) {
+                            smem_bs_lo = best_probe;
+                            smem_bs_hi = best_probe;
+                        } else {
+                            smem_bs_lo = smem_bs_hi;
+                        }
+                    } else {
+                        int first_feasible = -1;
+                        for (int w = 0; w < QUOTA_SOLVER_WARPS; ++w) {
+                            if (smem_probe_feasible[w]) {
+                                first_feasible = w;
+                                break;
+                            }
+                        }
+                        if (first_feasible >= 0) {
+                            smem_bs_hi = smem_probes[first_feasible];
+                            if (first_feasible > 0) {
+                                smem_bs_lo = smem_probes[first_feasible - 1] + 1;
+                            }
+                        } else {
+                            smem_bs_lo = smem_probes[QUOTA_SOLVER_WARPS - 1] + 1;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (!smem_precheck_done) {
+                if (warp_id == 0) {
+                    warp_init_oracle_state_parallel(smem_warp_export_sum[0],
+                                                    smem_warp_occ_lo_base,
+                                                    smem_warp_occ_hi_base,
+                                                    smem_warp_excess[0],
+                                                    smem_warp_slack[0],
+                                                    smem_warp_slots_used[0],
+                                                    smem_rank_load,
+                                                    smem_bs_lo,
+                                                    E,
+                                                    G,
+                                                    num_local_master,
+                                                    lane_id);
+                    __syncwarp();
+
+                    int final_exports = 0;
+                    const bool final_feasible = warp_build_export_plan<true>(smem_loads,
+                                                                             smem_sorted_experts,
+                                                                             smem_warp_export_sum[0],
+                                                                             smem_warp_excess[0],
+                                                                             smem_warp_slack[0],
+                                                                             smem_warp_slots_used[0],
+                                                                             smem_rank_load,
+                                                                             smem_presorted_source,
+                                                                             smem_warp_occ_lo_base,
+                                                                             smem_warp_occ_hi_base,
+                                                                             smem_export_plan,
+                                                                             final_exports,
+                                                                             smem_bs_lo,
+                                                                             G,
+                                                                             num_local_master,
+                                                                             num_local_redundant,
+                                                                             min_tokens_per_replica,
+                                                                             allow_zero_master_quota,
+                                                                             lane_id,
+                                                                             false,
+                                                                             1);
+                    if (lane_id == 0) {
+                        EP_DEVICE_ASSERT(final_feasible);
+                        smem_num_exports = final_exports;
+                    }
+                }
+                __syncthreads();
+            }
         }
+        if (tid == 0 && v1_oracle_stats != nullptr && use_fast_t_oracle) {
+            atomicAdd(v1_oracle_stats + 0, 1);
+            if (smem_fast_plan_done) {
+                atomicAdd(v1_oracle_stats + 1, 1);
+            } else {
+                atomicAdd(v1_oracle_stats + 2, 1);
+            }
+        }
+        __syncthreads();
     }
 
     const int32_t* final_export_sum = smem_warp_export_sum[0];
@@ -1971,23 +2894,82 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
     }
     __syncthreads();
 
-    if (tid == 0) {
-        for (int plan_idx = 0; plan_idx < smem_num_exports; ++plan_idx) {
+    if (enable_v4b) {
+        if (tid == 0) {
+            for (int plan_idx = 0; plan_idx < smem_num_exports; ++plan_idx) {
+                const ExportPlanEntry entry = smem_export_plan[plan_idx];
+                smem_plan_rank_slot[plan_idx] = smem_next_slot[entry.target_rank_local]++;
+                smem_plan_expert_slot[plan_idx] = smem_expert_slot[entry.expert_local]++;
+            }
+        }
+        __syncthreads();
+
+        for (int plan_idx = tid; plan_idx < smem_num_exports; plan_idx += blockDim.x) {
             const ExportPlanEntry entry = smem_export_plan[plan_idx];
             const int expert_local = entry.expert_local;
             const int l_global = domain_start_log + expert_local;
             const int row_offset = l_global * max_replicas_dim;
-            const int slot = smem_expert_slot[expert_local]++;
-
-            const int target_global_rank = domain_start_rank + entry.target_rank_local;
-            const int phys_idx = target_global_rank * num_local_physical + num_local_master +
-                                 smem_next_slot[entry.target_rank_local]++;
+            const int slot = smem_plan_expert_slot[plan_idx];
+            const int rank_slot = smem_plan_rank_slot[plan_idx];
+            const int target_local = entry.target_rank_local;
+            const int phys_base = enable_v4a
+                                      ? smem_rank_phys_base[target_local]
+                                      : ((domain_start_rank + target_local) * num_local_physical + num_local_master);
+            const int phys_idx = phys_base + rank_slot;
             p2l_map[phys_idx] = l_global;
             l2p_map[row_offset + slot] = phys_idx;
             quota[row_offset + slot] = entry.quota;
         }
+        __syncthreads();
+    } else {
+        if (tid == 0) {
+            for (int plan_idx = 0; plan_idx < smem_num_exports; ++plan_idx) {
+                const ExportPlanEntry entry = smem_export_plan[plan_idx];
+                const int expert_local = entry.expert_local;
+                const int l_global = domain_start_log + expert_local;
+                const int row_offset = l_global * max_replicas_dim;
+                const int slot = smem_expert_slot[expert_local]++;
+                const int target_local = entry.target_rank_local;
+                const int phys_base = enable_v4a
+                                          ? smem_rank_phys_base[target_local]
+                                          : ((domain_start_rank + target_local) * num_local_physical + num_local_master);
+                const int phys_idx = phys_base + smem_next_slot[target_local]++;
+                p2l_map[phys_idx] = l_global;
+                l2p_map[row_offset + slot] = phys_idx;
+                quota[row_offset + slot] = entry.quota;
+            }
+        }
+        __syncthreads();
     }
-    __syncthreads();
+
+    if (enable_v4b) {
+        for (int expert_local = tid; expert_local < E; expert_local += blockDim.x) {
+            const int l_global = domain_start_log + expert_local;
+            const int row_offset = l_global * max_replicas_dim;
+            const int C = smem_expert_slot[expert_local];
+            for (int i = 1; i < C; ++i) {
+                const int key_phys = l2p_map[row_offset + i];
+                const int key_quota = quota[row_offset + i];
+                const int key_host = key_phys / num_local_physical;
+                int j = i - 1;
+                while (j >= 0) {
+                    const int cur_phys = l2p_map[row_offset + j];
+                    const int cur_host = cur_phys / num_local_physical;
+                    const bool cur_after =
+                        (cur_host > key_host) || (cur_host == key_host && cur_phys > key_phys);
+                    if (!cur_after) {
+                        break;
+                    }
+                    l2p_map[row_offset + j + 1] = cur_phys;
+                    quota[row_offset + j + 1] = quota[row_offset + j];
+                    --j;
+                }
+                l2p_map[row_offset + j + 1] = key_phys;
+                quota[row_offset + j + 1] = key_quota;
+            }
+        }
+        __syncthreads();
+    }
 
     for (int expert_local = tid; expert_local < E; expert_local += blockDim.x) {
         const int l_global = domain_start_log + expert_local;
@@ -2005,9 +2987,10 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
     __syncthreads();
 
     if (can_use_tma) {
-        if (tid == 0) {
+        if (tid == 0 && (!enable_v4c || smem_tma_wait_done == 0)) {
             ptx::mbarrier_wait_and_flip_phase(mbar, smem_tma_phase);
             ptx::mbarrier_invalidate(mbar);
+            smem_tma_wait_done = 1;
         }
         __syncthreads();
     }
@@ -2017,11 +3000,16 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
         const int C = smem_c[expert_local];
 
         if (C <= QUOTA_FAST_REPLICA_LIMIT) {
+            if (enable_v4c && smem_precompute_c1[expert_local] && C == 1) {
+                rank_quota_prefix[row_offset] = smem_precompute_rqp0[expert_local];
+                continue;
+            }
             int host_rank[QUOTA_FAST_REPLICA_LIMIT];
             int my_alloc[QUOTA_FAST_REPLICA_LIMIT];
             int64_t remainders[QUOTA_FAST_REPLICA_LIMIT];
             for (int j = 0; j < C; ++j) {
-                host_rank[j] = l2p_map[row_offset + j] / num_local_physical;
+                const int phys_idx = l2p_map[row_offset + j];
+                host_rank[j] = phys_idx / num_local_physical;
                 my_alloc[j] = 0;
                 remainders[j] = -1;
             }
@@ -2196,7 +3184,12 @@ void PlacementSolverQuota::solve(const int32_t* expert_loads_gpu,
                                  int32_t min_tokens_per_replica,
                                  bool allow_zero_master_quota,
                                  bool locality_aware,
-                                 int solver_version) const {
+                                 int solver_version,
+                                 int v1_oracle_mode,
+                                 float v1_oracle_eps,
+                                 int v1_oracle_batch_k,
+                                 int v1_kernel_stage,
+                                 int32_t* v1_oracle_stats) const {
     if (num_nvl_domains_ == 0) {
         return;
     }
@@ -2226,67 +3219,78 @@ void PlacementSolverQuota::solve(const int32_t* expert_loads_gpu,
     const int my_rank = runtime::is_runtime_initialized ? runtime::rank_idx : 0;
     dim3 grid(num_nvl_domains_);
 
-    if (solver_version == 2) {
+    if (solver_version == 2 || solver_version == 3) {
         const size_t smem_size_v2 = domain_loads_bytes;
         const int epl = (num_logical_per_nvl_ + 31) / 32;
         const bool compact = (num_nvl_ranks_ <= 64);
+        const bool use_v3 = (solver_version == 3);
 
-#define LAUNCH_QUOTA_V2(EPL_VAL, COMPACT_VAL)                                                      \
-    do {                                                                                            \
-        constexpr int NTHREADS = (COMPACT_VAL) ? 64 : 32;                                          \
-        dim3 block(NTHREADS);                                                                       \
-        CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(quota_placement_solve_kernel_v2<EPL_VAL, COMPACT_VAL>, \
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize,        \
-                                                static_cast<int>(smem_size_v2)));                   \
-        quota_placement_solve_kernel_v2<EPL_VAL, COMPACT_VAL>                                       \
-            <<<grid, block, smem_size_v2, stream>>>(                                                \
-                expert_loads_gpu,                                                                   \
-                expert_loads_per_rank_gpu,                                                          \
-                p2l_gpu,                                                                            \
-                l2p_gpu,                                                                            \
-                lcnts_gpu,                                                                          \
-                quota_gpu,                                                                          \
-                quota_prefix_gpu,                                                                   \
-                rank_quota_prefix_gpu,                                                              \
-                num_nvl_ranks_,                                                                     \
-                num_local_master_,                                                                  \
-                num_local_redundant_,                                                               \
-                num_local_physical_,                                                                \
-                max_replicas_dim_,                                                                  \
-                num_logical_per_nvl_,                                                               \
-                num_redundant_per_nvl_,                                                             \
-                num_global_logical_experts_,                                                        \
-                balance_threshold,                                                                  \
-                locality_aware,                                                                     \
-                my_rank);                                                                           \
+#define LAUNCH_QUOTA_V2_OR_V3(EPL_VAL, COMPACT_VAL, PARALLEL_D1_VAL)                                  \
+    do {                                                                                                \
+        constexpr int NTHREADS = (COMPACT_VAL) ? 64 : 32;                                              \
+        dim3 block(NTHREADS);                                                                           \
+        CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(quota_placement_solve_kernel_v2<EPL_VAL, COMPACT_VAL, PARALLEL_D1_VAL>, \
+                                                cudaFuncAttributeMaxDynamicSharedMemorySize,            \
+                                                static_cast<int>(smem_size_v2)));                       \
+        quota_placement_solve_kernel_v2<EPL_VAL, COMPACT_VAL, PARALLEL_D1_VAL>                         \
+            <<<grid, block, smem_size_v2, stream>>>(                                                    \
+                expert_loads_gpu,                                                                       \
+                expert_loads_per_rank_gpu,                                                              \
+                p2l_gpu,                                                                                \
+                l2p_gpu,                                                                                \
+                lcnts_gpu,                                                                              \
+                quota_gpu,                                                                              \
+                quota_prefix_gpu,                                                                       \
+                rank_quota_prefix_gpu,                                                                  \
+                num_nvl_ranks_,                                                                         \
+                num_local_master_,                                                                      \
+                num_local_redundant_,                                                                   \
+                num_local_physical_,                                                                    \
+                max_replicas_dim_,                                                                      \
+                num_logical_per_nvl_,                                                                   \
+                num_redundant_per_nvl_,                                                                 \
+                num_global_logical_experts_,                                                            \
+                balance_threshold,                                                                      \
+                locality_aware,                                                                         \
+                my_rank);                                                                               \
+    } while (0)
+
+#define LAUNCH_QUOTA_BY_VERSION(EPL_VAL, COMPACT_VAL)                                                   \
+    do {                                                                                                \
+        if (use_v3) {                                                                                  \
+            LAUNCH_QUOTA_V2_OR_V3(EPL_VAL, COMPACT_VAL, true);                                        \
+        } else {                                                                                       \
+            LAUNCH_QUOTA_V2_OR_V3(EPL_VAL, COMPACT_VAL, false);                                       \
+        }                                                                                              \
     } while (0)
 
         if (compact) {
             switch (epl) {
-                case 1: LAUNCH_QUOTA_V2(1, true); break;
-                case 2: LAUNCH_QUOTA_V2(2, true); break;
-                case 3: LAUNCH_QUOTA_V2(3, true); break;
-                case 4: LAUNCH_QUOTA_V2(4, true); break;
-                case 5: LAUNCH_QUOTA_V2(5, true); break;
-                case 6: LAUNCH_QUOTA_V2(6, true); break;
-                case 7: LAUNCH_QUOTA_V2(7, true); break;
-                case 8: LAUNCH_QUOTA_V2(8, true); break;
-                default: LAUNCH_QUOTA_V2(16, true); break;
+                case 1: LAUNCH_QUOTA_BY_VERSION(1, true); break;
+                case 2: LAUNCH_QUOTA_BY_VERSION(2, true); break;
+                case 3: LAUNCH_QUOTA_BY_VERSION(3, true); break;
+                case 4: LAUNCH_QUOTA_BY_VERSION(4, true); break;
+                case 5: LAUNCH_QUOTA_BY_VERSION(5, true); break;
+                case 6: LAUNCH_QUOTA_BY_VERSION(6, true); break;
+                case 7: LAUNCH_QUOTA_BY_VERSION(7, true); break;
+                case 8: LAUNCH_QUOTA_BY_VERSION(8, true); break;
+                default: LAUNCH_QUOTA_BY_VERSION(16, true); break;
             }
         } else {
             switch (epl) {
-                case 1: LAUNCH_QUOTA_V2(1, false); break;
-                case 2: LAUNCH_QUOTA_V2(2, false); break;
-                case 3: LAUNCH_QUOTA_V2(3, false); break;
-                case 4: LAUNCH_QUOTA_V2(4, false); break;
-                case 5: LAUNCH_QUOTA_V2(5, false); break;
-                case 6: LAUNCH_QUOTA_V2(6, false); break;
-                case 7: LAUNCH_QUOTA_V2(7, false); break;
-                case 8: LAUNCH_QUOTA_V2(8, false); break;
-                default: LAUNCH_QUOTA_V2(16, false); break;
+                case 1: LAUNCH_QUOTA_BY_VERSION(1, false); break;
+                case 2: LAUNCH_QUOTA_BY_VERSION(2, false); break;
+                case 3: LAUNCH_QUOTA_BY_VERSION(3, false); break;
+                case 4: LAUNCH_QUOTA_BY_VERSION(4, false); break;
+                case 5: LAUNCH_QUOTA_BY_VERSION(5, false); break;
+                case 6: LAUNCH_QUOTA_BY_VERSION(6, false); break;
+                case 7: LAUNCH_QUOTA_BY_VERSION(7, false); break;
+                case 8: LAUNCH_QUOTA_BY_VERSION(8, false); break;
+                default: LAUNCH_QUOTA_BY_VERSION(16, false); break;
             }
         }
-#undef LAUNCH_QUOTA_V2
+#undef LAUNCH_QUOTA_BY_VERSION
+#undef LAUNCH_QUOTA_V2_OR_V3
     } else {
         const size_t occ_bytes =
             2 * static_cast<size_t>(QUOTA_SOLVER_WARPS) * num_logical_per_nvl_ * sizeof(uint64_t);
@@ -2316,6 +3320,11 @@ void PlacementSolverQuota::solve(const int32_t* expert_loads_gpu,
                                                                              min_tokens_per_replica,
                                                                              allow_zero_master_quota,
                                                                              locality_aware,
+                                                                             v1_oracle_mode,
+                                                                             v1_oracle_eps,
+                                                                             v1_oracle_batch_k,
+                                                                             v1_kernel_stage,
+                                                                             v1_oracle_stats,
                                                                              my_rank);
     }
     CUDA_RUNTIME_CHECK(cudaGetLastError());
