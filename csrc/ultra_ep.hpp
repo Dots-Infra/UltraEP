@@ -256,6 +256,11 @@ class Manager {
     bool quota_locality_aware_ = true;
     int32_t quota_min_tokens_per_replica_ = 1;
     bool quota_allow_zero_master_quota_ = true;
+    int quota_solver_version_ = 1;
+    int quota_v1_oracle_mode_ = 0;
+    float quota_v1_oracle_eps_ = 0.01f;
+    int quota_v1_oracle_batch_k_ = 4;
+    int quota_v1_kernel_stage_ = 0;
     std::vector<bool> placement_cpu_dirty_;
     // Shape: [num_global_logical_experts]
     int* global_logical_expert_loads_cpu = nullptr;  // pinned memory for CPU-side placement solver
@@ -283,7 +288,12 @@ public:
             const bool& use_quota_solver = false,
             const bool& quota_locality_aware = true,
             const int32_t& quota_min_tokens_per_replica = 1,
-            const bool& quota_allow_zero_master_quota = true);
+            const bool& quota_allow_zero_master_quota = true,
+            const int& quota_solver_version = 1,
+            const int& quota_v1_oracle_mode = 0,
+            const float& quota_v1_oracle_eps = 0.01f,
+            const int& quota_v1_oracle_batch_k = 4,
+            const int& quota_v1_kernel_stage = 0);
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
@@ -367,7 +377,7 @@ public:
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<Manager>(m, "Manager")
-        .def(pybind11::init<int, int, int, int64_t, int64_t, bool, bool, bool, float, bool, bool, int32_t, bool>(),
+        .def(pybind11::init<int, int, int, int64_t, int64_t, bool, bool, bool, float, bool, bool, int32_t, bool, int, int, float, int, int>(),
              pybind11::arg("num_layers"),
              pybind11::arg("num_local_master_experts"),
              pybind11::arg("num_local_redundant_experts"),
@@ -380,7 +390,12 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("use_quota_solver") = false,
              pybind11::arg("quota_locality_aware") = true,
              pybind11::arg("quota_min_tokens_per_replica") = 1,
-             pybind11::arg("quota_allow_zero_master_quota") = true)
+             pybind11::arg("quota_allow_zero_master_quota") = true,
+             pybind11::arg("quota_solver_version") = 1,
+             pybind11::arg("quota_v1_oracle_mode") = 0,
+             pybind11::arg("quota_v1_oracle_eps") = 0.01f,
+             pybind11::arg("quota_v1_oracle_batch_k") = 4,
+             pybind11::arg("quota_v1_kernel_stage") = 0)
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("sync_placement_to_cpu", &Manager::sync_placement_to_cpu, pybind11::arg("layer_id") = -1)

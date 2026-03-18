@@ -29,6 +29,11 @@ class Manager:
         quota_locality_aware: bool = True,
         quota_min_tokens_per_replica: int = 1,
         quota_allow_zero_master_quota: bool = True,
+        quota_solver_version: int = 1,
+        quota_v1_oracle_mode: int = 0,
+        quota_v1_oracle_eps: float = 0.01,
+        quota_v1_oracle_batch_k: int = 4,
+        quota_v1_kernel_stage: int = 0,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -91,6 +96,9 @@ class Manager:
         self.explicitly_destroy = explicitly_destroy
         self.use_gpu_solver = use_gpu_solver
         self.use_quota_solver = use_quota_solver
+        # Quota solver keeps placement/reroute data on GPU, so grad/weight task build
+        # should also use the GPU path to avoid hot-path D2H placement sync.
+        self.use_gpu_task_build = self.use_gpu_solver or self.use_quota_solver
         self.runtime = _C.Manager(
             self.num_alloc_layers,
             num_local_master_experts,
@@ -105,6 +113,11 @@ class Manager:
             quota_locality_aware,
             quota_min_tokens_per_replica,
             quota_allow_zero_master_quota,
+            quota_solver_version,
+            quota_v1_oracle_mode,
+            quota_v1_oracle_eps,
+            quota_v1_oracle_batch_k,
+            quota_v1_kernel_stage,
         )
         assert self.runtime.is_available()
 
@@ -250,7 +263,7 @@ class Manager:
         self.local_master_fc2_weight_pool[layer_id] = _to_dataptr_tensor(
             fc2_weights, device="cpu"
         )
-        if self.use_gpu_solver:
+        if self.use_gpu_task_build:
             self.local_master_fc1_weight_pool_gpu[layer_id] = _to_dataptr_tensor(
                 fc1_weights, device=gpu_ptr_device
             )
@@ -272,7 +285,7 @@ class Manager:
             self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(
                 fc2_grads, device="cpu"
             )
-            if self.use_gpu_solver:
+            if self.use_gpu_task_build:
                 self.local_master_fc1_grad_pool_gpu[layer_id] = _to_dataptr_tensor(
                     fc1_grads, device=gpu_ptr_device
                 )
@@ -300,19 +313,19 @@ class Manager:
             self.local_master_fc1_grad_pool[real_lid] is not None
             and self.local_master_fc2_grad_pool[real_lid] is not None
         )
-        if self.use_gpu_solver:
+        if self.use_gpu_task_build:
             assert (
                 self.local_master_fc1_grad_pool_gpu[real_lid] is not None
                 and self.local_master_fc2_grad_pool_gpu[real_lid] is not None
             )
         fc1_grad_ptr_pool = (
             self.local_master_fc1_grad_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc1_grad_pool[real_lid]
         )
         fc2_grad_ptr_pool = (
             self.local_master_fc2_grad_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc2_grad_pool[real_lid]
         )
         event = self.runtime.grad_reduce(
@@ -353,19 +366,19 @@ class Manager:
             self.local_master_fc1_weight_pool[real_lid] is not None
             and self.local_master_fc2_weight_pool[real_lid] is not None
         )
-        if self.use_gpu_solver:
+        if self.use_gpu_task_build:
             assert (
                 self.local_master_fc1_weight_pool_gpu[real_lid] is not None
                 and self.local_master_fc2_weight_pool_gpu[real_lid] is not None
             )
         fc1_weight_ptr_pool = (
             self.local_master_fc1_weight_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc1_weight_pool[real_lid]
         )
         fc2_weight_ptr_pool = (
             self.local_master_fc2_weight_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc2_weight_pool[real_lid]
         )
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):

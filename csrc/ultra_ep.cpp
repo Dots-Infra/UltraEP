@@ -313,7 +313,12 @@ Manager::Manager(const int& num_layers,
                  const bool& use_quota_solver,
                  const bool& quota_locality_aware,
                  const int32_t& quota_min_tokens_per_replica,
-                 const bool& quota_allow_zero_master_quota)
+                 const bool& quota_allow_zero_master_quota,
+                 const int& quota_solver_version,
+                 const int& quota_v1_oracle_mode,
+                 const float& quota_v1_oracle_eps,
+                 const int& quota_v1_oracle_batch_k,
+                 const int& quota_v1_kernel_stage)
     : num_layers(num_layers),
       num_local_master_experts(num_local_master_experts),
       num_local_redundant_experts(num_local_redundant_experts),
@@ -328,6 +333,11 @@ Manager::Manager(const int& num_layers,
       quota_locality_aware_(quota_locality_aware),
       quota_min_tokens_per_replica_(quota_min_tokens_per_replica),
       quota_allow_zero_master_quota_(quota_allow_zero_master_quota),
+      quota_solver_version_(quota_solver_version),
+      quota_v1_oracle_mode_(quota_v1_oracle_mode),
+      quota_v1_oracle_eps_(quota_v1_oracle_eps),
+      quota_v1_oracle_batch_k_(quota_v1_oracle_batch_k),
+      quota_v1_kernel_stage_(quota_v1_kernel_stage),
       balance_threshold_(balance_threshold),
       placement_cpu_dirty_(num_layers, false),
       comm_stream(at::cuda::getStreamFromPool(true)),
@@ -415,8 +425,9 @@ Manager::Manager(const int& num_layers,
     // Task metadata buffer: [total_tasks, total_tiles] — shared between weight_sync and grad_reduce
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_metadata_gpu, 2 * sizeof(int)));
 
-    // GPU task build support (only when GPU solver is enabled)
-    if (use_gpu_solver_) {
+    // GPU task build support for modes that keep placement on device.
+    // Quota solver is also GPU-resident, so it should share this path.
+    if (use_gpu_solver_ || use_quota_solver_) {
         // Copy immutable config to GPU (once)
         kernels::TaskBuildConfig config_cpu;
         config_cpu.rank_idx = runtime::rank_idx;
@@ -723,7 +734,13 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
                                        balance_threshold_,
                                        quota_min_tokens_per_replica_,
                                        quota_allow_zero_master_quota_,
-                                       quota_locality_aware_);
+                                       quota_locality_aware_,
+                                       quota_solver_version_,
+                                       quota_v1_oracle_mode_,
+                                       quota_v1_oracle_eps_,
+                                       quota_v1_oracle_batch_k_,
+                                       quota_v1_kernel_stage_,
+                                       nullptr);
         placement_cpu_dirty_[layer_id] = true;
     } else if (use_gpu_solver_) {
         nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, curr_stream.stream());
@@ -808,7 +825,13 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
                                        balance_threshold_,
                                        quota_min_tokens_per_replica_,
                                        quota_allow_zero_master_quota_,
-                                       quota_locality_aware_);
+                                       quota_locality_aware_,
+                                       quota_solver_version_,
+                                       quota_v1_oracle_mode_,
+                                       quota_v1_oracle_eps_,
+                                       quota_v1_oracle_batch_k_,
+                                       quota_v1_kernel_stage_,
+                                       nullptr);
         placement_cpu_dirty_[layer_id] = true;
         record_placement_ready(layer_id, comm_stream);
     } else if (use_gpu_solver_) {
@@ -1030,7 +1053,7 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
     EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.numel() == num_local_master_experts);
     EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.numel() == num_local_master_experts);
 
-    if (use_gpu_solver_) {
+    if (use_gpu_solver_ || use_quota_solver_) {
         // GPU task build path: tasks built entirely on GPU
         int64_t* local_master_fc1_grad_ptrs_gpu = nullptr;
         int64_t* local_master_fc2_grad_ptrs_gpu = nullptr;
@@ -1190,7 +1213,7 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.numel() == num_local_master_experts);
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.numel() == num_local_master_experts);
 
-    if (use_gpu_solver_) {
+    if (use_gpu_solver_ || use_quota_solver_) {
         // GPU task build path: tasks built entirely on GPU
         int64_t* local_master_fc1_weight_ptrs_gpu = nullptr;
         int64_t* local_master_fc2_weight_ptrs_gpu = nullptr;
