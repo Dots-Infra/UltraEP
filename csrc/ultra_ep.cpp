@@ -700,10 +700,6 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
                             global_logical_expert_loads_gpu,
                             curr_stream.stream());
 
-    // Zero-out reroute buffer on the same stream as solver/reroute to avoid
-    // cross-stream event synchronization in the hot path.
-    reroute_output_buffer_->zero_out_fwd_bufs(layer_id, curr_stream);
-
     if (use_quota_solver_) {
         CUDA_RUNTIME_CHECK(cudaMemcpyAsync(local_expert_loads_gpu,
                                            global_logical_expert_loads_gpu,
@@ -920,17 +916,13 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
 
     // Lazy allocation / reallocation of output buffers
     // These buffers are async zero-out during update_placement for zero-overhead
-    auto [expand_probs_ptr, expand_rmap_ptr] =
-        reroute_output_buffer_->get_or_create_fwd_bufs(T, layer_id, probs.scalar_type());
+    auto expanded_probs_buf_ = torch::zeros({T, P}, torch::TensorOptions().dtype(probs.scalar_type()).device(device));
+    auto expanded_rmap_buf_ = torch::zeros({T, P}, torch::TensorOptions().dtype(torch::kBool).device(device));
+    void* expand_probs_ptr = expanded_probs_buf_.data_ptr();
+    bool* expand_rmap_ptr = expanded_rmap_buf_.data_ptr<bool>();
 
     // Get GPU placement pointers (H2D already done by update_placement)
     auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
-
-    if (!reroute_output_buffer_->get_fwd_valid_flag(layer_id)) {  // not zero-out
-        reroute_output_buffer_->zero_out_fwd_bufs(layer_id, stream);
-    }
-    // Reset layer valid flag
-    reroute_output_buffer_->set_fwd_valid_flag(layer_id, false);
 
     if (T > 0 && L > 0) {
         constexpr int TILE_T = REROUTE_FWD_TILE_T;
