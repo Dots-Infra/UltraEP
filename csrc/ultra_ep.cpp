@@ -914,12 +914,10 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
     auto stream = at::cuda::getCurrentCUDAStream();
     wait_for_placement_ready(layer_id, stream);
 
-    // Lazy allocation / reallocation of output buffers
-    // These buffers are async zero-out during update_placement for zero-overhead
-    auto expanded_probs_buf_ = torch::zeros({T, P}, torch::TensorOptions().dtype(probs.scalar_type()).device(device));
-    auto expanded_rmap_buf_ = torch::zeros({T, P}, torch::TensorOptions().dtype(torch::kBool).device(device));
-    void* expand_probs_ptr = expanded_probs_buf_.data_ptr();
-    bool* expand_rmap_ptr = expanded_rmap_buf_.data_ptr<bool>();
+    auto expanded_probs = torch::zeros({T, P}, torch::TensorOptions().dtype(probs.scalar_type()).device(device));
+    auto expanded_rmap = torch::zeros({T, P}, torch::TensorOptions().dtype(torch::kBool).device(device));
+    void* expand_probs_ptr = expanded_probs.data_ptr();
+    bool* expand_rmap_ptr = expanded_rmap.data_ptr<bool>();
 
     // Get GPU placement pointers (H2D already done by update_placement)
     auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
@@ -962,19 +960,20 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
         }
     }
 
-    // Return fresh from_blob views — independent version counters so autograd
-    // will not see in-place conflicts when the buffer is reused for the next layer.
-    auto result_probs =
-        torch::from_blob(expand_probs_ptr, {T, P}, torch::TensorOptions().dtype(probs.dtype()).device(device));
-    auto result_map =
-        torch::from_blob(expand_rmap_ptr, {T, P}, torch::TensorOptions().dtype(torch::kBool).device(device));
+    // // Return fresh from_blob views — independent version counters so autograd
+    // // will not see in-place conflicts when the buffer is reused for the next layer.
+    // auto result_probs =
+    //     torch::from_blob(expand_probs_ptr, {T, P}, torch::TensorOptions().dtype(probs.dtype()).device(device));
+    // auto result_map =
+    //     torch::from_blob(expand_rmap_ptr, {T, P}, torch::TensorOptions().dtype(torch::kBool).device(device));
 
-    return std::make_tuple(result_probs, result_map);
+    return std::make_tuple(expanded_probs, expanded_rmap);
 }
 
 torch::Tensor Manager::reroute_cuda_backward(const int& layer_id,
                                              torch::Tensor& grad_expanded_probs,
-                                             torch::Tensor& routing_map) {
+                                             torch::Tensor& routing_map,
+                                             torch::Tensor& expanded_routing_map) {
     EP_HOST_ASSERT(is_available());
     EP_HOST_ASSERT(grad_expanded_probs.is_cuda() && routing_map.is_cuda());
 
@@ -998,8 +997,9 @@ torch::Tensor Manager::reroute_cuda_backward(const int& layer_id,
 
     auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
 
-    // Retrieve forward's expanded_routing_map for the row-parallel backward gather.
-    const bool* fwd_expanded_rmap = reroute_output_buffer_->get_fwd_expanded_rmap_ptr(layer_id);
+    // // Retrieve forward's expanded_routing_map for the row-parallel backward gather.
+    // const bool* fwd_expanded_rmap = reroute_output_buffer_->get_fwd_expanded_rmap_ptr(layer_id);
+    const bool* fwd_expanded_rmap = expanded_routing_map.data_ptr<bool>();
 
     if (T > 0 && L > 0) {
         EP_HOST_ASSERT(grad_expanded_probs.scalar_type() == torch::kFloat32);

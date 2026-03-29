@@ -352,7 +352,8 @@ public:
 
     torch::Tensor reroute_cuda_backward(const int& layer_id,
                                         torch::Tensor& grad_expanded_probs,
-                                        torch::Tensor& routing_map);
+                                        torch::Tensor& routing_map,
+                                        torch::Tensor& expanded_routing_map);
 
     torch::Stream get_comm_stream() const { return comm_stream; }
 
