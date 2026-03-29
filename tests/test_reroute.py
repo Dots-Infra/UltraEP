@@ -80,6 +80,13 @@ def generate_routing_map(T, L, topk, device="cuda"):
     return routing_map
 
 
+def routing_map_to_topk_ids(routing_map, topk):
+    """Convert a fixed-topk routing map to contiguous [T, topk] logical expert IDs."""
+    token_and_expert = routing_map.nonzero(as_tuple=False)
+    assert token_and_expert.size(0) == routing_map.size(0) * topk
+    return token_and_expert[:, 1].reshape(routing_map.size(0), topk).to(torch.int64)
+
+
 def update_placement_with_random_loads(mgr, layer_id, T, topk):
     """Run update_placement with random routing map."""
     L = mgr.num_global_logical_experts
@@ -269,6 +276,43 @@ def test_quota_forward_counts(mgr, layer_id, T, topk):
     print_rank0("  PASS")
 
 
+def test_sparse_quota_forward_counts(mgr, layer_id, T, topk):
+    """Verify sparse quota reroute hits the same per-instance quotas."""
+    assert mgr.use_quota_eplb_solver
+
+    print_rank0(f"\n{'='*60}")
+    print_rank0(f"Test: sparse quota forward counts  (T={T}, topk={topk})")
+    print_rank0(f"{'='*60}")
+
+    L = mgr.num_global_logical_experts
+    routing_map = generate_routing_map(T, L, topk)
+    topk_ids = routing_map_to_topk_ids(routing_map, topk).contiguous()
+
+    mgr.update_placement_sparse(layer_id, topk_ids)
+    mgr.reroute_sparse(layer_id, topk_ids)
+
+    per_phys_counts = torch.bincount(
+        topk_ids.flatten(), minlength=mgr.num_global_physical_experts
+    ).to(torch.int32)
+    dist.all_reduce(per_phys_counts)
+    per_phys_counts = per_phys_counts.cpu()
+    quota = mgr.get_quota_tensor(layer_id)
+    l2p = mgr.logical_to_physical_map[layer_id]
+    lcnts = mgr.logical_replica_counts[layer_id]
+
+    for logical in range(L):
+        for replica_idx in range(int(lcnts[logical].item())):
+            phys = int(l2p[logical, replica_idx].item())
+            expected = int(quota[logical, replica_idx].item())
+            actual = int(per_phys_counts[phys].item())
+            assert actual == expected, (
+                f"logical={logical} replica={replica_idx} phys={phys}: "
+                f"expected {expected}, got {actual}"
+            )
+
+    print_rank0("  PASS")
+
+
 # ============================================================================
 # Benchmark: forward and forward+backward latency
 # ============================================================================
@@ -434,6 +478,7 @@ def main():
     try:
         if args.quota:
             test_quota_forward_counts(mgr, layer_id, args.T, args.topk)
+            test_sparse_quota_forward_counts(mgr, layer_id, args.T, args.topk)
         else:
             test_forward_correctness(
                 mgr, layer_id, args.T, args.topk, verbose=args.verbose

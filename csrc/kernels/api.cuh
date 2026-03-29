@@ -225,11 +225,15 @@ void topk_local_sum(const int64_t* topk_ids_ptr,
 
 void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads, int G, int L, cudaStream_t stream);
 
-// In-place remap topk_ids from logical to physical expert IDs using round-robin.
+// In-place remap topk_ids from logical to physical expert IDs using current
+// placement. The sparse path uses a per-expert local ordinal produced by
+// atomicAdd on `counters_gpu`, then:
+//   - non-quota mode: local_ordinal % replica_count
+//   - quota mode:     upper_bound(rank_quota_prefix, local_ordinal)
 //   topk_ids_ptr: [T, K] int64, device — modified in place
 //   l2p_map_gpu: [L, max_replicas] int32, device — logical-to-physical map
 //   lcnts_gpu: [L] int32, device — replica counts per logical expert
-//   counters_gpu: [L] int32, device scratch — round-robin counters (zeroed internally)
+//   counters_gpu: [L] int32, device scratch — zeroed internally each call
 void run_reroute_sparse(int64_t* topk_ids_ptr,
                         const int32_t* l2p_map_gpu,
                         const int32_t* lcnts_gpu,
@@ -239,5 +243,16 @@ void run_reroute_sparse(int64_t* topk_ids_ptr,
                         const int num_global_logical_experts,
                         const int max_replicas,
                         cudaStream_t stream);
+
+void run_reroute_sparse_quota(int64_t* topk_ids_ptr,
+                              const int32_t* l2p_map_gpu,
+                              const int32_t* lcnts_gpu,
+                              const int32_t* rank_quota_prefix_gpu,
+                              int* counters_gpu,
+                              const int num_tokens,
+                              const int top_k,
+                              const int num_global_logical_experts,
+                              const int max_replicas,
+                              cudaStream_t stream);
 
 }  // namespace ultra_ep::kernels

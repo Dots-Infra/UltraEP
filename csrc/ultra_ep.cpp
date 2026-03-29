@@ -835,7 +835,6 @@ void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
     EP_HOST_ASSERT(topk_ids.is_cuda() && topk_ids.dtype() == torch::kInt64);
     EP_HOST_ASSERT(topk_ids.dim() == 2);
-    EP_HOST_ASSERT(!use_quota_solver_ && "Sparse reroute is not supported in quota mode");
 
     int T = topk_ids.size(0);
     int K = topk_ids.size(1);
@@ -844,15 +843,29 @@ void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
 
     auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
 
-    kernels::run_reroute_sparse(topk_ids.data_ptr<int64_t>(),
-                                l2p_gpu,
-                                lcnts_gpu,
-                                _reroute_sparse_counters_gpu,
-                                T,
-                                K,
-                                num_global_logical_experts,
-                                runtime::num_ranks,  // max_replicas
-                                stream);
+    if (use_quota_solver_) {
+        const int32_t* rank_quota_prefix_gpu = std::get<2>(placement.get_quota_gpu_ptrs(layer_id));
+        kernels::run_reroute_sparse_quota(topk_ids.data_ptr<int64_t>(),
+                                          l2p_gpu,
+                                          lcnts_gpu,
+                                          rank_quota_prefix_gpu,
+                                          _reroute_sparse_counters_gpu,
+                                          T,
+                                          K,
+                                          num_global_logical_experts,
+                                          runtime::num_ranks,  // max_replicas
+                                          stream);
+    } else {
+        kernels::run_reroute_sparse(topk_ids.data_ptr<int64_t>(),
+                                    l2p_gpu,
+                                    lcnts_gpu,
+                                    _reroute_sparse_counters_gpu,
+                                    T,
+                                    K,
+                                    num_global_logical_experts,
+                                    runtime::num_ranks,  // max_replicas
+                                    stream);
+    }
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> Manager::reroute_cpu(const int& layer_id,

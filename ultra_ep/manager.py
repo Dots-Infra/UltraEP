@@ -578,10 +578,6 @@ class Manager:
         topk_ids: torch.Tensor,
     ):
         assert layer_id < self.num_alloc_layers
-        if self.use_quota_eplb_solver:
-            raise ValueError(
-                "Sparse reroute is not supported when use_quota_eplb_solver=True"
-            )
 
         if self.log_expert_loads:
             # Compute original logical expert loads before rerouting.

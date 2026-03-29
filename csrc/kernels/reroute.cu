@@ -333,14 +333,52 @@ void run_reroute_backward(const void* grad_expanded_probs,
 // reroute_sparse_kernel
 //
 // In-place remaps topk_ids from logical expert IDs to physical expert IDs
-// using round-robin dispatch across replicas.
+// using the current placement. The per-expert local ordinal comes from a
+// single atomicAdd counter:
+//   - non-quota mode uses round-robin across replicas
+//   - quota mode uses rank_quota_prefix to select the replica
 // Each thread handles one topk entry.  An atomicAdd on a per-expert counter
-// determines the round-robin rank; the modulo selects the physical replica.
+// determines the local ordinal with no extra preprocessing or synchronization.
 // ---------------------------------------------------------------------------
 
+template <bool QUOTA_MODE>
+__device__ __forceinline__ int sparse_replica_index(const int local_ordinal,
+                                                    const int logical_id,
+                                                    const int replica_count,
+                                                    const int max_replicas,
+                                                    const int32_t* __restrict__ rank_quota_prefix) {
+    if constexpr (!QUOTA_MODE) {
+        return local_ordinal % replica_count;
+    } else {
+        constexpr int PREFETCH_REPLICAS = 8;
+        const int row_offset = logical_id * max_replicas;
+        const int prefetch_count = min(replica_count, PREFETCH_REPLICAS);
+        int replica_idx = 0;
+        int local_prefix[PREFETCH_REPLICAS];
+
+#pragma unroll
+        for (int j = 0; j < PREFETCH_REPLICAS; ++j) {
+            local_prefix[j] = (j < prefetch_count) ? rank_quota_prefix[row_offset + j] : 0;
+        }
+
+#pragma unroll
+        for (int j = 0; j < PREFETCH_REPLICAS; ++j) {
+            if (j < prefetch_count) {
+                replica_idx += (local_ordinal >= local_prefix[j]) ? 1 : 0;
+            }
+        }
+        for (int j = PREFETCH_REPLICAS; j < replica_count; ++j) {
+            replica_idx += (local_ordinal >= rank_quota_prefix[row_offset + j]) ? 1 : 0;
+        }
+        return min(replica_idx, max(replica_count - 1, 0));
+    }
+}
+
+template <bool QUOTA_MODE>
 __global__ void reroute_sparse_kernel(int64_t* __restrict__ topk_ids,
                                       const int32_t* __restrict__ l2p_map,
                                       const int32_t* __restrict__ replica_counts,
+                                      const int32_t* __restrict__ rank_quota_prefix,
                                       int* __restrict__ counters,
                                       const int num_entries,
                                       const int max_replicas,
@@ -354,10 +392,35 @@ __global__ void reroute_sparse_kernel(int64_t* __restrict__ topk_ids,
         if (C <= 0)
             continue;
 
-        int rank = atomicAdd(&counters[logical_id], 1);
-        int replica_idx = rank % C;
+        int local_ordinal = atomicAdd(&counters[logical_id], 1);
+        int replica_idx = sparse_replica_index<QUOTA_MODE>(
+            local_ordinal, static_cast<int>(logical_id), C, max_replicas, rank_quota_prefix);
         int32_t physical_id = l2p_map[logical_id * max_replicas + replica_idx];
         topk_ids[idx] = static_cast<int64_t>(physical_id);
+    }
+}
+
+template <bool QUOTA_MODE>
+void run_reroute_sparse_impl(int64_t* topk_ids_ptr,
+                             const int32_t* l2p_map_gpu,
+                             const int32_t* lcnts_gpu,
+                             const int32_t* rank_quota_prefix_gpu,
+                             int* counters_gpu,
+                             const int num_tokens,
+                             const int top_k,
+                             const int num_global_logical_experts,
+                             const int max_replicas,
+                             cudaStream_t stream) {
+    int num_entries = num_tokens * top_k;
+    int L = num_global_logical_experts;
+
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(counters_gpu, 0, L * sizeof(int), stream));
+
+    if (num_entries > 0) {
+        constexpr int BLOCK = 256;
+        int num_blocks = min(256, (num_entries + BLOCK - 1) / BLOCK);
+        reroute_sparse_kernel<QUOTA_MODE><<<num_blocks, BLOCK, 0, stream>>>(
+            topk_ids_ptr, l2p_map_gpu, lcnts_gpu, rank_quota_prefix_gpu, counters_gpu, num_entries, max_replicas, L);
     }
 }
 
@@ -370,17 +433,38 @@ void run_reroute_sparse(int64_t* topk_ids_ptr,
                         const int num_global_logical_experts,
                         const int max_replicas,
                         cudaStream_t stream) {
-    int num_entries = num_tokens * top_k;
-    int L = num_global_logical_experts;
+    run_reroute_sparse_impl<false>(topk_ids_ptr,
+                                   l2p_map_gpu,
+                                   lcnts_gpu,
+                                   nullptr,
+                                   counters_gpu,
+                                   num_tokens,
+                                   top_k,
+                                   num_global_logical_experts,
+                                   max_replicas,
+                                   stream);
+}
 
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(counters_gpu, 0, L * sizeof(int), stream));
-
-    if (num_entries > 0) {
-        constexpr int BLOCK = 256;
-        int num_blocks = min(256, (num_entries + BLOCK - 1) / BLOCK);
-        reroute_sparse_kernel<<<num_blocks, BLOCK, 0, stream>>>(
-            topk_ids_ptr, l2p_map_gpu, lcnts_gpu, counters_gpu, num_entries, max_replicas, L);
-    }
+void run_reroute_sparse_quota(int64_t* topk_ids_ptr,
+                              const int32_t* l2p_map_gpu,
+                              const int32_t* lcnts_gpu,
+                              const int32_t* rank_quota_prefix_gpu,
+                              int* counters_gpu,
+                              const int num_tokens,
+                              const int top_k,
+                              const int num_global_logical_experts,
+                              const int max_replicas,
+                              cudaStream_t stream) {
+    run_reroute_sparse_impl<true>(topk_ids_ptr,
+                                  l2p_map_gpu,
+                                  lcnts_gpu,
+                                  rank_quota_prefix_gpu,
+                                  counters_gpu,
+                                  num_tokens,
+                                  top_k,
+                                  num_global_logical_experts,
+                                  max_replicas,
+                                  stream);
 }
 
 __global__ void reduce_per_rank_loads_kernel(const int32_t* __restrict__ loads_per_rank,
