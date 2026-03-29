@@ -119,12 +119,7 @@ if __name__ == "__main__":
             )
 
     # Device linking against NVSHMEM and multiple CUDA translation units requires RDC.
-    nvcc_flags.extend(
-        [
-            "-rdc=true",
-            "--ptxas-options=--register-usage-level=10"
-        ]
-    )
+    nvcc_flags.extend(["-rdc=true", "--ptxas-options=--register-usage-level=10"])
     # Compilation workaround for CUDA 13.x
     if torch.version.cuda and torch.version.cuda.startswith("13."):
         include_dirs.extend(["/usr/local/cuda/include/cccl/"])

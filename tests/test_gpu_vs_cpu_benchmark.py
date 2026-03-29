@@ -74,13 +74,14 @@ def create_manager(
         is_train=True,
         explicitly_destroy=True,
         use_gpu_solver=use_gpu_solver,
+        use_quota_eplb_solver=False,
     )
 
 
 def validate_topk(num_global_logical_experts: int, topk: int):
-    assert topk <= num_global_logical_experts, (
-        f"topk={topk} exceeds num_global_logical_experts={num_global_logical_experts}"
-    )
+    assert (
+        topk <= num_global_logical_experts
+    ), f"topk={topk} exceeds num_global_logical_experts={num_global_logical_experts}"
 
 
 def setup_master_ptr_pool(
@@ -423,9 +424,13 @@ def main():
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--bench-iters", type=int, default=50)
-    parser.add_argument("--grad-reduce-mode", choices=("low_sm", "high_sm"), default="low_sm")
+    parser.add_argument(
+        "--grad-reduce-mode", choices=("low_sm", "high_sm"), default="low_sm"
+    )
     parser.add_argument("--hot-expert-ratio-per-nvl-domain", type=float, default=0.03)
-    parser.add_argument("--scaling-distribution", choices=("uniform", "skewed"), default="skewed")
+    parser.add_argument(
+        "--scaling-distribution", choices=("uniform", "skewed"), default="skewed"
+    )
     parser.add_argument("--scaling-num-local-master", type=str, default="4,8,16")
     parser.add_argument("--scaling-num-local-redundant", type=str, default="2,4,8")
     parser.add_argument("--seed", type=int, default=42)

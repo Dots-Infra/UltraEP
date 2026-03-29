@@ -60,11 +60,12 @@ __global__ void reroute_forward_count_kernel(const bool* __restrict__ routing_ma
 // ============================================================================
 // Forward pass 2: prefix-sum of tile counts + scatter
 // ============================================================================
-template <typename scalar_t, int TILE_T, int WARPS_PER_BLOCK>
+template <typename scalar_t, int TILE_T, int WARPS_PER_BLOCK, bool QUOTA_MODE>
 __global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_map,
                                                const scalar_t* __restrict__ probs,
                                                const int32_t* __restrict__ l2p_map,
                                                const int32_t* __restrict__ lcnts,
+                                               const int32_t* __restrict__ rank_quota_prefix,
                                                const int32_t* __restrict__ tile_counts,
                                                bool* __restrict__ expanded_routing_map,
                                                scalar_t* __restrict__ expanded_probs,
@@ -82,6 +83,33 @@ __global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_
         return;
 
     const int C = lcnts[expert_id];
+    constexpr int PREFETCH_REPLICAS = 8;
+    int local_prefix[PREFETCH_REPLICAS];
+    int local_l2p[PREFETCH_REPLICAS];
+    const int prefetch_count = min(C, PREFETCH_REPLICAS);
+
+#pragma unroll
+    for (int j = 0; j < PREFETCH_REPLICAS; ++j) {
+        local_prefix[j] = 0;
+        local_l2p[j] = -1;
+    }
+
+    if constexpr (QUOTA_MODE) {
+#pragma unroll
+        for (int j = 0; j < PREFETCH_REPLICAS; ++j) {
+            if (j < prefetch_count) {
+                local_prefix[j] = rank_quota_prefix[expert_id * max_replicas + j];
+                local_l2p[j] = l2p_map[expert_id * max_replicas + j];
+            }
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < PREFETCH_REPLICAS; ++j) {
+            if (j < prefetch_count) {
+                local_l2p[j] = l2p_map[expert_id * max_replicas + j];
+            }
+        }
+    }
 
     // Warp-parallel prefix-sum: sum tile_counts[expert][0..tile_id-1] to get base_rank.
     // Each round loads 32 values via coalesced warp read and reduces with shuffles.
@@ -114,8 +142,29 @@ __global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_
         const int my_rank = counter + preceding;
 
         if (active) {
-            const int replica_idx = my_rank % C;
-            const int phys = l2p_map[expert_id * max_replicas + replica_idx];
+            int replica_idx = 0;
+            int phys = -1;
+            if constexpr (QUOTA_MODE) {
+                // Branchless upper_bound: count how many prefix values <= my_rank.
+                // This avoids warp divergence from a break-based scan (D5 design).
+#pragma unroll
+                for (int j = 0; j < PREFETCH_REPLICAS; ++j) {
+                    if (j < prefetch_count) {
+                        replica_idx += (my_rank >= local_prefix[j]) ? 1 : 0;
+                    }
+                }
+                for (int j = PREFETCH_REPLICAS; j < C; ++j) {
+                    replica_idx += (my_rank >= rank_quota_prefix[expert_id * max_replicas + j]) ? 1 : 0;
+                }
+                // Clamp to valid range [0, C-1]
+                replica_idx = min(replica_idx, max(C - 1, 0));
+                phys = (replica_idx < PREFETCH_REPLICAS) ? local_l2p[replica_idx]
+                                                         : l2p_map[expert_id * max_replicas + replica_idx];
+            } else {
+                replica_idx = my_rank % C;
+                phys = (replica_idx < PREFETCH_REPLICAS) ? local_l2p[replica_idx]
+                                                         : l2p_map[expert_id * max_replicas + replica_idx];
+            }
             expanded_routing_map[t * P + phys] = true;
             expanded_probs[t * P + phys] = probs[t * L + expert_id];
         }
@@ -189,18 +238,63 @@ void run_reroute_forward(const bool* routing_map,
     reroute_forward_count_kernel<TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map, tile_counts, T, L, num_tiles);
 
     // Pass 2: prefix-sum + scatter (type-dispatched)
-    reroute_forward_scatter_kernel<float, TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map,
-                                                                                   static_cast<const float*>(probs),
-                                                                                   l2p_map,
-                                                                                   lcnts,
-                                                                                   tile_counts,
-                                                                                   expanded_routing_map,
-                                                                                   static_cast<float*>(expanded_probs),
-                                                                                   T,
-                                                                                   L,
-                                                                                   P,
-                                                                                   max_replicas,
-                                                                                   num_tiles);
+    reroute_forward_scatter_kernel<float, TILE_T, WPB, false>
+        <<<grid, block, 0, stream>>>(routing_map,
+                                     static_cast<const float*>(probs),
+                                     l2p_map,
+                                     lcnts,
+                                     nullptr,
+                                     tile_counts,
+                                     expanded_routing_map,
+                                     static_cast<float*>(expanded_probs),
+                                     T,
+                                     L,
+                                     P,
+                                     max_replicas,
+                                     num_tiles);
+}
+
+void run_reroute_forward_quota(const bool* routing_map,
+                               const void* probs,
+                               const int32_t* l2p_map,
+                               const int32_t* lcnts,
+                               const int32_t* rank_quota_prefix,
+                               bool* expanded_routing_map,
+                               void* expanded_probs,
+                               int32_t* tile_counts,
+                               int T,
+                               int L,
+                               int P,
+                               int max_replicas,
+                               cudaStream_t stream) {
+    if (T == 0 || L == 0)
+        return;
+
+    constexpr int TILE_T = REROUTE_FWD_TILE_T;
+    constexpr int WPB = REROUTE_FWD_WARPS_PER_BLOCK;
+    constexpr int TPB = REROUTE_FWD_THREADS_PER_BLOCK;
+
+    const int num_tiles = (T + TILE_T - 1) / TILE_T;
+    const int num_expert_blocks = (L + WPB - 1) / WPB;
+    dim3 grid(num_expert_blocks, num_tiles);
+    dim3 block(TPB);
+
+    reroute_forward_count_kernel<TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map, tile_counts, T, L, num_tiles);
+
+    reroute_forward_scatter_kernel<float, TILE_T, WPB, true>
+        <<<grid, block, 0, stream>>>(routing_map,
+                                     static_cast<const float*>(probs),
+                                     l2p_map,
+                                     lcnts,
+                                     rank_quota_prefix,
+                                     tile_counts,
+                                     expanded_routing_map,
+                                     static_cast<float*>(expanded_probs),
+                                     T,
+                                     L,
+                                     P,
+                                     max_replicas,
+                                     num_tiles);
 }
 
 void run_reroute_backward(const void* grad_expanded_probs,
@@ -287,6 +381,27 @@ void run_reroute_sparse(int64_t* topk_ids_ptr,
         reroute_sparse_kernel<<<num_blocks, BLOCK, 0, stream>>>(
             topk_ids_ptr, l2p_map_gpu, lcnts_gpu, counters_gpu, num_entries, max_replicas, L);
     }
+}
+
+__global__ void reduce_per_rank_loads_kernel(const int32_t* __restrict__ loads_per_rank,
+                                             int32_t* __restrict__ global_loads,
+                                             int G,
+                                             int L) {
+    for (int l = blockIdx.x * blockDim.x + threadIdx.x; l < L; l += blockDim.x * gridDim.x) {
+        int32_t total = 0;
+        for (int r = 0; r < G; ++r) {
+            total += loads_per_rank[r * L + l];
+        }
+        global_loads[l] = total;
+    }
+}
+
+void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads, int G, int L, cudaStream_t stream) {
+    if (G <= 0 || L <= 0)
+        return;
+    constexpr int BLOCK = 256;
+    int grid = min(1024, (L + BLOCK - 1) / BLOCK);
+    reduce_per_rank_loads_kernel<<<grid, BLOCK, 0, stream>>>(loads_per_rank, global_loads, G, L);
 }
 
 }  // namespace ultra_ep::kernels

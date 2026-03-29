@@ -380,8 +380,7 @@ void run_grad_reduce_low_sm(const GradReduceTask* grad_reduce_tasks_cpu,
 
     // Write task metadata
     int metadata[2] = {total_tasks, 0};  // total_tiles unused by low_sm
-    CUDA_RUNTIME_CHECK(
-        cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // Copy tasks to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(grad_reduce_tasks_gpu,
@@ -419,8 +418,7 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
 
     // Write task metadata
     int metadata[2] = {total_tasks, total_tiles};
-    CUDA_RUNTIME_CHECK(
-        cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // Copy tasks and tile offsets from CPU to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(grad_reduce_tasks_gpu,
@@ -438,8 +436,8 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
     int num_ctas = min(num_device_sms * 2, total_tiles);
     num_ctas = max(num_ctas, 1);
 
-    launch_grad_reduce_high_sm(grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu,
-                               global_tile_counter_gpu, num_ctas, stream);
+    launch_grad_reduce_high_sm(
+        grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu, num_ctas, stream);
 }
 
 // ============================================================================
@@ -469,8 +467,8 @@ void run_grad_reduce_high_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
     int num_ctas = min(num_device_sms * 2, max_possible_tiles);
     num_ctas = max(num_ctas, 1);
 
-    launch_grad_reduce_high_sm(grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu,
-                               global_tile_counter_gpu, num_ctas, stream);
+    launch_grad_reduce_high_sm(
+        grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu, num_ctas, stream);
 }
 
 }  // namespace ultra_ep::kernels

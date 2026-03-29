@@ -97,4 +97,8 @@ inline void int32_allreduce(int32_t* ptr, size_t nelems, cudaStream_t stream) {
     EP_HOST_ASSERT(nvshmemx_int32_sum_reduce_on_stream(NVSHMEM_TEAM_WORLD, ptr, ptr, nelems, stream) == 0);
 }
 
+inline void int32_fcollect(int32_t* dest, const int32_t* src, size_t nelems_per_pe, cudaStream_t stream) {
+    EP_HOST_ASSERT(nvshmemx_int32_fcollect_on_stream(NVSHMEM_TEAM_WORLD, dest, src, nelems_per_pe, stream) == 0);
+}
+
 }  // namespace ultra_ep::nvshmem

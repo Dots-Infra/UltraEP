@@ -96,8 +96,7 @@ __device__ __forceinline__ float ceil_div_f(int numerator, int denominator) {
     return static_cast<float>((numerator + denominator - 1) / denominator);
 }
 
-__device__ __forceinline__ bool ratio_greater(int load_a, int denom_a, int idx_a,
-                                              int load_b, int denom_b, int idx_b) {
+__device__ __forceinline__ bool ratio_greater(int load_a, int denom_a, int idx_a, int load_b, int denom_b, int idx_b) {
     long long lhs = static_cast<long long>(load_a) * denom_b;
     long long rhs = static_cast<long long>(load_b) * denom_a;
     if (lhs != rhs) {
@@ -108,8 +107,8 @@ __device__ __forceinline__ bool ratio_greater(int load_a, int denom_a, int idx_a
 
 // Reverse-greedy fixup: remove the smallest last-replica score first.
 // On exact ties, remove the larger expert index first so lower indices keep precedence.
-__device__ __forceinline__ bool ratio_less_for_remove(int load_a, int denom_a, int idx_a,
-                                                      int load_b, int denom_b, int idx_b) {
+__device__ __forceinline__ bool ratio_less_for_remove(
+    int load_a, int denom_a, int idx_a, int load_b, int denom_b, int idx_b) {
     long long lhs = static_cast<long long>(load_a) * denom_b;
     long long rhs = static_cast<long long>(load_b) * denom_a;
     if (lhs != rhs) {
@@ -178,21 +177,19 @@ __device__ void bitonic_sort_replicas(ReplicaEntry* arr, int n_padded) {
 // ============================================================================
 
 template <int EPL, bool COMPACT_EOR>
-__global__ void placement_solve_kernel_v3(
-    const int32_t* __restrict__ expert_loads,
-    int32_t* __restrict__ p2l_map,
-    int32_t* __restrict__ l2p_map,
-    int32_t* __restrict__ lcnts,
-    int num_nvl_ranks,
-    int num_local_master,
-    int num_local_redundant,
-    int num_local_physical,
-    int max_replicas_dim,
-    int num_logical_per_nvl,
-    int num_redundant_per_nvl,
-    int num_global_physical,
-    float balance_threshold
-) {
+__global__ void placement_solve_kernel_v3(const int32_t* __restrict__ expert_loads,
+                                          int32_t* __restrict__ p2l_map,
+                                          int32_t* __restrict__ l2p_map,
+                                          int32_t* __restrict__ lcnts,
+                                          int num_nvl_ranks,
+                                          int num_local_master,
+                                          int num_local_redundant,
+                                          int num_local_physical,
+                                          int max_replicas_dim,
+                                          int num_logical_per_nvl,
+                                          int num_redundant_per_nvl,
+                                          int num_global_physical,
+                                          float balance_threshold) {
     const int domain = blockIdx.x;
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -217,8 +214,8 @@ __global__ void placement_solve_kernel_v3(
 
     // Union: compact EOR (G <= 64) and packed EOR (G > 64) are mutually exclusive
     union EorUnion {
-        uint64_t compact[MAX_EXPERTS_PER_NVL];                                    // COMPACT_EOR=true
-        uint32_t packed[((MAX_GPUS_PER_NVL * MAX_EXPERTS_PER_NVL) + 31) / 32];   // COMPACT_EOR=false
+        uint64_t compact[MAX_EXPERTS_PER_NVL];                                  // COMPACT_EOR=true
+        uint32_t packed[((MAX_GPUS_PER_NVL * MAX_EXPERTS_PER_NVL) + 31) / 32];  // COMPACT_EOR=false
     };
     __shared__ EorUnion smem_eor_union;
 
@@ -358,12 +355,13 @@ __global__ void placement_solve_kernel_v3(
     } else {
         // Early-stop: compute effective_B based on balance_threshold
         int effective_B = B;
-        if (balance_threshold > 0.0f) {
+        if (balance_threshold > 1.0f) {
             int total_load_local = 0;
 #pragma unroll
             for (int k = 0; k < EPL; ++k) {
                 int i = lane + k * 32;
-                if (i < E) total_load_local += reg_load[k];
+                if (i < E)
+                    total_load_local += reg_load[k];
             }
             int total_load = warp_reduce_sum(total_load_local);
             float avg_per_slot = __int2float_rn(total_load) / (G * num_local_master);
@@ -480,8 +478,8 @@ __global__ void placement_solve_kernel_v3(
                             continue;
                         }
                         if (best_idx < 0 ||
-                            ratio_greater(smem_loads[i], smem_c[i], i,
-                                          smem_loads[best_idx], smem_c[best_idx], best_idx)) {
+                            ratio_greater(
+                                smem_loads[i], smem_c[i], i, smem_loads[best_idx], smem_c[best_idx], best_idx)) {
                             best_idx = i;
                         }
                     }
@@ -500,8 +498,12 @@ __global__ void placement_solve_kernel_v3(
                             continue;
                         }
                         if (best_idx < 0 ||
-                            ratio_less_for_remove(smem_loads[i], smem_c[i] - 1, i,
-                                                  smem_loads[best_idx], smem_c[best_idx] - 1, best_idx)) {
+                            ratio_less_for_remove(smem_loads[i],
+                                                  smem_c[i] - 1,
+                                                  i,
+                                                  smem_loads[best_idx],
+                                                  smem_c[best_idx] - 1,
+                                                  best_idx)) {
                             best_idx = i;
                         }
                     }
@@ -561,7 +563,8 @@ __global__ void placement_solve_kernel_v3(
             int write_idx = lane_offset;
             for (int i = lane; i < E; i += 32) {
                 int num_extra = smem_c[i] - 1;
-                if (num_extra <= 0) continue;
+                if (num_extra <= 0)
+                    continue;
                 float lpr = ceil_div_f(smem_loads[i], smem_c[i]);
                 for (int j = 0; j < num_extra; ++j) {
                     smem_replicas[write_idx++] = {i, lpr};
@@ -574,7 +577,8 @@ __global__ void placement_solve_kernel_v3(
         int write_idx = lane_offset;
         for (int i = lane; i < E; i += 32) {
             int num_extra = smem_c[i] - 1;
-            if (num_extra <= 0) continue;
+            if (num_extra <= 0)
+                continue;
             float lpr = ceil_div_f(smem_loads[i], smem_c[i]);
             for (int j = 0; j < num_extra; ++j) {
                 smem_replicas[write_idx++] = {i, lpr};
@@ -646,9 +650,8 @@ __global__ void placement_solve_kernel_v3(
 
             // Each warp independently does argmin over its 32 GPUs
             int my_gpu_idx = warp_id * 32 + lane;
-            bool valid = (my_gpu_idx < G) &&
-                         (my_gpu_slots < num_local_redundant) &&
-                         ((expert_mask & (1ULL << my_gpu_idx)) == 0);
+            bool valid =
+                (my_gpu_idx < G) && (my_gpu_slots < num_local_redundant) && ((expert_mask & (1ULL << my_gpu_idx)) == 0);
 
             int winner = -1;
             float min_val = warp_reduce_argmin(my_gpu_load, valid, winner);
@@ -672,9 +675,7 @@ __global__ void placement_solve_kernel_v3(
             int hi_slot = smem_warp_result[1].winner_slot;
 
             int best_gpu, best_slot;
-            bool use_lo = (lo_gpu >= 0) &&
-                          (hi_gpu < 0 || lo_val < hi_val ||
-                           (lo_val == hi_val && lo_gpu < hi_gpu));
+            bool use_lo = (lo_gpu >= 0) && (hi_gpu < 0 || lo_val < hi_val || (lo_val == hi_val && lo_gpu < hi_gpu));
             if (use_lo) {
                 best_gpu = lo_gpu;
                 best_slot = lo_slot;
@@ -751,17 +752,15 @@ __global__ void placement_solve_kernel_v3(
 
             for (int base = 0; base < G; base += 32) {
                 int g = base + lane;
-                bool valid = (g < G) &&
-                             (smem_gpu_slots_nc[g] < num_local_redundant) &&
-                             !eor_is_set(smem_eor_union.packed, E, g, l_local);
+                bool valid = (g < G) && (smem_gpu_slots_nc[g] < num_local_redundant) &&
+                    !eor_is_set(smem_eor_union.packed, E, g, l_local);
                 float load_val = (g < G) ? smem_gpu_load_nc[g] : kInfLoad;
 
                 int argmin_lane = -1;
                 float min_load = warp_reduce_argmin(load_val, valid, argmin_lane);
                 int candidate_gpu = (min_load < kInfLoad * 0.5f) ? (base + argmin_lane) : -1;
                 if (candidate_gpu >= 0 &&
-                    (min_load < best_load ||
-                     (min_load == best_load && (best_gpu < 0 || candidate_gpu < best_gpu)))) {
+                    (min_load < best_load || (min_load == best_load && (best_gpu < 0 || candidate_gpu < best_gpu)))) {
                     best_load = min_load;
                     best_gpu = candidate_gpu;
                 }
@@ -843,15 +842,12 @@ void PlacementSolverGPU::solve(const int32_t* expert_loads_gpu,
     }
 
     // External memset: initialize output arrays before kernel launch
+    CUDA_RUNTIME_CHECK(
+        cudaMemsetAsync(p2l_gpu, 0xFF, static_cast<size_t>(num_global_physical_) * sizeof(int32_t), stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(
-        p2l_gpu, 0xFF,
-        static_cast<size_t>(num_global_physical_) * sizeof(int32_t), stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(
-        l2p_gpu, 0xFF,
-        static_cast<size_t>(num_global_logical_experts_) * max_replicas_dim_ * sizeof(int32_t), stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(
-        lcnts_gpu, 0,
-        static_cast<size_t>(num_global_logical_experts_) * sizeof(int32_t), stream));
+        l2p_gpu, 0xFF, static_cast<size_t>(num_global_logical_experts_) * max_replicas_dim_ * sizeof(int32_t), stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemsetAsync(lcnts_gpu, 0, static_cast<size_t>(num_global_logical_experts_) * sizeof(int32_t), stream));
 
     dim3 grid(num_nvl_domains_);
 
@@ -860,42 +856,84 @@ void PlacementSolverGPU::solve(const int32_t* expert_loads_gpu,
 
     // Template dispatch: EPL × COMPACT_EOR
     // COMPACT_EOR=true uses 64 threads (2 warps), false uses 32 threads (1 warp)
-#define LAUNCH_V3(EPL_VAL, COMPACT_VAL)                                        \
-    do {                                                                        \
-        constexpr int NTHREADS = (COMPACT_VAL) ? 64 : 32;                      \
-        dim3 block(NTHREADS);                                                   \
-        placement_solve_kernel_v3<EPL_VAL, COMPACT_VAL>                         \
-            <<<grid, block, 0, stream>>>(                                       \
-                expert_loads_gpu, p2l_gpu, l2p_gpu, lcnts_gpu,                  \
-                num_nvl_ranks_, num_local_master_, num_local_redundant_,         \
-                num_local_physical_, max_replicas_dim_, num_logical_per_nvl_,    \
-                num_redundant_per_nvl_, num_global_physical_,                    \
-                balance_threshold);                                             \
+#define LAUNCH_V3(EPL_VAL, COMPACT_VAL)                                                                     \
+    do {                                                                                                    \
+        constexpr int NTHREADS = (COMPACT_VAL) ? 64 : 32;                                                   \
+        dim3 block(NTHREADS);                                                                               \
+        placement_solve_kernel_v3<EPL_VAL, COMPACT_VAL><<<grid, block, 0, stream>>>(expert_loads_gpu,       \
+                                                                                    p2l_gpu,                \
+                                                                                    l2p_gpu,                \
+                                                                                    lcnts_gpu,              \
+                                                                                    num_nvl_ranks_,         \
+                                                                                    num_local_master_,      \
+                                                                                    num_local_redundant_,   \
+                                                                                    num_local_physical_,    \
+                                                                                    max_replicas_dim_,      \
+                                                                                    num_logical_per_nvl_,   \
+                                                                                    num_redundant_per_nvl_, \
+                                                                                    num_global_physical_,   \
+                                                                                    balance_threshold);     \
     } while (0)
 
     if (compact) {
         switch (epl) {
-            case 1: LAUNCH_V3(1, true); break;
-            case 2: LAUNCH_V3(2, true); break;
-            case 3: LAUNCH_V3(3, true); break;
-            case 4: LAUNCH_V3(4, true); break;
-            case 5: LAUNCH_V3(5, true); break;
-            case 6: LAUNCH_V3(6, true); break;
-            case 7: LAUNCH_V3(7, true); break;
-            case 8: LAUNCH_V3(8, true); break;
-            default: LAUNCH_V3(16, true); break;
+            case 1:
+                LAUNCH_V3(1, true);
+                break;
+            case 2:
+                LAUNCH_V3(2, true);
+                break;
+            case 3:
+                LAUNCH_V3(3, true);
+                break;
+            case 4:
+                LAUNCH_V3(4, true);
+                break;
+            case 5:
+                LAUNCH_V3(5, true);
+                break;
+            case 6:
+                LAUNCH_V3(6, true);
+                break;
+            case 7:
+                LAUNCH_V3(7, true);
+                break;
+            case 8:
+                LAUNCH_V3(8, true);
+                break;
+            default:
+                LAUNCH_V3(16, true);
+                break;
         }
     } else {
         switch (epl) {
-            case 1: LAUNCH_V3(1, false); break;
-            case 2: LAUNCH_V3(2, false); break;
-            case 3: LAUNCH_V3(3, false); break;
-            case 4: LAUNCH_V3(4, false); break;
-            case 5: LAUNCH_V3(5, false); break;
-            case 6: LAUNCH_V3(6, false); break;
-            case 7: LAUNCH_V3(7, false); break;
-            case 8: LAUNCH_V3(8, false); break;
-            default: LAUNCH_V3(16, false); break;
+            case 1:
+                LAUNCH_V3(1, false);
+                break;
+            case 2:
+                LAUNCH_V3(2, false);
+                break;
+            case 3:
+                LAUNCH_V3(3, false);
+                break;
+            case 4:
+                LAUNCH_V3(4, false);
+                break;
+            case 5:
+                LAUNCH_V3(5, false);
+                break;
+            case 6:
+                LAUNCH_V3(6, false);
+                break;
+            case 7:
+                LAUNCH_V3(7, false);
+                break;
+            case 8:
+                LAUNCH_V3(8, false);
+                break;
+            default:
+                LAUNCH_V3(16, false);
+                break;
         }
     }
 #undef LAUNCH_V3

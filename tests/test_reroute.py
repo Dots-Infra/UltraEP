@@ -45,6 +45,7 @@ def create_manager(
     num_local_master,
     num_local_redundant,
     use_gpu_solver=False,
+    use_quota_eplb_solver=False,
 ):
     """Create a Manager with CUDA reroute enabled and minimal expert buffer sizes."""
     return ultra_ep.Manager(
@@ -56,6 +57,7 @@ def create_manager(
         expert_fc2_numel=64,
         explicitly_destroy=True,
         use_gpu_solver=use_gpu_solver,
+        use_quota_eplb_solver=use_quota_eplb_solver,
     )
 
 
@@ -137,6 +139,47 @@ def test_forward_correctness(mgr, layer_id, T, topk, verbose=False):
 
 def test_backward_correctness(mgr, layer_id, T, topk):
     """Verify that CPU and CUDA backward paths produce identical grad_probs."""
+    if mgr.use_quota_eplb_solver:
+        # In quota mode, CPU reference path is not available.
+        # Instead, verify gradient consistency via finite-difference-like check:
+        # forward produces a deterministic mapping, backward must be its transpose.
+        print_rank0(f"\n{'='*60}")
+        print_rank0(f"Test: backward correctness (quota mode)  (T={T}, topk={topk})")
+        print_rank0(f"{'='*60}")
+
+        L = mgr.num_global_logical_experts
+
+        torch.manual_seed(7 + dist.get_rank())
+        update_placement_with_random_loads(mgr, layer_id, T, topk)
+        routing_map = generate_routing_map(T, L, topk)
+
+        # CUDA path: forward + backward
+        probs = torch.randn(
+            T, L, dtype=torch.float32, device="cuda", requires_grad=True
+        )
+        exp_probs, exp_map = mgr._reroute_cuda(layer_id, probs, routing_map)
+        loss = exp_probs.sum()
+        loss.backward()
+
+        assert probs.grad is not None, "No gradient computed"
+
+        # Verify: for each active (t, l), grad_probs[t,l] should be 1.0
+        # (since loss = sum of expanded_probs, and each active prob is scattered exactly once)
+        grad = probs.grad
+        for t in range(min(T, 100)):  # spot-check first 100 tokens
+            for l in range(L):
+                if routing_map[t, l]:
+                    assert (
+                        abs(grad[t, l].item() - 1.0) < 1e-5
+                    ), f"grad[{t},{l}]={grad[t,l].item()} expected 1.0"
+                else:
+                    assert (
+                        grad[t, l].item() == 0.0
+                    ), f"grad[{t},{l}]={grad[t,l].item()} expected 0.0 (inactive)"
+
+        print_rank0("  PASS")
+        return
+
     print_rank0(f"\n{'='*60}")
     print_rank0(f"Test: backward correctness  (T={T}, topk={topk})")
     print_rank0(f"{'='*60}")
@@ -177,6 +220,51 @@ def test_backward_correctness(mgr, layer_id, T, topk):
         assert (
             False
         ), f"gradient mismatch: {num_diff} entries differ, max diff = {max_diff}"
+
+    print_rank0("  PASS")
+
+
+def test_quota_forward_counts(mgr, layer_id, T, topk):
+    """Verify that quota-mode reroute matches per-instance quota counts."""
+    assert mgr.use_quota_eplb_solver
+
+    print_rank0(f"\n{'='*60}")
+    print_rank0(f"Test: quota forward counts  (T={T}, topk={topk})")
+    print_rank0(f"{'='*60}")
+
+    L = mgr.num_global_logical_experts
+    routing_map = generate_routing_map(T, L, topk)
+    probs = torch.randn(T, L, dtype=torch.float32, device="cuda")
+    mgr.update_placement(layer_id, routing_map, verify_reduced_loads=True)
+    _, expanded_routing_map = mgr._reroute_cuda(layer_id, probs, routing_map)
+
+    per_phys_counts = expanded_routing_map.sum(dim=0, dtype=torch.int32)
+    dist.all_reduce(per_phys_counts)
+    per_phys_counts = per_phys_counts.cpu()
+    quota = mgr.get_quota_tensor(layer_id)
+    l2p = mgr.logical_to_physical_map[layer_id]
+    lcnts = mgr.logical_replica_counts[layer_id]
+
+    for logical in range(L):
+        for replica_idx in range(int(lcnts[logical].item())):
+            phys = int(l2p[logical, replica_idx].item())
+            expected = int(quota[logical, replica_idx].item())
+            actual = int(per_phys_counts[phys].item())
+            assert actual == expected, (
+                f"logical={logical} replica={replica_idx} phys={phys}: "
+                f"expected {expected}, got {actual}"
+            )
+
+    # Additional: verify per-rank load balance
+    P_local = mgr.num_local_physical_experts
+    rank_loads = per_phys_counts.view(mgr.num_ranks, P_local).sum(dim=1)
+    if rank_loads.sum().item() > 0:
+        max_load = rank_loads.max().item()
+        mean_load = rank_loads.float().mean().item()
+        imbalance = max_load / mean_load if mean_load > 0 else 1.0
+        print_rank0(
+            f"  Per-rank load balance: max={max_load}, mean={mean_load:.1f}, imbalance={imbalance:.3f}"
+        )
 
     print_rank0("  PASS")
 
@@ -310,6 +398,7 @@ def main():
     parser.add_argument("--topk", type=int, default=8, help="Top-k experts per token")
     parser.add_argument("--bench-iters", type=int, default=200)
     parser.add_argument("--gpu-solver", action="store_true")
+    parser.add_argument("--quota", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -321,7 +410,8 @@ def main():
         f"num_local_master={args.num_local_master}, "
         f"num_local_redundant={args.num_local_redundant}, "
         f"T={args.T}, topk={args.topk}, "
-        f"solver={'GPU' if args.gpu_solver else 'CPU'}"
+        f"solver={'GPU' if args.gpu_solver else 'CPU'}, "
+        f"quota={'on' if args.quota else 'off'}"
     )
 
     mgr = create_manager(
@@ -330,6 +420,7 @@ def main():
         args.num_local_master,
         args.num_local_redundant,
         use_gpu_solver=args.gpu_solver,
+        use_quota_eplb_solver=args.quota,
     )
 
     L = mgr.num_global_logical_experts
@@ -341,7 +432,12 @@ def main():
 
     # ---- Correctness tests ----
     try:
-        test_forward_correctness(mgr, layer_id, args.T, args.topk, verbose=args.verbose)
+        if args.quota:
+            test_quota_forward_counts(mgr, layer_id, args.T, args.topk)
+        else:
+            test_forward_correctness(
+                mgr, layer_id, args.T, args.topk, verbose=args.verbose
+            )
     except Exception as e:
         all_passed = False
         print_rank0(f"  FAIL: {e}")
@@ -361,7 +457,8 @@ def main():
             traceback.print_exc()
 
     # ---- Benchmarks ----
-    run_benchmarks(mgr, layer_id, args.T, args.topk, num_iters=args.bench_iters)
+    if not args.quota:
+        run_benchmarks(mgr, layer_id, args.T, args.topk, num_iters=args.bench_iters)
 
     # ---- Summary ----
     print_rank0(f"\n{'='*60}")

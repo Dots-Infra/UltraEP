@@ -51,23 +51,36 @@ struct GlobalExpertPlacement {
     torch::Tensor physical_to_logical_map;
     torch::Tensor logical_to_physical_map;
     torch::Tensor logical_replica_counts;
+    torch::Tensor logical_instance_quota;
+    torch::Tensor logical_instance_quota_prefix;
 
     // GPU tensor views (strided views into gpu_buffer)
     torch::Tensor physical_to_logical_map_gpu;
     torch::Tensor logical_to_physical_map_gpu;
     torch::Tensor logical_replica_counts_gpu;
+    torch::Tensor logical_instance_quota_gpu;
+    torch::Tensor logical_instance_quota_prefix_gpu;
+    // Per-rank quota prefix only needs a device copy.
+    torch::Tensor rank_quota_prefix_gpu;
 
     // Contiguous per-layer buffer management.
-    // Layout per layer: [p2l (P) | l2p (L*R) | lcnts (L)] with padding to alignment.
+    // Layout per layer:
+    //   [p2l (P) | l2p (L*R) | lcnts (L) | quota (L*R) | quota_prefix (L*R)]
+    // with padding to alignment.
     // Cross-layer stride is per_layer_stride_numel (may be > per_layer_data_numel for alignment).
     int32_t* cpu_buffer = nullptr;  // pinned host memory
     int32_t* gpu_buffer = nullptr;  // device memory
+    int32_t* quota_buf_cpu = nullptr;
+    int32_t* quota_buf_gpu = nullptr;
 
     int num_layers_ = 0;
     int p2l_numel = 0;               // = num_global_physical_experts
     int l2p_numel = 0;               // = num_global_logical_experts * max_replicas_dim
     int lcnts_numel = 0;             // = num_global_logical_experts
-    int per_layer_data_numel = 0;    // = p2l + l2p + lcnts
+    int quota_numel = 0;             // = num_global_logical_experts * max_replicas_dim
+    int quota_prefix_numel = 0;      // = num_global_logical_experts * max_replicas_dim
+    int rank_quota_numel = 0;        // = num_global_logical_experts * max_replicas_dim
+    int per_layer_data_numel = 0;    // = p2l + l2p + lcnts + quota + quota_prefix
     int per_layer_stride_numel = 0;  // aligned stride (in int32 elements)
     int per_layer_data_bytes = 0;
     int per_layer_stride_bytes = 0;
@@ -101,6 +114,8 @@ struct GlobalExpertPlacement {
     // Raw pointer access for a specific layer.
     std::tuple<int32_t*, int32_t*, int32_t*> get_cpu_ptrs(int layer_id) const;
     std::tuple<int32_t*, int32_t*, int32_t*> get_gpu_ptrs(int layer_id) const;
+    std::tuple<int32_t*, int32_t*, int32_t*> get_quota_cpu_ptrs(int layer_id) const;
+    std::tuple<int32_t*, int32_t*, int32_t*> get_quota_gpu_ptrs(int layer_id) const;
 };
 
 // Pre-allocated CUDA output buffers for reroute (lazy init).
@@ -217,8 +232,8 @@ class Manager {
 
     // GPU task build support: config + remote pointer tables + staging buffer
     kernels::TaskBuildConfig* _task_build_config_gpu = nullptr;
-    void** _remote_weight_ptrs_gpu = nullptr;  // [MAX_NVL_DOMAIN_SIZE]
-    void** _remote_grad_ptrs_gpu = nullptr;    // [MAX_NVL_DOMAIN_SIZE]
+    void** _remote_weight_ptrs_gpu = nullptr;           // [MAX_NVL_DOMAIN_SIZE]
+    void** _remote_grad_ptrs_gpu = nullptr;             // [MAX_NVL_DOMAIN_SIZE]
     int64_t* _local_master_ptrs_staging_gpu = nullptr;  // [2 * num_local_master_experts]
     // Pre-computed upper bounds for GPU-path grid sizing
     int _max_ws_total_tiles = 0;
@@ -229,17 +244,25 @@ class Manager {
     int* _reroute_sparse_counters_gpu = nullptr;
 
     // Early-stop balance threshold for replica allocation
-    float balance_threshold_ = 0.0f;
+    float balance_threshold_ = 1.0f;
 
     // Solvers
     std::unique_ptr<solver::PlacementSolver> placement_solver_;
     std::unique_ptr<solver::PlacementSolverGPU> placement_solver_gpu_;
+    std::unique_ptr<solver::PlacementSolverQuota> placement_solver_quota_;
     std::unique_ptr<solver::RerouteSolver> reroute_solver_;
     bool use_gpu_solver_ = false;
+    bool use_quota_solver_ = false;
+    bool quota_locality_aware_ = true;
+    int32_t quota_min_tokens_per_replica_ = 1;
+    bool quota_allow_zero_master_quota_ = true;
+    float quota_oracle_eps_ = 0.01f;
     std::vector<bool> placement_cpu_dirty_;
     // Shape: [num_global_logical_experts]
     int* global_logical_expert_loads_cpu = nullptr;  // pinned memory for CPU-side placement solver
     int* global_logical_expert_loads_gpu = nullptr;  // alloc by nvshmem for allreduce
+    int32_t* local_expert_loads_gpu = nullptr;       // [L] — symmetric source buffer for allgather
+    int32_t* expert_loads_per_rank_gpu = nullptr;    // [num_ranks, L] — symmetric allgather output
 
     // Reroute output buffer management
     std::unique_ptr<RerouteOutputBuffer> reroute_output_buffer_;
@@ -257,7 +280,12 @@ public:
             const bool& is_train,
             const bool& explicitly_destroy,
             const bool& use_gpu_solver = false,
-            const float& balance_threshold = 0.0f);
+            const float& balance_threshold = 1.0f,
+            const bool& use_quota_solver = false,
+            const bool& quota_locality_aware = true,
+            const int32_t& quota_min_tokens_per_replica = 1,
+            const bool& quota_allow_zero_master_quota = true,
+            const float& quota_oracle_eps = 0.01f);
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
@@ -316,7 +344,8 @@ public:
 
     torch::Tensor reroute_cuda_backward(const int& layer_id,
                                         torch::Tensor& grad_expanded_probs,
-                                        torch::Tensor& routing_map);
+                                        torch::Tensor& routing_map,
+                                        torch::Tensor& expanded_routing_map);
 
     torch::Stream get_comm_stream() const { return comm_stream; }
 
@@ -328,6 +357,9 @@ public:
     torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
     torch::Tensor get_logical_to_physical_map_tensor() const { return placement.logical_to_physical_map; }
     torch::Tensor get_logical_replica_counts_tensor() const { return placement.logical_replica_counts; }
+    torch::Tensor get_logical_instance_quota_tensor() const { return placement.logical_instance_quota; }
+    torch::Tensor get_logical_instance_quota_prefix_tensor() const { return placement.logical_instance_quota_prefix; }
+    torch::Tensor get_rank_quota_prefix_tensor() const { return placement.rank_quota_prefix_gpu; }
     torch::Tensor get_global_logical_expert_loads_tensor() const {
         return make_tensor_from_buffer(global_logical_expert_loads_gpu,
                                        {num_global_logical_experts},
@@ -338,7 +370,8 @@ public:
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<Manager>(m, "Manager")
-        .def(pybind11::init<int, int, int, int64_t, int64_t, bool, bool, bool, float>(),
+        .def(pybind11::
+                 init<int, int, int, int64_t, int64_t, bool, bool, bool, float, bool, bool, int32_t, bool, float>(),
              pybind11::arg("num_layers"),
              pybind11::arg("num_local_master_experts"),
              pybind11::arg("num_local_redundant_experts"),
@@ -347,7 +380,12 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("is_train"),
              pybind11::arg("explicitly_destroy"),
              pybind11::arg("use_gpu_solver") = false,
-             pybind11::arg("balance_threshold") = 0.0f)
+             pybind11::arg("balance_threshold") = 1.0f,
+             pybind11::arg("use_quota_solver") = false,
+             pybind11::arg("quota_locality_aware") = true,
+             pybind11::arg("quota_min_tokens_per_replica") = 1,
+             pybind11::arg("quota_allow_zero_master_quota") = true,
+             pybind11::arg("quota_oracle_eps") = 0.01f)
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("sync_placement_to_cpu", &Manager::sync_placement_to_cpu, pybind11::arg("layer_id") = -1)
@@ -365,6 +403,9 @@ static void register_apis(pybind11::module_& m) {
         .def("get_physical_to_logical_map_tensor", &Manager::get_physical_to_logical_map_tensor)
         .def("get_logical_to_physical_map_tensor", &Manager::get_logical_to_physical_map_tensor)
         .def("get_logical_replica_counts_tensor", &Manager::get_logical_replica_counts_tensor)
+        .def("get_logical_instance_quota_tensor", &Manager::get_logical_instance_quota_tensor)
+        .def("get_logical_instance_quota_prefix_tensor", &Manager::get_logical_instance_quota_prefix_tensor)
+        .def("get_rank_quota_prefix_tensor", &Manager::get_rank_quota_prefix_tensor)
         .def("get_global_logical_expert_loads_tensor", &Manager::get_global_logical_expert_loads_tensor);
 }
 

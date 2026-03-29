@@ -87,8 +87,7 @@ void PlacementSolver::solve(const int32_t* __restrict__ expert_loads,
         for (int i = 0; i < num_logical_per_nvl_; ++i) {
             total_load += expert_loads[domain_start_log + i];
         }
-        const double avg_per_slot = (total_load > 0) ?
-            total_load / (num_nvl_ranks_ * num_local_master_) : 0.0;
+        const double avg_per_slot = (total_load > 0) ? total_load / (num_nvl_ranks_ * num_local_master_) : 0.0;
 
         for (int slot = 0; slot < num_redundant_per_nvl_; ++slot) {
             int best_l = -1;
@@ -109,8 +108,7 @@ void PlacementSolver::solve(const int32_t* __restrict__ expert_loads,
             }
 
             // Early-stop: all experts' per-replica load is within threshold of average
-            if (balance_threshold > 0.0f && avg_per_slot > 0.0 &&
-                best_score <= avg_per_slot * balance_threshold) {
+            if (balance_threshold > 1.0f && avg_per_slot > 0.0 && best_score <= avg_per_slot * balance_threshold) {
                 break;
             }
 

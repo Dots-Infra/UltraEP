@@ -251,8 +251,7 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
 
     // Write task metadata to GPU
     int metadata[2] = {total_tasks, total_tiles};
-    CUDA_RUNTIME_CHECK(
-        cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     // Copy tasks and tile offsets from CPU to GPU
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(weight_sync_tasks_gpu,
@@ -284,8 +283,8 @@ void run_weight_sync_from_gpu(WeightSyncTask* tasks_gpu,
     int num_ctas = min(num_device_sms * 2, max_possible_tiles);
     num_ctas = max(num_ctas, 1);
 
-    launch_weight_sync_kernel(tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu,
-                              num_ctas, stream);
+    launch_weight_sync_kernel(
+        tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu, num_ctas, stream);
 }
 
 }  // namespace ultra_ep::kernels

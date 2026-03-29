@@ -24,7 +24,13 @@ class Manager:
         explicitly_destroy: bool = False,
         max_microbatches: int = 1,
         use_gpu_solver: bool = False,
-        balance_threshold: float = 0.0,
+        balance_threshold: float = 1.0,
+        use_quota_eplb_solver: bool = True,
+        quota_locality_aware: bool = True,
+        quota_min_tokens_per_replica: int = 1024,
+        quota_allow_zero_master_quota: bool = False,
+        quota_oracle_mode: str = "fastt",
+        quota_oracle_eps: float = 0.01,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -86,6 +92,15 @@ class Manager:
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
         self.use_gpu_solver = use_gpu_solver
+        normalized_quota_oracle_mode = quota_oracle_mode.lower().replace("_", "")
+        if normalized_quota_oracle_mode != "fastt":
+            raise ValueError(
+                "UltraEP only supports quota_oracle_mode='fastt' in the pruned quota solver path"
+            )
+        self.use_quota_eplb_solver = use_quota_eplb_solver
+        # Quota solver keeps placement/reroute data on GPU, so grad/weight task build
+        # should also use the GPU path to avoid hot-path D2H placement sync.
+        self.use_gpu_task_build = self.use_gpu_solver or self.use_quota_eplb_solver
         self.runtime = _C.Manager(
             self.num_alloc_layers,
             num_local_master_experts,
@@ -96,11 +111,16 @@ class Manager:
             explicitly_destroy,
             use_gpu_solver,
             balance_threshold,
+            use_quota_eplb_solver,
+            quota_locality_aware,
+            quota_min_tokens_per_replica,
+            quota_allow_zero_master_quota,
+            quota_oracle_eps,
         )
         assert self.runtime.is_available()
 
-        # Host-visible placement mirror. When use_gpu_solver=True the authoritative
-        # copy lives on GPU and this mirror is refreshed on demand.
+        # Host-visible placement mirror. GPU-resident placement paths refresh this
+        # CPU mirror only on demand.
         self._physical_to_logical_map: torch.Tensor = (
             self.runtime.get_physical_to_logical_map_tensor()
         )
@@ -109,6 +129,15 @@ class Manager:
         )
         self._logical_replica_counts: torch.Tensor = (
             self.runtime.get_logical_replica_counts_tensor()
+        )
+        self._logical_instance_quota: torch.Tensor = (
+            self.runtime.get_logical_instance_quota_tensor()
+        )
+        self._logical_instance_quota_prefix: torch.Tensor = (
+            self.runtime.get_logical_instance_quota_prefix_tensor()
+        )
+        self._rank_quota_prefix: torch.Tensor = (
+            self.runtime.get_rank_quota_prefix_tensor()
         )
         # Replica weight buffer shared by layers on GPU
         self.local_replica_weight_buffer: torch.Tensor = (
@@ -143,6 +172,31 @@ class Manager:
     def logical_replica_counts(self) -> torch.Tensor:
         self.sync_placement_to_cpu()
         return self._logical_replica_counts
+
+    @property
+    def logical_instance_quota(self) -> torch.Tensor:
+        self.sync_placement_to_cpu()
+        return self._logical_instance_quota
+
+    @property
+    def logical_instance_quota_prefix(self) -> torch.Tensor:
+        self.sync_placement_to_cpu()
+        return self._logical_instance_quota_prefix
+
+    @property
+    def rank_quota_prefix(self) -> torch.Tensor:
+        return self._rank_quota_prefix
+
+    def get_quota_tensor(self, layer_id: int) -> torch.Tensor:
+        self.sync_placement_to_cpu(layer_id)
+        return self._logical_instance_quota[layer_id]
+
+    def get_quota_prefix_tensor(self, layer_id: int) -> torch.Tensor:
+        self.sync_placement_to_cpu(layer_id)
+        return self._logical_instance_quota_prefix[layer_id]
+
+    def get_rank_quota_prefix_tensor(self, layer_id: int) -> torch.Tensor:
+        return self._rank_quota_prefix[layer_id]
 
     def destroy(self):
         assert self.explicitly_destroy
@@ -207,7 +261,7 @@ class Manager:
         self.local_master_fc2_weight_pool[layer_id] = _to_dataptr_tensor(
             fc2_weights, device="cpu"
         )
-        if self.use_gpu_solver:
+        if self.use_gpu_task_build:
             self.local_master_fc1_weight_pool_gpu[layer_id] = _to_dataptr_tensor(
                 fc1_weights, device=gpu_ptr_device
             )
@@ -229,7 +283,7 @@ class Manager:
             self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(
                 fc2_grads, device="cpu"
             )
-            if self.use_gpu_solver:
+            if self.use_gpu_task_build:
                 self.local_master_fc1_grad_pool_gpu[layer_id] = _to_dataptr_tensor(
                     fc1_grads, device=gpu_ptr_device
                 )
@@ -257,19 +311,19 @@ class Manager:
             self.local_master_fc1_grad_pool[real_lid] is not None
             and self.local_master_fc2_grad_pool[real_lid] is not None
         )
-        if self.use_gpu_solver:
+        if self.use_gpu_task_build:
             assert (
                 self.local_master_fc1_grad_pool_gpu[real_lid] is not None
                 and self.local_master_fc2_grad_pool_gpu[real_lid] is not None
             )
         fc1_grad_ptr_pool = (
             self.local_master_fc1_grad_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc1_grad_pool[real_lid]
         )
         fc2_grad_ptr_pool = (
             self.local_master_fc2_grad_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc2_grad_pool[real_lid]
         )
         event = self.runtime.grad_reduce(
@@ -310,19 +364,19 @@ class Manager:
             self.local_master_fc1_weight_pool[real_lid] is not None
             and self.local_master_fc2_weight_pool[real_lid] is not None
         )
-        if self.use_gpu_solver:
+        if self.use_gpu_task_build:
             assert (
                 self.local_master_fc1_weight_pool_gpu[real_lid] is not None
                 and self.local_master_fc2_weight_pool_gpu[real_lid] is not None
             )
         fc1_weight_ptr_pool = (
             self.local_master_fc1_weight_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc1_weight_pool[real_lid]
         )
         fc2_weight_ptr_pool = (
             self.local_master_fc2_weight_pool_gpu[real_lid]
-            if self.use_gpu_solver
+            if self.use_gpu_task_build
             else self.local_master_fc2_weight_pool[real_lid]
         )
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
@@ -344,8 +398,8 @@ class Manager:
         """
         Update expert placement for a single layer based on real-time load statistics.
 
-        Runs the EPLB-style placement algorithm on CPU or GPU depending on
-        ``use_gpu_solver``:
+        Runs the EPLB-style placement algorithm on CPU or GPU depending on the
+        selected placement path:
           1. Masters remain fixed at their pre-assigned positions.
           2. Per NVL domain, greedily replicates the most loaded experts.
           3. Per NVL domain, packs replicas to GPU slots via LPT bin-packing,
@@ -415,6 +469,10 @@ class Manager:
                 layer_id, probs, routing_map
             )
         elif backend == "cpu":
+            if self.use_quota_eplb_solver:
+                raise ValueError(
+                    "CPU reroute is not supported when use_quota_eplb_solver=True"
+                )
             expanded_probs, expanded_routing_map = self._reroute_cpu(
                 layer_id, probs, routing_map
             )
@@ -520,6 +578,10 @@ class Manager:
         topk_ids: torch.Tensor,
     ):
         assert layer_id < self.num_alloc_layers
+        if self.use_quota_eplb_solver:
+            raise ValueError(
+                "Sparse reroute is not supported when use_quota_eplb_solver=True"
+            )
 
         if self.log_expert_loads:
             # Compute original logical expert loads before rerouting.
@@ -566,11 +628,15 @@ class Manager:
             self._physical_to_logical_map.device == torch.device("cpu")
             and self._logical_to_physical_map.device == torch.device("cpu")
             and self._logical_replica_counts.device == torch.device("cpu")
+            and self._logical_instance_quota.device == torch.device("cpu")
+            and self._logical_instance_quota_prefix.device == torch.device("cpu")
         )
         assert (
             self._physical_to_logical_map.dtype == torch.int32
             and self._logical_to_physical_map.dtype == torch.int32
             and self._logical_replica_counts.dtype == torch.int32
+            and self._logical_instance_quota.dtype == torch.int32
+            and self._logical_instance_quota_prefix.dtype == torch.int32
         )
         assert (
             self._physical_to_logical_map.shape
@@ -585,6 +651,17 @@ class Manager:
                 self.num_alloc_layers,
                 self.num_global_logical_experts,
             )
+            and self._logical_instance_quota.shape
+            == (self.num_alloc_layers, self.num_global_logical_experts, self.num_ranks)
+            and self._logical_instance_quota_prefix.shape
+            == (self.num_alloc_layers, self.num_global_logical_experts, self.num_ranks)
+        )
+        assert self._rank_quota_prefix.device == torch.device("cuda", self.device)
+        assert self._rank_quota_prefix.dtype == torch.int32
+        assert self._rank_quota_prefix.shape == (
+            self.num_alloc_layers,
+            self.num_global_logical_experts,
+            self.num_ranks,
         )
         assert self.local_replica_weight_buffer.device == torch.device(
             "cuda", self.device

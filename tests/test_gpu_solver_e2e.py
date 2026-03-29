@@ -48,20 +48,27 @@ def generate_routing_map(T, L, topk, device="cuda"):
     return routing_map
 
 
-def create_manager(group, num_layers, num_local_master, num_local_redundant,
-                   use_gpu_solver=False, max_microbatches=1):
+def create_manager(
+    group,
+    num_layers,
+    num_local_master,
+    num_local_redundant,
+    use_gpu_solver=False,
+    max_microbatches=1,
+):
     """Create a Manager with specified solver mode."""
     return ultra_ep.Manager(
         group=group,
         num_layers=num_layers,
         num_local_master_experts=num_local_master,
         num_local_redundant_experts=num_local_redundant,
-        expert_fc1_numel=64,   # Small for testing
+        expert_fc1_numel=64,  # Small for testing
         expert_fc2_numel=32,
         is_train=True,
         explicitly_destroy=True,
         max_microbatches=max_microbatches,
         use_gpu_solver=use_gpu_solver,
+        use_quota_eplb_solver=False,
     )
 
 
@@ -83,13 +90,16 @@ def setup_master_ptrs(mgr, layer_id, fc1_numel, fc2_numel, num_local_master):
         torch.randn(fc2_numel, device="cuda", dtype=torch.float32)
         for _ in range(num_local_master)
     ]
-    mgr.construct_local_master_ptr_pool(layer_id, fc1_weights, fc2_weights, fc1_grads, fc2_grads)
+    mgr.construct_local_master_ptr_pool(
+        layer_id, fc1_weights, fc2_weights, fc1_grads, fc2_grads
+    )
     return fc1_weights, fc2_weights, fc1_grads, fc2_grads
 
 
 # ============================================================================
 # Test 1: GPU vs CPU solver produce valid placements
 # ============================================================================
+
 
 def test_placement_equivalence(args):
     """Verify GPU solver update_placement produces valid placement maps.
@@ -113,8 +123,11 @@ def test_placement_equivalence(args):
 
     for solver_name, use_gpu in [("CPU", False), ("GPU", True)]:
         mgr = create_manager(
-            group, NUM_LAYERS, args.num_local_master,
-            args.num_local_redundant, use_gpu_solver=use_gpu,
+            group,
+            NUM_LAYERS,
+            args.num_local_master,
+            args.num_local_redundant,
+            use_gpu_solver=use_gpu,
         )
         L = mgr.num_global_logical_experts
         layer_id = 0
@@ -136,12 +149,12 @@ def test_placement_equivalence(args):
             master_rank = l // args.num_local_master
             local_idx = l % args.num_local_master
             p = master_rank * num_local_physical + local_idx
-            assert p2l[p].item() == l, (
-                f"[{solver_name}] Master wrong: p2l[{p}]={p2l[p].item()}, expected {l}"
-            )
-            assert l2p[l, 0].item() == p, (
-                f"[{solver_name}] Master l2p wrong: l2p[{l},0]={l2p[l,0].item()}, expected {p}"
-            )
+            assert (
+                p2l[p].item() == l
+            ), f"[{solver_name}] Master wrong: p2l[{p}]={p2l[p].item()}, expected {l}"
+            assert (
+                l2p[l, 0].item() == p
+            ), f"[{solver_name}] Master l2p wrong: l2p[{l},0]={l2p[l,0].item()}, expected {p}"
 
         # Check lcnts match actual count
         actual_counts = torch.zeros(L, dtype=torch.int32)
@@ -149,9 +162,7 @@ def test_placement_equivalence(args):
             l = p2l[p].item()
             if l >= 0:
                 actual_counts[l] += 1
-        assert (lcnts == actual_counts).all(), (
-            f"[{solver_name}] lcnts mismatch"
-        )
+        assert (lcnts == actual_counts).all(), f"[{solver_name}] lcnts mismatch"
 
         # Check no duplicate logical expert on same rank
         for r in range(world_size):
@@ -160,9 +171,9 @@ def test_placement_equivalence(args):
                 p = r * num_local_physical + s
                 l = p2l[p].item()
                 if l >= 0:
-                    assert l not in experts_on_rank, (
-                        f"[{solver_name}] Duplicate expert {l} on rank {r}"
-                    )
+                    assert (
+                        l not in experts_on_rank
+                    ), f"[{solver_name}] Duplicate expert {l} on rank {r}"
                     experts_on_rank.add(l)
 
         print_rank0(f"  {solver_name} solver: placement invariants PASS")
@@ -175,6 +186,7 @@ def test_placement_equivalence(args):
 # ============================================================================
 # Test 2: Full pipeline (placement → reroute → weight_sync → grad_reduce)
 # ============================================================================
+
 
 def test_full_pipeline(args):
     """End-to-end test: placement → reroute → weight_sync → grad_reduce with GPU solver."""
@@ -190,8 +202,11 @@ def test_full_pipeline(args):
 
     for solver_name, use_gpu in [("CPU", False), ("GPU", True)]:
         mgr = create_manager(
-            group, NUM_LAYERS, args.num_local_master,
-            args.num_local_redundant, use_gpu_solver=use_gpu,
+            group,
+            NUM_LAYERS,
+            args.num_local_master,
+            args.num_local_redundant,
+            use_gpu_solver=use_gpu,
         )
         L = mgr.num_global_logical_experts
         fc1_numel = mgr.expert_fc1_numel
@@ -214,19 +229,21 @@ def test_full_pipeline(args):
 
         # Verify expanded routing map has correct shape
         P = mgr.num_global_physical_experts
-        assert exp_probs.shape == (T, P), (
-            f"[{solver_name}] exp_probs shape {exp_probs.shape}, expected ({T}, {P})"
-        )
-        assert exp_map.shape == (T, P), (
-            f"[{solver_name}] exp_map shape {exp_map.shape}, expected ({T}, {P})"
-        )
+        assert exp_probs.shape == (
+            T,
+            P,
+        ), f"[{solver_name}] exp_probs shape {exp_probs.shape}, expected ({T}, {P})"
+        assert exp_map.shape == (
+            T,
+            P,
+        ), f"[{solver_name}] exp_map shape {exp_map.shape}, expected ({T}, {P})"
 
         # Each token should have >= topk physical experts selected
         # (some logicals may have replicas, so physical count >= topk)
         tokens_with_experts = exp_map.sum(dim=1)
-        assert (tokens_with_experts >= topk).all(), (
-            f"[{solver_name}] Some tokens have fewer than topk physical experts"
-        )
+        assert (
+            tokens_with_experts >= topk
+        ).all(), f"[{solver_name}] Some tokens have fewer than topk physical experts"
 
         # 4. Weight sync
         dist.barrier()
@@ -240,8 +257,12 @@ def test_full_pipeline(args):
         # Build global master weights for reference
         local_master_fc1_weights = torch.stack(fc1_w)
         local_master_fc2_weights = torch.stack(fc2_w)
-        global_fc1_list = [torch.zeros_like(local_master_fc1_weights) for _ in range(world_size)]
-        global_fc2_list = [torch.zeros_like(local_master_fc2_weights) for _ in range(world_size)]
+        global_fc1_list = [
+            torch.zeros_like(local_master_fc1_weights) for _ in range(world_size)
+        ]
+        global_fc2_list = [
+            torch.zeros_like(local_master_fc2_weights) for _ in range(world_size)
+        ]
         dist.all_gather(global_fc1_list, local_master_fc1_weights)
         dist.all_gather(global_fc2_list, local_master_fc2_weights)
         global_fc1 = torch.stack(global_fc1_list)
@@ -253,19 +274,21 @@ def test_full_pipeline(args):
             logical_idx = mgr.physical_to_logical_map[layer_id, global_phys_idx].item()
             if logical_idx < 0:
                 continue
-            master_global_phys = mgr.logical_to_physical_map[layer_id, logical_idx, 0].item()
+            master_global_phys = mgr.logical_to_physical_map[
+                layer_id, logical_idx, 0
+            ].item()
             master_rank = master_global_phys // num_local_physical
             master_local = master_global_phys % num_local_physical
             expected_fc1 = global_fc1[master_rank, master_local]
             expected_fc2 = global_fc2[master_rank, master_local]
             actual_fc1 = replica_weight_buffer[i, :fc1_numel]
             actual_fc2 = replica_weight_buffer[i, fc1_numel:]
-            assert torch.allclose(actual_fc1, expected_fc1, atol=1e-5), (
-                f"[{solver_name}] Weight sync mismatch for replica {i} on rank {rank}"
-            )
-            assert torch.allclose(actual_fc2, expected_fc2, atol=1e-5), (
-                f"[{solver_name}] Weight sync mismatch for replica {i} on rank {rank}"
-            )
+            assert torch.allclose(
+                actual_fc1, expected_fc1, atol=1e-5
+            ), f"[{solver_name}] Weight sync mismatch for replica {i} on rank {rank}"
+            assert torch.allclose(
+                actual_fc2, expected_fc2, atol=1e-5
+            ), f"[{solver_name}] Weight sync mismatch for replica {i} on rank {rank}"
 
         # 5. Grad reduce
         # Fill replica grad buffer with known values
@@ -278,9 +301,9 @@ def test_full_pipeline(args):
         dist.barrier()
 
         # After grad_reduce, replica grad buffer should be zeroed
-        assert (replica_grad_buffer == 0).all().item(), (
-            f"[{solver_name}] Replica grad buffer not zeroed after grad_reduce on rank {rank}"
-        )
+        assert (
+            (replica_grad_buffer == 0).all().item()
+        ), f"[{solver_name}] Replica grad buffer not zeroed after grad_reduce on rank {rank}"
 
         print_rank0(f"  {solver_name} solver: full pipeline PASS")
         mgr.destroy()
@@ -292,6 +315,7 @@ def test_full_pipeline(args):
 # ============================================================================
 # Test 3: GPU vs CPU solver produce equivalent reroute outputs
 # ============================================================================
+
 
 def test_reroute_gpu_vs_cpu_solver(args):
     """With same routing_map, GPU and CPU solver should produce valid reroute."""
@@ -305,12 +329,18 @@ def test_reroute_gpu_vs_cpu_solver(args):
     topk = args.topk
 
     mgr_cpu = create_manager(
-        group, NUM_LAYERS, args.num_local_master,
-        args.num_local_redundant, use_gpu_solver=False,
+        group,
+        NUM_LAYERS,
+        args.num_local_master,
+        args.num_local_redundant,
+        use_gpu_solver=False,
     )
     mgr_gpu = create_manager(
-        group, NUM_LAYERS, args.num_local_master,
-        args.num_local_redundant, use_gpu_solver=True,
+        group,
+        NUM_LAYERS,
+        args.num_local_master,
+        args.num_local_redundant,
+        use_gpu_solver=True,
     )
 
     L = mgr_cpu.num_global_logical_experts
@@ -325,8 +355,12 @@ def test_reroute_gpu_vs_cpu_solver(args):
     mgr_gpu.update_placement(layer_id, routing_map, verify_reduced_loads=True)
 
     # Both should produce valid reroute outputs
-    exp_probs_cpu, exp_map_cpu = mgr_cpu.reroute(layer_id, probs, routing_map, backend="cuda")
-    exp_probs_gpu, exp_map_gpu = mgr_gpu.reroute(layer_id, probs, routing_map, backend="cuda")
+    exp_probs_cpu, exp_map_cpu = mgr_cpu.reroute(
+        layer_id, probs, routing_map, backend="cuda"
+    )
+    exp_probs_gpu, exp_map_gpu = mgr_gpu.reroute(
+        layer_id, probs, routing_map, backend="cuda"
+    )
 
     # Both outputs should have same shape and valid structure
     assert exp_probs_cpu.shape == exp_probs_gpu.shape
@@ -357,6 +391,7 @@ def test_reroute_gpu_vs_cpu_solver(args):
 # Test 4: allocate_microbatch_slot with max_microbatches > 1
 # ============================================================================
 
+
 def test_microbatch_slots(args):
     """Test allocate_microbatch_slot with PP-style multi-microbatch mode."""
     print_rank0(f"\n{'='*60}")
@@ -369,8 +404,11 @@ def test_microbatch_slots(args):
 
     for solver_name, use_gpu in [("CPU", False), ("GPU", True)]:
         mgr = create_manager(
-            group, NUM_LAYERS, args.num_local_master,
-            args.num_local_redundant, use_gpu_solver=use_gpu,
+            group,
+            NUM_LAYERS,
+            args.num_local_master,
+            args.num_local_redundant,
+            use_gpu_solver=use_gpu,
             max_microbatches=max_mbs,
         )
 
@@ -383,7 +421,9 @@ def test_microbatch_slots(args):
         real_layer_id = 1
 
         # Register master pointers for this real layer
-        setup_master_ptrs(mgr, real_layer_id, fc1_numel, fc2_numel, args.num_local_master)
+        setup_master_ptrs(
+            mgr, real_layer_id, fc1_numel, fc2_numel, args.num_local_master
+        )
 
         # Allocate max_mbs virtual layer IDs and verify they're unique
         virtual_ids = []
@@ -391,15 +431,15 @@ def test_microbatch_slots(args):
             vid = mgr.allocate_microbatch_slot(real_layer_id)
             virtual_ids.append(vid)
 
-        assert len(set(virtual_ids)) == max_mbs, (
-            f"[{solver_name}] Virtual IDs not unique: {virtual_ids}"
-        )
+        assert (
+            len(set(virtual_ids)) == max_mbs
+        ), f"[{solver_name}] Virtual IDs not unique: {virtual_ids}"
 
         # Each virtual ID should be in range [real_layer_id * max_mbs, (real_layer_id+1) * max_mbs)
         for vid in virtual_ids:
-            assert real_layer_id * max_mbs <= vid < (real_layer_id + 1) * max_mbs, (
-                f"[{solver_name}] Virtual ID {vid} out of range for real_layer_id={real_layer_id}"
-            )
+            assert (
+                real_layer_id * max_mbs <= vid < (real_layer_id + 1) * max_mbs
+            ), f"[{solver_name}] Virtual ID {vid} out of range for real_layer_id={real_layer_id}"
 
         # Run update_placement + reroute on each virtual layer ID
         torch.manual_seed(42 + rank)
@@ -412,9 +452,9 @@ def test_microbatch_slots(args):
 
         # Next allocation should wrap around (slot 0 reused)
         vid_wrap = mgr.allocate_microbatch_slot(real_layer_id)
-        assert vid_wrap == virtual_ids[0], (
-            f"[{solver_name}] Wrap-around failed: got {vid_wrap}, expected {virtual_ids[0]}"
-        )
+        assert (
+            vid_wrap == virtual_ids[0]
+        ), f"[{solver_name}] Wrap-around failed: got {vid_wrap}, expected {virtual_ids[0]}"
 
         print_rank0(f"  {solver_name} solver: microbatch slot allocation PASS")
         mgr.destroy()
@@ -426,6 +466,7 @@ def test_microbatch_slots(args):
 # ============================================================================
 # Test 5: Public reroute() dispatcher selects correct backend
 # ============================================================================
+
 
 def test_reroute_dispatcher(args):
     """Test that reroute(backend='cuda') and reroute(backend='cpu') produce identical results."""
@@ -439,8 +480,11 @@ def test_reroute_dispatcher(args):
     topk = args.topk
 
     mgr = create_manager(
-        group, NUM_LAYERS, args.num_local_master,
-        args.num_local_redundant, use_gpu_solver=True,
+        group,
+        NUM_LAYERS,
+        args.num_local_master,
+        args.num_local_redundant,
+        use_gpu_solver=True,
     )
     L = mgr.num_global_logical_experts
     layer_id = 0
@@ -452,14 +496,18 @@ def test_reroute_dispatcher(args):
     probs = torch.randn(T, L, dtype=torch.float32, device="cuda")
 
     # Use public reroute() with both backends
-    exp_probs_cuda, exp_map_cuda = mgr.reroute(layer_id, probs, routing_map, backend="cuda")
-    exp_probs_cpu, exp_map_cpu = mgr.reroute(layer_id, probs, routing_map, backend="cpu")
+    exp_probs_cuda, exp_map_cuda = mgr.reroute(
+        layer_id, probs, routing_map, backend="cuda"
+    )
+    exp_probs_cpu, exp_map_cpu = mgr.reroute(
+        layer_id, probs, routing_map, backend="cpu"
+    )
 
     # They should produce identical results
     map_match = torch.equal(exp_map_cpu, exp_map_cuda)
-    assert map_match, (
-        f"routing_map mismatch: {(exp_map_cpu != exp_map_cuda).sum().item()} differing entries"
-    )
+    assert (
+        map_match
+    ), f"routing_map mismatch: {(exp_map_cpu != exp_map_cuda).sum().item()} differing entries"
 
     probs_match = torch.equal(exp_probs_cpu, exp_probs_cuda)
     if not probs_match:
@@ -474,6 +522,7 @@ def test_reroute_dispatcher(args):
 # ============================================================================
 # Main
 # ============================================================================
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -519,6 +568,7 @@ def main():
             all_passed = False
             print_rank0(f"  FAIL ({test_name}): {e}")
             import traceback
+
             if rank == 0:
                 traceback.print_exc()
 

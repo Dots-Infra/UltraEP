@@ -127,6 +127,7 @@ class _RerouteCUDAFunction(torch.autograd.Function):
         # Save for backward (plain attributes — avoids version-counter checks)
         ctx.manager_runtime = manager_runtime
         ctx.routing_map = routing_map
+        ctx.expanded_routing_map = expanded_routing_map
         ctx.layer_id = layer_id
 
         return expanded_probs, expanded_routing_map
@@ -141,5 +142,6 @@ class _RerouteCUDAFunction(torch.autograd.Function):
             ctx.layer_id,
             grad_expanded_probs,
             ctx.routing_map,
+            ctx.expanded_routing_map,
         )
         return grad_probs, None, None, None

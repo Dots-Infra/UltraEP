@@ -14,9 +14,9 @@ NUM_LAYERS = 48
 def apply_test_placement(manager, args, layer_id: int, placement_mode: str):
     if args.gpu_solver:
         num_global_logical_experts = manager.num_global_logical_experts
-        assert args.topk <= num_global_logical_experts, (
-            f"topk={args.topk} exceeds num_global_logical_experts={num_global_logical_experts}"
-        )
+        assert (
+            args.topk <= num_global_logical_experts
+        ), f"topk={args.topk} exceeds num_global_logical_experts={num_global_logical_experts}"
         routing_map = generate_routing_map_from_distribution(
             num_tokens=args.num_tokens,
             num_global_logical_experts=num_global_logical_experts,
@@ -80,6 +80,7 @@ def main():
         expert_fc2_numel=args.expert_fc2_numel,
         explicitly_destroy=True,
         use_gpu_solver=args.gpu_solver,
+        use_quota_eplb_solver=False,
     )
 
     num_nvl_ranks = manager.nvl_domain_size

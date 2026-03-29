@@ -29,18 +29,18 @@ static __device__ __forceinline__ int ceil_div(int64_t a, int64_t b) {
 // Weight Sync Task Build
 // ---------------------------------------------------------------------------
 
-__global__ void build_weight_sync_tasks_kernel(
-        const TaskBuildConfig* __restrict__ config,
-        const int32_t* __restrict__ p2l,
-        const int32_t* __restrict__ l2p,
-        const int32_t* __restrict__ lcnts,
-        void* const* __restrict__ remote_weight_ptrs,
-        const int64_t* __restrict__ local_master_fc1_ptrs,
-        const int64_t* __restrict__ local_master_fc2_ptrs,
-        WeightSyncTask* __restrict__ tasks,
-        int* __restrict__ tile_offsets,
-        int* __restrict__ task_metadata) {
-    if (threadIdx.x != 0) return;
+__global__ void build_weight_sync_tasks_kernel(const TaskBuildConfig* __restrict__ config,
+                                               const int32_t* __restrict__ p2l,
+                                               const int32_t* __restrict__ l2p,
+                                               const int32_t* __restrict__ lcnts,
+                                               void* const* __restrict__ remote_weight_ptrs,
+                                               const int64_t* __restrict__ local_master_fc1_ptrs,
+                                               const int64_t* __restrict__ local_master_fc2_ptrs,
+                                               WeightSyncTask* __restrict__ tasks,
+                                               int* __restrict__ tile_offsets,
+                                               int* __restrict__ task_metadata) {
+    if (threadIdx.x != 0)
+        return;
 
     // Load config into registers
     const int rank_idx = config->rank_idx;
@@ -59,7 +59,8 @@ __global__ void build_weight_sync_tasks_kernel(
         int master_log = p2l[master_phy];
         int num_replicas = lcnts[master_log] - 1;  // exclude the master itself
 
-        if (num_replicas <= 0) continue;
+        if (num_replicas <= 0)
+            continue;
 
         // FC1 task
         WeightSyncTask& fc1 = tasks[num_tasks];
@@ -80,8 +81,7 @@ __global__ void build_weight_sync_tasks_kernel(
             int replica_nvl_rank = replica_rank % num_nvl_ranks;
             int replica_local_offset = replica_phy % num_local_physical - num_local_master;
 
-            __nv_bfloat16* remote_buf =
-                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank]);
+            __nv_bfloat16* remote_buf = reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank]);
             __nv_bfloat16* remote_expert_base = remote_buf + replica_local_offset * total_numel;
 
             fc1.replica_remote_addrs[j] = remote_expert_base;
@@ -116,15 +116,16 @@ void build_weight_sync_tasks(const TaskBuildConfig* config_gpu,
                              int* task_metadata_gpu,
                              int* global_tile_counter_gpu,
                              cudaStream_t stream) {
-    build_weight_sync_tasks_kernel<<<1, 32, 0, stream>>>(
-        config_gpu,
-        p2l_gpu, l2p_gpu, lcnts_gpu,
-        remote_weight_ptrs_gpu,
-        local_master_fc1_ptrs_gpu,
-        local_master_fc2_ptrs_gpu,
-        tasks_gpu,
-        task_tile_offsets_gpu,
-        task_metadata_gpu);
+    build_weight_sync_tasks_kernel<<<1, 32, 0, stream>>>(config_gpu,
+                                                         p2l_gpu,
+                                                         l2p_gpu,
+                                                         lcnts_gpu,
+                                                         remote_weight_ptrs_gpu,
+                                                         local_master_fc1_ptrs_gpu,
+                                                         local_master_fc2_ptrs_gpu,
+                                                         tasks_gpu,
+                                                         task_tile_offsets_gpu,
+                                                         task_metadata_gpu);
 
     // Reset tile counter for the subsequent main kernel
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
@@ -134,18 +135,18 @@ void build_weight_sync_tasks(const TaskBuildConfig* config_gpu,
 // Grad Reduce Task Build
 // ---------------------------------------------------------------------------
 
-__global__ void build_grad_reduce_tasks_kernel(
-        const TaskBuildConfig* __restrict__ config,
-        const int32_t* __restrict__ p2l,
-        const int32_t* __restrict__ l2p,
-        const int32_t* __restrict__ lcnts,
-        void* const* __restrict__ remote_grad_ptrs,
-        const int64_t* __restrict__ local_master_fc1_ptrs,
-        const int64_t* __restrict__ local_master_fc2_ptrs,
-        GradReduceTask* __restrict__ tasks,
-        int* __restrict__ tile_offsets,
-        int* __restrict__ task_metadata) {
-    if (threadIdx.x != 0) return;
+__global__ void build_grad_reduce_tasks_kernel(const TaskBuildConfig* __restrict__ config,
+                                               const int32_t* __restrict__ p2l,
+                                               const int32_t* __restrict__ l2p,
+                                               const int32_t* __restrict__ lcnts,
+                                               void* const* __restrict__ remote_grad_ptrs,
+                                               const int64_t* __restrict__ local_master_fc1_ptrs,
+                                               const int64_t* __restrict__ local_master_fc2_ptrs,
+                                               GradReduceTask* __restrict__ tasks,
+                                               int* __restrict__ tile_offsets,
+                                               int* __restrict__ task_metadata) {
+    if (threadIdx.x != 0)
+        return;
 
     const int rank_idx = config->rank_idx;
     const int num_nvl_ranks = config->num_nvl_ranks;
@@ -172,8 +173,7 @@ __global__ void build_grad_reduce_tasks_kernel(
             int replica_nvl_rank = replica_rank % num_nvl_ranks;
             int replica_local_offset = replica_phy % num_local_physical - num_local_master;
 
-            float* remote_buf =
-                reinterpret_cast<float*>(remote_grad_ptrs[replica_nvl_rank]);
+            float* remote_buf = reinterpret_cast<float*>(remote_grad_ptrs[replica_nvl_rank]);
             float* remote_expert_base = remote_buf + replica_local_offset * total_numel;
 
             // FC1 task
@@ -214,15 +214,16 @@ void build_grad_reduce_tasks(const TaskBuildConfig* config_gpu,
                              int* task_metadata_gpu,
                              int* global_task_or_tile_counter_gpu,
                              cudaStream_t stream) {
-    build_grad_reduce_tasks_kernel<<<1, 32, 0, stream>>>(
-        config_gpu,
-        p2l_gpu, l2p_gpu, lcnts_gpu,
-        remote_grad_ptrs_gpu,
-        local_master_fc1_ptrs_gpu,
-        local_master_fc2_ptrs_gpu,
-        tasks_gpu,
-        task_tile_offsets_gpu,
-        task_metadata_gpu);
+    build_grad_reduce_tasks_kernel<<<1, 32, 0, stream>>>(config_gpu,
+                                                         p2l_gpu,
+                                                         l2p_gpu,
+                                                         lcnts_gpu,
+                                                         remote_grad_ptrs_gpu,
+                                                         local_master_fc1_ptrs_gpu,
+                                                         local_master_fc2_ptrs_gpu,
+                                                         tasks_gpu,
+                                                         task_tile_offsets_gpu,
+                                                         task_metadata_gpu);
 
     // Reset task/tile counter for the subsequent main kernel
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_task_or_tile_counter_gpu, 0, sizeof(int), stream));

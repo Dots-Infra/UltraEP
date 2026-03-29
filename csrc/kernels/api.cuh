@@ -162,6 +162,20 @@ void run_reroute_forward(const bool* routing_map,
                          int max_replicas,
                          cudaStream_t stream);
 
+void run_reroute_forward_quota(const bool* routing_map,
+                               const void* probs,
+                               const int32_t* l2p_map,
+                               const int32_t* lcnts,
+                               const int32_t* rank_quota_prefix,
+                               bool* expanded_routing_map,
+                               void* expanded_probs,
+                               int32_t* tile_counts,
+                               int T,
+                               int L,
+                               int P,
+                               int max_replicas,
+                               cudaStream_t stream);
+
 // Backward (row-parallel gather): gather gradients from [T,P] physical to [T,L] logical.
 // Each thread handles one (t, l) pair.  For active pairs, searches the forward's
 // expanded_routing_map to find the assigned physical replica, then gathers the gradient.
@@ -208,6 +222,8 @@ void topk_local_sum(const int64_t* topk_ids_ptr,
                     const int num_global_logical_experts,
                     int32_t* expert_loads_ptr,
                     cudaStream_t stream);
+
+void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads, int G, int L, cudaStream_t stream);
 
 // In-place remap topk_ids from logical to physical expert IDs using round-robin.
 //   topk_ids_ptr: [T, K] int64, device — modified in place
