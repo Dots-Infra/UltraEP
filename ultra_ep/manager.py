@@ -31,6 +31,10 @@ class Manager:
         quota_allow_zero_master_quota: bool = False,
         quota_oracle_mode: str = "fastt",
         quota_oracle_eps: float = 0.01,
+        weight_sync_plan_mode: str = "adaptive",
+        weight_sync_relay_min_replicas: int = 6,
+        weight_sync_relay_max_relays: int = 8,
+        weight_sync_relay_min_fanout_gain: int = 2,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -97,10 +101,26 @@ class Manager:
             raise ValueError(
                 "UltraEP only supports quota_oracle_mode='fastt' in the pruned quota solver path"
             )
+        normalized_weight_sync_plan_mode = weight_sync_plan_mode.lower().replace(
+            "_", ""
+        )
+        weight_sync_plan_mode_map = {
+            "direct": 0,
+            "adaptive": 1,
+            "forcerelay": 2,
+        }
+        if normalized_weight_sync_plan_mode not in weight_sync_plan_mode_map:
+            raise ValueError(
+                "weight_sync_plan_mode must be one of: 'direct', 'adaptive', 'force_relay'"
+            )
         self.use_quota_eplb_solver = use_quota_eplb_solver
         # Quota solver keeps placement/reroute data on GPU, so grad/weight task build
         # should also use the GPU path to avoid hot-path D2H placement sync.
         self.use_gpu_task_build = self.use_gpu_solver or self.use_quota_eplb_solver
+        self.weight_sync_plan_mode = normalized_weight_sync_plan_mode
+        self.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas
+        self.weight_sync_relay_max_relays = weight_sync_relay_max_relays
+        self.weight_sync_relay_min_fanout_gain = weight_sync_relay_min_fanout_gain
         self.runtime = _C.Manager(
             self.num_alloc_layers,
             num_local_master_experts,
@@ -116,6 +136,10 @@ class Manager:
             quota_min_tokens_per_replica,
             quota_allow_zero_master_quota,
             quota_oracle_eps,
+            weight_sync_plan_mode_map[normalized_weight_sync_plan_mode],
+            weight_sync_relay_min_replicas,
+            weight_sync_relay_max_relays,
+            weight_sync_relay_min_fanout_gain,
         )
         assert self.runtime.is_available()
 
@@ -345,9 +369,9 @@ class Manager:
         """
         Synchronize master weights to replicas.
 
-        Each local master broadcasts its weight to all corresponding remote replicas.
-        This is optimized for hot masters with multiple replicas - the weight is loaded
-        to shared memory once and then TMA stored to all replica destinations.
+        The runtime derives a deterministic communication plan from the current
+        placement. Mild cases stay on the flat direct fan-out path; extreme hot
+        masters may use a staged relay plan to reduce source-side bottlenecks.
 
         Args:
             layer_id: Virtual layer ID.  Used for placement map lookup in C++.

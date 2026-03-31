@@ -6,11 +6,14 @@
 namespace ultra_ep::kernels {
 
 // ============================================================================
-// Weight Sync Kernel: Broadcast Master Weights to Replicas
+// Weight Sync Kernel: Synchronize weights across the current task plan
 // ============================================================================
 //
-// Design for hot master optimization:
-// - Each task represents a master broadcasting to N replicas
+// Design:
+// - Each task is a single-source, multi-destination transfer for one weight shard.
+// - The source can be either:
+//     1. a local master weight (direct fan-out / stage 1), or
+//     2. a local relay replica buffer (relay forwarding / stage 2).
 // - For each tile:
 //   1. TMA Load tile from local master to SMEM (async)
 //   2. Issue N TMA stores to N different replica addresses
@@ -21,9 +24,9 @@ namespace ultra_ep::kernels {
 //   Tile 1:                         [TMA_Load₁] [wait_load] [wait_store₀] [TMA_Store₁...]
 //   Tile 2:                                                               [TMA_Load₂] ...
 //
-// This approach loads SMEM only once per tile, regardless of replica count.
-// For hot masters with many replicas, this is significantly more efficient
-// than separate load-store operations for each replica.
+// This approach loads SMEM only once per tile, regardless of destination count.
+// The higher-level planner may choose either a flat fan-out or a staged relay
+// topology; both are executed by the same persistent kernel.
 //
 // Tile-level parallelism with persistent kernel:
 // - Each CTA grabs tiles via atomic counter

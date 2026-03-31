@@ -223,6 +223,7 @@ class Manager {
     // Intermediate buffers for weight sync tasks
     kernels::WeightSyncTask* _weight_sync_tasks_cpu = nullptr;
     kernels::WeightSyncTask* _weight_sync_tasks_gpu = nullptr;
+    int _weight_sync_task_capacity = 0;
     // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
     int* _task_tile_offsets_cpu = nullptr;
 
@@ -257,6 +258,10 @@ class Manager {
     int32_t quota_min_tokens_per_replica_ = 1;
     bool quota_allow_zero_master_quota_ = true;
     float quota_oracle_eps_ = 0.01f;
+    int weight_sync_plan_mode_ = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive);
+    int weight_sync_relay_min_replicas_ = 6;
+    int weight_sync_relay_max_relays_ = 8;
+    int weight_sync_relay_min_fanout_gain_ = 2;
     std::vector<bool> placement_cpu_dirty_;
     // Shape: [num_global_logical_experts]
     int* global_logical_expert_loads_cpu = nullptr;  // pinned memory for CPU-side placement solver
@@ -285,7 +290,11 @@ public:
             const bool& quota_locality_aware = true,
             const int32_t& quota_min_tokens_per_replica = 1,
             const bool& quota_allow_zero_master_quota = true,
-            const float& quota_oracle_eps = 0.01f);
+            const float& quota_oracle_eps = 0.01f,
+            const int& weight_sync_plan_mode = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
+            const int& weight_sync_relay_min_replicas = 6,
+            const int& weight_sync_relay_max_relays = 8,
+            const int& weight_sync_relay_min_fanout_gain = 2);
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
@@ -370,8 +379,24 @@ public:
 
 static void register_apis(pybind11::module_& m) {
     pybind11::class_<Manager>(m, "Manager")
-        .def(pybind11::
-                 init<int, int, int, int64_t, int64_t, bool, bool, bool, float, bool, bool, int32_t, bool, float>(),
+        .def(pybind11::init<int,
+                            int,
+                            int,
+                            int64_t,
+                            int64_t,
+                            bool,
+                            bool,
+                            bool,
+                            float,
+                            bool,
+                            bool,
+                            int32_t,
+                            bool,
+                            float,
+                            int,
+                            int,
+                            int,
+                            int>(),
              pybind11::arg("num_layers"),
              pybind11::arg("num_local_master_experts"),
              pybind11::arg("num_local_redundant_experts"),
@@ -385,7 +410,11 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("quota_locality_aware") = true,
              pybind11::arg("quota_min_tokens_per_replica") = 1,
              pybind11::arg("quota_allow_zero_master_quota") = true,
-             pybind11::arg("quota_oracle_eps") = 0.01f)
+             pybind11::arg("quota_oracle_eps") = 0.01f,
+             pybind11::arg("weight_sync_plan_mode") = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
+             pybind11::arg("weight_sync_relay_min_replicas") = 6,
+             pybind11::arg("weight_sync_relay_max_relays") = 8,
+             pybind11::arg("weight_sync_relay_min_fanout_gain") = 2)
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
         .def("sync_placement_to_cpu", &Manager::sync_placement_to_cpu, pybind11::arg("layer_id") = -1)

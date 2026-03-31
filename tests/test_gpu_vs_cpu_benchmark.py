@@ -49,13 +49,15 @@ def solver_name(use_gpu_solver: bool) -> str:
 
 
 def validate_distribution(distribution: str):
-    if distribution not in ("uniform", "skewed"):
+    if distribution not in ("uniform", "skewed", "zipf", "single_hot"):
         raise ValueError(
-            f"Unsupported distribution: {distribution}. Expected one of: uniform, skewed"
+            "Unsupported distribution: "
+            f"{distribution}. Expected one of: uniform, skewed, zipf, single_hot"
         )
 
 
 def create_manager(
+    args,
     group,
     num_layers: int,
     num_local_master: int,
@@ -75,6 +77,10 @@ def create_manager(
         explicitly_destroy=True,
         use_gpu_solver=use_gpu_solver,
         use_quota_eplb_solver=False,
+        weight_sync_plan_mode=args.weight_sync_plan_mode,
+        weight_sync_relay_min_replicas=args.weight_sync_relay_min_replicas,
+        weight_sync_relay_max_relays=args.weight_sync_relay_max_relays,
+        weight_sync_relay_min_fanout_gain=args.weight_sync_relay_min_fanout_gain,
     )
 
 
@@ -142,6 +148,7 @@ def benchmark_update_placement(
 
     for use_gpu_solver in (False, True):
         manager = create_manager(
+            args,
             group,
             num_layers=NUM_LAYERS,
             num_local_master=num_local_master,
@@ -165,6 +172,8 @@ def benchmark_update_placement(
             num_local_master=num_local_master,
             num_nvl_ranks=manager.nvl_domain_size,
             hot_expert_ratio_per_nvl_domain=args.hot_expert_ratio_per_nvl_domain,
+            zipf_alpha=args.zipf_alpha,
+            single_hot_ratio=args.single_hot_ratio,
         )
 
         stats = bench_stats(
@@ -192,6 +201,7 @@ def benchmark_full_pipeline(
 
     for use_gpu_solver in (False, True):
         manager = create_manager(
+            args,
             group,
             num_layers=NUM_LAYERS,
             num_local_master=num_local_master,
@@ -215,6 +225,8 @@ def benchmark_full_pipeline(
             num_local_master=num_local_master,
             num_nvl_ranks=manager.nvl_domain_size,
             hot_expert_ratio_per_nvl_domain=args.hot_expert_ratio_per_nvl_domain,
+            zipf_alpha=args.zipf_alpha,
+            single_hot_ratio=args.single_hot_ratio,
         )
         probs = torch.randn(
             args.num_tokens,
@@ -413,7 +425,7 @@ def main():
     parser.add_argument(
         "--distributions",
         type=str,
-        default="uniform,skewed",
+        default="uniform,skewed,zipf,single_hot",
         help="Comma-separated load distributions for placement/pipeline benchmarks",
     )
     parser.add_argument("--num-local-master-experts", type=int, default=4)
@@ -428,8 +440,20 @@ def main():
         "--grad-reduce-mode", choices=("low_sm", "high_sm"), default="low_sm"
     )
     parser.add_argument("--hot-expert-ratio-per-nvl-domain", type=float, default=0.03)
+    parser.add_argument("--zipf-alpha", type=float, default=1.2)
+    parser.add_argument("--single-hot-ratio", type=float, default=0.8)
     parser.add_argument(
-        "--scaling-distribution", choices=("uniform", "skewed"), default="skewed"
+        "--weight-sync-plan-mode",
+        choices=("direct", "adaptive", "force_relay"),
+        default="adaptive",
+    )
+    parser.add_argument("--weight-sync-relay-min-replicas", type=int, default=6)
+    parser.add_argument("--weight-sync-relay-max-relays", type=int, default=8)
+    parser.add_argument("--weight-sync-relay-min-fanout-gain", type=int, default=2)
+    parser.add_argument(
+        "--scaling-distribution",
+        choices=("uniform", "skewed", "zipf", "single_hot"),
+        default="skewed",
     )
     parser.add_argument("--scaling-num-local-master", type=str, default="4,8,16")
     parser.add_argument("--scaling-num-local-redundant", type=str, default="2,4,8")
@@ -448,7 +472,8 @@ def main():
         validate_distribution(distribution)
     print_rank0(
         f"Config: world_size={world_size}, num_tokens={args.num_tokens}, topk={args.topk}, "
-        f"master={args.num_local_master_experts}, redundant={args.num_local_redundant_experts}"
+        f"master={args.num_local_master_experts}, redundant={args.num_local_redundant_experts}, "
+        f"weight_sync_plan_mode={args.weight_sync_plan_mode}"
     )
 
     try:

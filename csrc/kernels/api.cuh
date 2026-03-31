@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <tuple>
 
 #include "../config.hpp"
@@ -53,6 +54,12 @@ void run_grad_reduce_high_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
 // Weight Sync: Broadcast master weights to replicas
 // ============================================================================
 
+enum class WeightSyncPlanMode : int32_t {
+    kDirect = 0,
+    kAdaptive = 1,
+    kForceRelay = 2,
+};
+
 // A broadcast task from one master to multiple replicas
 // This structure enables loading SMEM once and TMA storing to multiple destinations
 struct WeightSyncTask {
@@ -99,7 +106,82 @@ struct TaskBuildConfig {
     int64_t expert_fc2_numel;
     int64_t expert_total_numel;
     int max_replicas_dim;
+    int weight_sync_plan_mode;
+    int weight_sync_relay_min_replicas;
+    int weight_sync_relay_max_relays;
+    int weight_sync_relay_min_fanout_gain;
 };
+
+static __host__ __device__ __forceinline__ int ceil_div_int(const int a, const int b) {
+    return (a + b - 1) / b;
+}
+
+static __host__ __device__ __forceinline__ int floor_sqrt_int(const int x) {
+    int root = 0;
+    while ((root + 1) * (root + 1) <= x) {
+        ++root;
+    }
+    return root;
+}
+
+static __host__ __device__ __forceinline__ int choose_weight_sync_relay_count(const int num_replicas,
+                                                                              const TaskBuildConfig& config) {
+    if (num_replicas <= 1) {
+        return 0;
+    }
+
+    int relay_count = floor_sqrt_int(num_replicas);
+    if (relay_count < 1) {
+        relay_count = 1;
+    }
+    if (config.weight_sync_relay_max_relays > 0 && relay_count > config.weight_sync_relay_max_relays) {
+        relay_count = config.weight_sync_relay_max_relays;
+    }
+    if (relay_count >= num_replicas) {
+        relay_count = num_replicas - 1;
+    }
+    return relay_count;
+}
+
+static __host__ __device__ __forceinline__ int relay_stage_child_count(const int num_replicas,
+                                                                       const int relay_count,
+                                                                       const int relay_idx) {
+    const int leaf_count = num_replicas - relay_count;
+    if (leaf_count <= 0 || relay_idx < 0 || relay_idx >= relay_count || relay_idx >= leaf_count) {
+        return 0;
+    }
+    return ceil_div_int(leaf_count - relay_idx, relay_count);
+}
+
+static __host__ __device__ __forceinline__ int relay_stage_leaf_owner(const int leaf_idx, const int relay_count) {
+    return leaf_idx % relay_count;
+}
+
+static __host__ __device__ __forceinline__ bool should_use_weight_sync_relay(const int num_replicas,
+                                                                             const TaskBuildConfig& config) {
+    if (config.weight_sync_plan_mode == static_cast<int>(WeightSyncPlanMode::kDirect)) {
+        return false;
+    }
+
+    const int relay_count = choose_weight_sync_relay_count(num_replicas, config);
+    if (relay_count <= 0) {
+        return false;
+    }
+
+    if (config.weight_sync_plan_mode == static_cast<int>(WeightSyncPlanMode::kForceRelay)) {
+        return true;
+    }
+
+    if (num_replicas < config.weight_sync_relay_min_replicas) {
+        return false;
+    }
+
+    const int relay_sender_fanout = relay_count;
+    const int relay_child_fanout = ceil_div_int(num_replicas - relay_count, relay_count);
+    const int relay_critical_fanout =
+        relay_sender_fanout > relay_child_fanout ? relay_sender_fanout : relay_child_fanout;
+    return (num_replicas - relay_critical_fanout) >= config.weight_sync_relay_min_fanout_gain;
+}
 
 // Build weight sync task array on GPU from placement data.
 // Writes tasks, tile_offsets, and task_metadata ({total_tasks, total_tiles}).
@@ -116,6 +198,20 @@ void build_weight_sync_tasks(const TaskBuildConfig* config_gpu,
                              int* task_metadata_gpu,
                              int* global_tile_counter_gpu,
                              cudaStream_t stream);
+
+// Build relay-stage weight sync tasks on GPU. Each task reads from a local relay
+// replica buffer and forwards to a subset of downstream replicas.
+void build_weight_sync_relay_tasks(const TaskBuildConfig* config_gpu,
+                                   const int32_t* p2l_gpu,
+                                   const int32_t* l2p_gpu,
+                                   const int32_t* lcnts_gpu,
+                                   void* const* remote_weight_ptrs_gpu,
+                                   __nv_bfloat16* local_replica_weight_buffer,
+                                   WeightSyncTask* tasks_gpu,
+                                   int* task_tile_offsets_gpu,
+                                   int* task_metadata_gpu,
+                                   int* global_tile_counter_gpu,
+                                   cudaStream_t stream);
 
 // Build grad reduce task array on GPU from placement data.
 void build_grad_reduce_tasks(const TaskBuildConfig* config_gpu,
