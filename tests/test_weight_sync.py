@@ -63,6 +63,78 @@ def relay_child_count(num_replicas: int, relay_count: int, relay_idx: int) -> in
     return (leaf_count - relay_idx + relay_count - 1) // relay_count
 
 
+def build_replica_infos(
+    logical_to_physical_map,
+    layer_id: int,
+    logical_idx: int,
+    num_replicas: int,
+    num_local_physical_experts: int,
+    nvl_domain_size: int,
+):
+    replica_infos = []
+    for replica_idx in range(num_replicas):
+        global_phys_idx = logical_to_physical_map[
+            layer_id, logical_idx, replica_idx + 1
+        ].item()
+        replica_rank = global_phys_idx // num_local_physical_experts
+        replica_infos.append(
+            {
+                "replica_idx": replica_idx,
+                "global_phys_idx": global_phys_idx,
+                "rank": replica_rank,
+                "nvl_rank": replica_rank % nvl_domain_size,
+            }
+        )
+    return replica_infos
+
+
+def select_cold_relays(replica_infos, sender_load_bytes, relay_count: int):
+    selected = []
+    used_ranks = set()
+    remaining = list(replica_infos)
+    for _ in range(relay_count):
+        best = min(
+            remaining,
+            key=lambda info: (
+                1 if info["rank"] in used_ranks else 0,
+                sender_load_bytes[info["nvl_rank"]],
+                info["rank"],
+                info["replica_idx"],
+            ),
+        )
+        selected.append(best)
+        used_ranks.add(best["rank"])
+        remaining = [
+            info for info in remaining if info["replica_idx"] != best["replica_idx"]
+        ]
+    return selected, remaining
+
+
+def assign_leaves_to_relays(selected_relays, leaves, sender_load_bytes, weight_bytes):
+    relay_children = [[] for _ in selected_relays]
+    projected_loads = [
+        sender_load_bytes[relay["nvl_rank"]] for relay in selected_relays
+    ]
+
+    for leaf_order, leaf in enumerate(leaves):
+        if leaf_order < len(selected_relays):
+            owner = leaf_order
+        else:
+            owner = min(
+                range(len(selected_relays)),
+                key=lambda relay_idx: (
+                    projected_loads[relay_idx],
+                    len(relay_children[relay_idx]),
+                    selected_relays[relay_idx]["rank"],
+                    selected_relays[relay_idx]["replica_idx"],
+                ),
+            )
+        relay_children[owner].append(leaf)
+        projected_loads[owner] += weight_bytes
+
+    return relay_children
+
+
 def should_use_relay(
     num_replicas: int,
     plan_mode: str,
@@ -183,6 +255,10 @@ def analyze_weight_sync_plan(
     manager, args, layer_id: int, plan_mode: str
 ) -> Dict[str, object]:
     world_size = manager.num_ranks
+    nvl_domain_size = manager.nvl_domain_size
+    physical_to_logical_map = manager.physical_to_logical_map
+    logical_to_physical_map = manager.logical_to_physical_map
+    logical_replica_counts = manager.logical_replica_counts
     weight_bytes_per_expert = manager.expert_total_numel * WEIGHT_ELEMENT_BYTES
     direct_sender_bytes = [0.0 for _ in range(world_size)]
     direct_max_fanout = [0 for _ in range(world_size)]
@@ -192,61 +268,82 @@ def analyze_weight_sync_plan(
     plan_stage2_max_fanout = [0 for _ in range(world_size)]
     relay_logical_experts = 0
 
-    for rank in range(world_size):
-        for local_master_idx in range(manager.num_local_master_experts):
-            global_phys_idx = (
-                rank * manager.num_local_physical_experts + local_master_idx
-            )
-            logical_idx = manager.physical_to_logical_map[
-                layer_id, global_phys_idx
-            ].item()
-            num_replicas = (
-                manager.logical_replica_counts[layer_id, logical_idx].item() - 1
-            )
-            if num_replicas <= 0:
-                continue
+    num_domains = world_size // nvl_domain_size
+    for domain_idx in range(num_domains):
+        sender_load_bytes = [0.0 for _ in range(nvl_domain_size)]
+        domain_base_rank = domain_idx * nvl_domain_size
 
-            direct_sender_bytes[rank] += num_replicas * weight_bytes_per_expert
-            direct_max_fanout[rank] = max(direct_max_fanout[rank], num_replicas)
+        for domain_nvl_rank in range(nvl_domain_size):
+            rank = domain_base_rank + domain_nvl_rank
+            for local_master_idx in range(manager.num_local_master_experts):
+                global_phys_idx = (
+                    rank * manager.num_local_physical_experts + local_master_idx
+                )
+                logical_idx = physical_to_logical_map[layer_id, global_phys_idx].item()
+                num_replicas = logical_replica_counts[layer_id, logical_idx].item() - 1
+                if num_replicas <= 0:
+                    continue
 
-            if should_use_relay(
-                num_replicas,
-                plan_mode,
-                args.weight_sync_relay_min_replicas,
-                args.weight_sync_relay_max_relays,
-                args.weight_sync_relay_min_fanout_gain,
-            ):
-                relay_logical_experts += 1
-                relay_count = choose_relay_count(
-                    num_replicas, args.weight_sync_relay_max_relays
-                )
-                plan_stage1_bytes[rank] += relay_count * weight_bytes_per_expert
-                plan_stage1_max_fanout[rank] = max(
-                    plan_stage1_max_fanout[rank], relay_count
-                )
-                for relay_idx in range(relay_count):
-                    relay_global_phys_idx = manager.logical_to_physical_map[
-                        layer_id, logical_idx, relay_idx + 1
-                    ].item()
-                    relay_rank = (
-                        relay_global_phys_idx // manager.num_local_physical_experts
+                direct_sender_bytes[rank] += num_replicas * weight_bytes_per_expert
+                direct_max_fanout[rank] = max(direct_max_fanout[rank], num_replicas)
+
+                if should_use_relay(
+                    num_replicas,
+                    plan_mode,
+                    args.weight_sync_relay_min_replicas,
+                    args.weight_sync_relay_max_relays,
+                    args.weight_sync_relay_min_fanout_gain,
+                ):
+                    relay_logical_experts += 1
+                    relay_count = choose_relay_count(
+                        num_replicas, args.weight_sync_relay_max_relays
                     )
-                    child_count = relay_child_count(
-                        num_replicas, relay_count, relay_idx
+                    replica_infos = build_replica_infos(
+                        logical_to_physical_map,
+                        layer_id,
+                        logical_idx,
+                        num_replicas,
+                        manager.num_local_physical_experts,
+                        nvl_domain_size,
                     )
-                    if child_count <= 0:
-                        continue
-                    plan_stage2_bytes[relay_rank] += (
-                        child_count * weight_bytes_per_expert
+                    selected_relays, leaf_replicas = select_cold_relays(
+                        replica_infos, sender_load_bytes, relay_count
                     )
-                    plan_stage2_max_fanout[relay_rank] = max(
-                        plan_stage2_max_fanout[relay_rank], child_count
+                    relay_children = assign_leaves_to_relays(
+                        selected_relays,
+                        leaf_replicas,
+                        sender_load_bytes,
+                        weight_bytes_per_expert,
                     )
-            else:
-                plan_stage1_bytes[rank] += num_replicas * weight_bytes_per_expert
-                plan_stage1_max_fanout[rank] = max(
-                    plan_stage1_max_fanout[rank], num_replicas
-                )
+
+                    plan_stage1_bytes[rank] += relay_count * weight_bytes_per_expert
+                    plan_stage1_max_fanout[rank] = max(
+                        plan_stage1_max_fanout[rank], relay_count
+                    )
+                    sender_load_bytes[domain_nvl_rank] += (
+                        relay_count * weight_bytes_per_expert
+                    )
+
+                    for relay_idx, relay in enumerate(selected_relays):
+                        child_count = len(relay_children[relay_idx])
+                        relay_rank = relay["rank"]
+                        plan_stage2_bytes[relay_rank] += (
+                            child_count * weight_bytes_per_expert
+                        )
+                        plan_stage2_max_fanout[relay_rank] = max(
+                            plan_stage2_max_fanout[relay_rank], child_count
+                        )
+                        sender_load_bytes[relay["nvl_rank"]] += (
+                            child_count * weight_bytes_per_expert
+                        )
+                else:
+                    plan_stage1_bytes[rank] += num_replicas * weight_bytes_per_expert
+                    plan_stage1_max_fanout[rank] = max(
+                        plan_stage1_max_fanout[rank], num_replicas
+                    )
+                    sender_load_bytes[domain_nvl_rank] += (
+                        num_replicas * weight_bytes_per_expert
+                    )
 
     flat_critical_bytes = max(direct_sender_bytes) if direct_sender_bytes else 0.0
     relay_stage1_critical_bytes = max(plan_stage1_bytes) if plan_stage1_bytes else 0.0
@@ -340,6 +437,7 @@ def main():
 
     num_nvl_ranks = None
     ranks_to_print = None
+    summary_rows = []
 
     def print_on_leader_ranks(msg: str):
         if rank in ranks_to_print:
@@ -534,7 +632,72 @@ def main():
                 f"stage2={max(plan_metrics['plan_stage2_max_fanout'])}\n"
             )
 
+            summary_rows.append(
+                {
+                    "distribution": distribution,
+                    "plan_mode": plan_mode,
+                    "avg_time_ms": avg_time_ms,
+                    "avg_bandwidth_gbps": avg_bandwidth_gbps,
+                    "relay_logical_experts": plan_metrics["relay_logical_experts"],
+                    "serial_upper_bound_speedup": plan_metrics[
+                        "serial_upper_bound_speedup"
+                    ],
+                    "overlap_upper_bound_speedup": plan_metrics[
+                        "overlap_upper_bound_speedup"
+                    ],
+                }
+            )
+
         manager.destroy()
+
+    if rank in ranks_to_print and summary_rows:
+        summary_by_distribution = {}
+        for row in summary_rows:
+            summary_by_distribution.setdefault(row["distribution"], {})[
+                row["plan_mode"]
+            ] = row
+
+        print("=" * 80, flush=True)
+        print("Summary Across Plans", flush=True)
+        print("=" * 80, flush=True)
+        for distribution in distributions:
+            plan_rows = summary_by_distribution.get(distribution, {})
+            if not plan_rows:
+                continue
+
+            direct_row = plan_rows.get("direct")
+            print(f"Distribution: {distribution}", flush=True)
+            print(
+                "plan         lat(ms)   vs_direct   avg_bw(GB/s)   relay_exp   serial_ub   overlap_ub",
+                flush=True,
+            )
+            for plan_mode in plan_modes:
+                row = plan_rows.get(plan_mode)
+                if row is None:
+                    continue
+                speedup_vs_direct = (
+                    direct_row["avg_time_ms"] / row["avg_time_ms"]
+                    if direct_row is not None and row["avg_time_ms"] > 1e-6
+                    else 1.0
+                )
+                print(
+                    f"{plan_mode:<12}"
+                    f"{row['avg_time_ms']:>8.3f}"
+                    f"{speedup_vs_direct:>12.2f}x"
+                    f"{row['avg_bandwidth_gbps']:>15.2f}"
+                    f"{row['relay_logical_experts']:>12}"
+                    f"{row['serial_upper_bound_speedup']:>12.2f}x"
+                    f"{row['overlap_upper_bound_speedup']:>12.2f}x",
+                    flush=True,
+                )
+
+            best_row = min(plan_rows.values(), key=lambda row: row["avg_time_ms"])
+            print(
+                f"Best latency plan: {best_row['plan_mode']} "
+                f"({best_row['avg_time_ms']:.3f} ms)",
+                flush=True,
+            )
+            print("-" * 80, flush=True)
 
     dist.destroy_process_group()
 

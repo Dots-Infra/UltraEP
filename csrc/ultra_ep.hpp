@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -196,6 +197,7 @@ class Manager {
 
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
+    at::cuda::CUDAStream relay_stream;
     // Completion event for the latest placement update / forward-buffer pre-zero.
     // Train mode tracks one slot per layer; inference mode uses slot 0 as the shared buffer.
     std::vector<std::optional<EventHandle>> placement_ready_events_;
@@ -213,6 +215,7 @@ class Manager {
     // Shape: [num_nvl_ranks,]
     void* global_replica_weight_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
     void* global_replica_grad_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
+    uint64_t* global_weight_sync_ready_flag_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
 
     // Intermediate buffers for grad reduce tasks
     kernels::GradReduceTask* _grad_reduce_tasks_cpu = nullptr;
@@ -224,17 +227,28 @@ class Manager {
     kernels::WeightSyncTask* _weight_sync_tasks_cpu = nullptr;
     kernels::WeightSyncTask* _weight_sync_tasks_gpu = nullptr;
     int _weight_sync_task_capacity = 0;
-    // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for weight sync
+    // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for stage-1
+    // weight sync and grad_reduce.
     int* _task_tile_offsets_cpu = nullptr;
+    int* _weight_sync_task_remaining_tiles_gpu = nullptr;
+    kernels::WeightSyncTask* _relay_weight_sync_tasks_cpu = nullptr;
+    kernels::WeightSyncTask* _relay_weight_sync_tasks_gpu = nullptr;
+    int* _relay_task_tile_offsets_cpu = nullptr;
+    int* _relay_task_tile_offsets_gpu = nullptr;
+    int* _relay_task_metadata_gpu = nullptr;
+    int* _relay_global_tile_counter_gpu = nullptr;
+    uint64_t* local_weight_sync_ready_flags = nullptr;
+    uint64_t _weight_sync_epoch = 0;
 
     // Task metadata: [total_tasks, total_tiles] written by CPU or GPU task build path,
-    // read by the main kernel from device memory.
+    // read by the stage-1 kernel from device memory.
     int* _task_metadata_gpu = nullptr;
 
     // GPU task build support: config + remote pointer tables + staging buffer
     kernels::TaskBuildConfig* _task_build_config_gpu = nullptr;
     void** _remote_weight_ptrs_gpu = nullptr;           // [MAX_NVL_DOMAIN_SIZE]
     void** _remote_grad_ptrs_gpu = nullptr;             // [MAX_NVL_DOMAIN_SIZE]
+    uint64_t** _remote_ready_flag_ptrs_gpu = nullptr;   // [MAX_NVL_DOMAIN_SIZE]
     int64_t* _local_master_ptrs_staging_gpu = nullptr;  // [2 * num_local_master_experts]
     // Pre-computed upper bounds for GPU-path grid sizing
     int _max_ws_total_tiles = 0;

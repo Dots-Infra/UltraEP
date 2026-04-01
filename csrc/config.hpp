@@ -19,6 +19,9 @@
 // Used by Manager for pre-computing grid size upper bounds.
 #define WEIGHT_SYNC_TILE_ELEMENTS (32 * 1024 / WEIGHT_ELEMENT_SIZE)  // 16384
 #define GRAD_REDUCE_TILE_ELEMENTS (64 * 1024 / GRAD_ELEMENT_SIZE)    // 16384
+// Relay streaming subdivides hot-expert sync into chunk-sized tasks so stage 2
+// can begin forwarding as soon as a relay chunk is complete.
+#define WEIGHT_SYNC_RELAY_CHUNK_TILES 8
 
 // Reroute forward tile size (tokens per tile in the two-pass forward kernel).
 // Defined here so it is accessible from both .cu (via config.cuh) and .cpp files.

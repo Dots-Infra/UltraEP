@@ -67,6 +67,10 @@ struct WeightSyncTask {
     __nv_bfloat16* replica_remote_addrs[MAX_NVL_DOMAIN_SIZE - 1];  // Destinations: replica addresses
     int num_replicas;                                              // Number of replicas (1 to MAX_NVL_DOMAIN_SIZE-1)
     size_t numel;                                                  // Number of elements
+    int wait_ready_slot;                                           // Local relay-ready flag slot, -1 if no wait
+    int num_ready_signals;                                         // Number of remote relay-ready flags to set
+    int ready_signal_slots[MAX_NVL_DOMAIN_SIZE - 1];               // Symmetric ready-flag slot per relay
+    int ready_signal_nvl_ranks[MAX_NVL_DOMAIN_SIZE - 1];           // Target NVL-domain rank slot per relay-ready signal
 };
 
 // Run weight sync operation — CPU task-build path
@@ -77,18 +81,28 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                      int* task_tile_offsets_gpu,
                      int* task_tile_offsets_cpu,
                      int* task_metadata_gpu,
+                     int* task_remaining_tiles_gpu,
+                     uint64_t* local_ready_flags,
+                     uint64_t* const* remote_ready_flag_ptrs_gpu,
+                     uint64_t current_epoch,
                      const int total_tasks,
                      cudaStream_t stream,
-                     const int num_device_sms);
+                     const int num_device_sms,
+                     const int cta_multiplier = 2);
 
 // Run weight sync using GPU-resident tasks (no H2D copy)
 void run_weight_sync_from_gpu(WeightSyncTask* tasks_gpu,
                               int* task_tile_offsets_gpu,
                               int* task_metadata_gpu,
                               int* global_tile_counter_gpu,
+                              int* task_remaining_tiles_gpu,
+                              uint64_t* local_ready_flags,
+                              uint64_t* const* remote_ready_flag_ptrs_gpu,
+                              uint64_t current_epoch,
                               cudaStream_t stream,
                               int num_device_sms,
-                              int max_possible_tiles);
+                              int max_possible_tiles,
+                              int cta_multiplier = 2);
 
 // ============================================================================
 // GPU Task Build: Build weight_sync/grad_reduce tasks entirely on GPU
@@ -116,6 +130,26 @@ static __host__ __device__ __forceinline__ int ceil_div_int(const int a, const i
     return (a + b - 1) / b;
 }
 
+static __host__ __device__ __forceinline__ int weight_sync_num_tiles(const size_t numel) {
+    return static_cast<int>((numel + WEIGHT_SYNC_TILE_ELEMENTS - 1) / WEIGHT_SYNC_TILE_ELEMENTS);
+}
+
+static __host__ __device__ __forceinline__ size_t weight_sync_chunk_offset_elements(const int chunk_idx) {
+    return static_cast<size_t>(chunk_idx) * WEIGHT_SYNC_RELAY_CHUNK_TILES * WEIGHT_SYNC_TILE_ELEMENTS;
+}
+
+static __host__ __device__ __forceinline__ size_t weight_sync_chunk_numel(const size_t total_numel,
+                                                                          const int chunk_idx) {
+    const size_t chunk_offset = weight_sync_chunk_offset_elements(chunk_idx);
+    if (chunk_offset >= total_numel) {
+        return 0;
+    }
+
+    const size_t chunk_capacity = static_cast<size_t>(WEIGHT_SYNC_RELAY_CHUNK_TILES) * WEIGHT_SYNC_TILE_ELEMENTS;
+    const size_t remaining = total_numel - chunk_offset;
+    return remaining < chunk_capacity ? remaining : chunk_capacity;
+}
+
 static __host__ __device__ __forceinline__ int floor_sqrt_int(const int x) {
     int root = 0;
     while ((root + 1) * (root + 1) <= x) {
@@ -141,6 +175,23 @@ static __host__ __device__ __forceinline__ int choose_weight_sync_relay_count(co
         relay_count = num_replicas - 1;
     }
     return relay_count;
+}
+
+static __host__ __device__ __forceinline__ int weight_sync_num_chunks(const size_t numel) {
+    return ceil_div_int(weight_sync_num_tiles(numel), WEIGHT_SYNC_RELAY_CHUNK_TILES);
+}
+
+static __host__ __device__ __forceinline__ int max_weight_sync_relay_chunks_per_shard(const TaskBuildConfig& config) {
+    const size_t max_numel = static_cast<size_t>(
+        config.expert_fc1_numel > config.expert_fc2_numel ? config.expert_fc1_numel : config.expert_fc2_numel);
+    return weight_sync_num_chunks(max_numel);
+}
+
+static __host__ __device__ __forceinline__ int weight_sync_ready_flag_slot(const TaskBuildConfig& config,
+                                                                           const int local_replica_offset,
+                                                                           const int shard_idx,
+                                                                           const int chunk_idx) {
+    return ((local_replica_offset * 2 + shard_idx) * max_weight_sync_relay_chunks_per_shard(config)) + chunk_idx;
 }
 
 static __host__ __device__ __forceinline__ int relay_stage_child_count(const int num_replicas,
@@ -183,35 +234,27 @@ static __host__ __device__ __forceinline__ bool should_use_weight_sync_relay(con
     return (num_replicas - relay_critical_fanout) >= config.weight_sync_relay_min_fanout_gain;
 }
 
-// Build weight sync task array on GPU from placement data.
-// Writes tasks, tile_offsets, and task_metadata ({total_tasks, total_tiles}).
-// Also resets global_tile_counter to 0.
-void build_weight_sync_tasks(const TaskBuildConfig* config_gpu,
-                             const int32_t* p2l_gpu,
-                             const int32_t* l2p_gpu,
-                             const int32_t* lcnts_gpu,
-                             void* const* remote_weight_ptrs_gpu,
-                             const int64_t* local_master_fc1_ptrs_gpu,
-                             const int64_t* local_master_fc2_ptrs_gpu,
-                             WeightSyncTask* tasks_gpu,
-                             int* task_tile_offsets_gpu,
-                             int* task_metadata_gpu,
-                             int* global_tile_counter_gpu,
-                             cudaStream_t stream);
-
-// Build relay-stage weight sync tasks on GPU. Each task reads from a local relay
-// replica buffer and forwards to a subset of downstream replicas.
-void build_weight_sync_relay_tasks(const TaskBuildConfig* config_gpu,
-                                   const int32_t* p2l_gpu,
-                                   const int32_t* l2p_gpu,
-                                   const int32_t* lcnts_gpu,
-                                   void* const* remote_weight_ptrs_gpu,
-                                   __nv_bfloat16* local_replica_weight_buffer,
-                                   WeightSyncTask* tasks_gpu,
-                                   int* task_tile_offsets_gpu,
-                                   int* task_metadata_gpu,
-                                   int* global_tile_counter_gpu,
-                                   cudaStream_t stream);
+// Build stage-1 and stage-2 weight sync task arrays on GPU from placement data.
+// Stage 1 seeds relays (or directly fans out); stage 2 waits on per-relay ready
+// flags and forwards chunked relay traffic to downstream replicas.
+void build_weight_sync_task_lists(const TaskBuildConfig* config_gpu,
+                                  const int32_t* p2l_gpu,
+                                  const int32_t* l2p_gpu,
+                                  const int32_t* lcnts_gpu,
+                                  void* const* remote_weight_ptrs_gpu,
+                                  const int64_t* local_master_fc1_ptrs_gpu,
+                                  const int64_t* local_master_fc2_ptrs_gpu,
+                                  __nv_bfloat16* local_replica_weight_buffer,
+                                  WeightSyncTask* stage1_tasks_gpu,
+                                  int* stage1_task_tile_offsets_gpu,
+                                  int* stage1_task_metadata_gpu,
+                                  int* stage1_task_remaining_tiles_gpu,
+                                  int* stage1_global_tile_counter_gpu,
+                                  WeightSyncTask* stage2_tasks_gpu,
+                                  int* stage2_task_tile_offsets_gpu,
+                                  int* stage2_task_metadata_gpu,
+                                  int* stage2_global_tile_counter_gpu,
+                                  cudaStream_t stream);
 
 // Build grad reduce task array on GPU from placement data.
 void build_grad_reduce_tasks(const TaskBuildConfig* config_gpu,

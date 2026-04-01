@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -293,163 +294,292 @@ const bool* RerouteOutputBuffer::get_fwd_expanded_rmap_ptr(const int layer_id) c
 
 namespace {
 
-int build_weight_sync_stage1_tasks_cpu(const kernels::TaskBuildConfig& config,
-                                       const int32_t* p2l_ptr,
-                                       const int32_t* l2p_ptr,
-                                       const int32_t* lcnts_ptr,
-                                       void* const* remote_weight_ptrs,
-                                       void** local_master_fc1_weight_ptrs,
-                                       void** local_master_fc2_weight_ptrs,
-                                       kernels::WeightSyncTask* tasks_cpu) {
-    int num_tasks = 0;
-    for (int i = 0; i < config.num_local_master_experts; ++i) {
-        const int master_global_phy_idx = config.rank_idx * config.num_local_physical_experts + i;
-        const int master_global_log_idx = p2l_ptr[master_global_phy_idx];
-        const int num_replicas = lcnts_ptr[master_global_log_idx] - 1;
-        if (num_replicas <= 0) {
-            continue;
-        }
-
-        const bool use_relay = kernels::should_use_weight_sync_relay(num_replicas, config);
-        const int stage_targets =
-            use_relay ? kernels::choose_weight_sync_relay_count(num_replicas, config) : num_replicas;
-        if (stage_targets <= 0) {
-            continue;
-        }
-
-        __nv_bfloat16* local_master_fc1_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc1_weight_ptrs[i]);
-        __nv_bfloat16* local_master_fc2_weight_ptr = reinterpret_cast<__nv_bfloat16*>(local_master_fc2_weight_ptrs[i]);
-
-        kernels::WeightSyncTask& fc1_task = tasks_cpu[num_tasks];
-        fc1_task.master_local_addr = local_master_fc1_weight_ptr;
-        fc1_task.num_replicas = stage_targets;
-        fc1_task.numel = static_cast<size_t>(config.expert_fc1_numel);
-
-        kernels::WeightSyncTask& fc2_task = tasks_cpu[num_tasks + 1];
-        fc2_task.master_local_addr = local_master_fc2_weight_ptr;
-        fc2_task.num_replicas = stage_targets;
-        fc2_task.numel = static_cast<size_t>(config.expert_fc2_numel);
-
-        for (int j = 0; j < stage_targets; ++j) {
-            const int replica_global_phy_idx = l2p_ptr[master_global_log_idx * config.max_replicas_dim + j + 1];
-            const int replica_global_rank_idx = replica_global_phy_idx / config.num_local_physical_experts;
-            EP_HOST_ASSERT(is_in_same_nvl_domain(config.rank_idx, replica_global_rank_idx, config.num_nvl_ranks) &&
-                           "Replica rank is not in the same NVL domain as the master rank");
-            const int replica_nvl_rank_idx = replica_global_rank_idx % config.num_nvl_ranks;
-            EP_HOST_ASSERT(replica_nvl_rank_idx != config.nvl_rank_idx &&
-                           "Replica rank is the same as the master rank, which is not allowed");
-            EP_HOST_ASSERT(remote_weight_ptrs[replica_nvl_rank_idx] != nullptr);
-
-            const int replica_local_offset =
-                replica_global_phy_idx % config.num_local_physical_experts - config.num_local_master_experts;
-            EP_HOST_ASSERT(replica_local_offset >= 0 && replica_local_offset < config.num_local_redundant_experts);
-
-            __nv_bfloat16* replica_remote_weight_buffer_ptr =
-                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank_idx]);
-            __nv_bfloat16* replica_remote_fc1_weight_ptr =
-                replica_remote_weight_buffer_ptr + replica_local_offset * config.expert_total_numel;
-            __nv_bfloat16* replica_remote_fc2_weight_ptr = replica_remote_fc1_weight_ptr + config.expert_fc1_numel;
-
-            fc1_task.replica_remote_addrs[j] = replica_remote_fc1_weight_ptr;
-            fc2_task.replica_remote_addrs[j] = replica_remote_fc2_weight_ptr;
-        }
-
-        num_tasks += 2;
-    }
-    return num_tasks;
+void init_weight_sync_task_cpu(kernels::WeightSyncTask& task) {
+    task.master_local_addr = nullptr;
+    task.num_replicas = 0;
+    task.numel = 0;
+    task.wait_ready_slot = -1;
+    task.num_ready_signals = 0;
 }
 
-int build_weight_sync_stage2_tasks_cpu(const kernels::TaskBuildConfig& config,
-                                       const int32_t* p2l_ptr,
-                                       const int32_t* l2p_ptr,
-                                       const int32_t* lcnts_ptr,
-                                       void* const* remote_weight_ptrs,
-                                       __nv_bfloat16* local_replica_weight_buffer,
-                                       kernels::WeightSyncTask* tasks_cpu) {
-    int num_tasks = 0;
-    for (int local_replica_offset = 0; local_replica_offset < config.num_local_redundant_experts;
-         ++local_replica_offset) {
-        const int local_phy = config.num_local_master_experts + local_replica_offset;
-        const int global_phy = config.rank_idx * config.num_local_physical_experts + local_phy;
-        const int logical_idx = p2l_ptr[global_phy];
-        if (logical_idx < 0) {
-            continue;
-        }
+void build_weight_sync_task_lists_cpu(const kernels::TaskBuildConfig& config,
+                                      const int32_t* p2l_ptr,
+                                      const int32_t* l2p_ptr,
+                                      const int32_t* lcnts_ptr,
+                                      void* const* remote_weight_ptrs,
+                                      void** local_master_fc1_weight_ptrs,
+                                      void** local_master_fc2_weight_ptrs,
+                                      __nv_bfloat16* local_replica_weight_buffer,
+                                      kernels::WeightSyncTask* stage1_tasks_cpu,
+                                      kernels::WeightSyncTask* stage2_tasks_cpu,
+                                      int& stage1_num_tasks,
+                                      int& stage2_num_tasks) {
+    stage1_num_tasks = 0;
+    stage2_num_tasks = 0;
 
-        const int num_replicas = lcnts_ptr[logical_idx] - 1;
-        if (!kernels::should_use_weight_sync_relay(num_replicas, config)) {
-            continue;
-        }
+    const int64_t weight_bytes_per_expert = config.expert_total_numel * WEIGHT_ELEMENT_SIZE;
+    const int domain_base_rank = config.rank_idx - config.nvl_rank_idx;
+    const size_t shard_numels[2] = {
+        static_cast<size_t>(config.expert_fc1_numel),
+        static_cast<size_t>(config.expert_fc2_numel),
+    };
+    const size_t shard_offsets[2] = {
+        0,
+        static_cast<size_t>(config.expert_fc1_numel),
+    };
+    int64_t sender_load_bytes[MAX_NVL_DOMAIN_SIZE] = {0};
 
-        const int relay_count = kernels::choose_weight_sync_relay_count(num_replicas, config);
-        if (relay_count <= 0) {
-            continue;
-        }
-
-        int replica_idx = -1;
-        for (int j = 0; j < num_replicas; ++j) {
-            if (l2p_ptr[logical_idx * config.max_replicas_dim + j + 1] == global_phy) {
-                replica_idx = j;
-                break;
-            }
-        }
-        if (replica_idx < 0 || replica_idx >= relay_count) {
-            continue;
-        }
-
-        const int child_count = kernels::relay_stage_child_count(num_replicas, relay_count, replica_idx);
-        if (child_count <= 0) {
-            continue;
-        }
-
-        __nv_bfloat16* local_expert_base =
-            local_replica_weight_buffer + local_replica_offset * config.expert_total_numel;
-
-        kernels::WeightSyncTask& fc1_task = tasks_cpu[num_tasks];
-        fc1_task.master_local_addr = local_expert_base;
-        fc1_task.num_replicas = child_count;
-        fc1_task.numel = static_cast<size_t>(config.expert_fc1_numel);
-
-        kernels::WeightSyncTask& fc2_task = tasks_cpu[num_tasks + 1];
-        fc2_task.master_local_addr = local_expert_base + config.expert_fc1_numel;
-        fc2_task.num_replicas = child_count;
-        fc2_task.numel = static_cast<size_t>(config.expert_fc2_numel);
-
-        int child_idx = 0;
-        const int leaf_count = num_replicas - relay_count;
-        for (int leaf_idx = 0; leaf_idx < leaf_count; ++leaf_idx) {
-            if (kernels::relay_stage_leaf_owner(leaf_idx, relay_count) != replica_idx) {
+    for (int domain_nvl_rank = 0; domain_nvl_rank < config.num_nvl_ranks; ++domain_nvl_rank) {
+        const int master_rank = domain_base_rank + domain_nvl_rank;
+        for (int local_master_idx = 0; local_master_idx < config.num_local_master_experts; ++local_master_idx) {
+            const int master_global_phy_idx = master_rank * config.num_local_physical_experts + local_master_idx;
+            const int logical_idx = p2l_ptr[master_global_phy_idx];
+            if (logical_idx < 0) {
                 continue;
             }
 
-            const int replica_global_phy_idx =
-                l2p_ptr[logical_idx * config.max_replicas_dim + relay_count + leaf_idx + 1];
-            const int replica_global_rank_idx = replica_global_phy_idx / config.num_local_physical_experts;
-            EP_HOST_ASSERT(is_in_same_nvl_domain(config.rank_idx, replica_global_rank_idx, config.num_nvl_ranks) &&
-                           "Replica rank is not in the same NVL domain as the relay rank");
-            const int replica_nvl_rank_idx = replica_global_rank_idx % config.num_nvl_ranks;
-            EP_HOST_ASSERT(replica_nvl_rank_idx != config.nvl_rank_idx &&
-                           "Relay rank is the same as the downstream replica rank, which is not allowed");
-            EP_HOST_ASSERT(remote_weight_ptrs[replica_nvl_rank_idx] != nullptr);
+            const int num_replicas = lcnts_ptr[logical_idx] - 1;
+            if (num_replicas <= 0) {
+                continue;
+            }
 
-            const int replica_local_offset =
-                replica_global_phy_idx % config.num_local_physical_experts - config.num_local_master_experts;
-            EP_HOST_ASSERT(replica_local_offset >= 0 && replica_local_offset < config.num_local_redundant_experts);
+            const bool use_relay = kernels::should_use_weight_sync_relay(num_replicas, config);
+            if (!use_relay) {
+                sender_load_bytes[domain_nvl_rank] += static_cast<int64_t>(num_replicas) * weight_bytes_per_expert;
+                if (master_rank == config.rank_idx) {
+                    __nv_bfloat16* local_master_addrs[2] = {
+                        reinterpret_cast<__nv_bfloat16*>(local_master_fc1_weight_ptrs[local_master_idx]),
+                        reinterpret_cast<__nv_bfloat16*>(local_master_fc2_weight_ptrs[local_master_idx]),
+                    };
+                    for (int shard_idx = 0; shard_idx < 2; ++shard_idx) {
+                        kernels::WeightSyncTask& task = stage1_tasks_cpu[stage1_num_tasks++];
+                        init_weight_sync_task_cpu(task);
+                        task.master_local_addr = local_master_addrs[shard_idx];
+                        task.num_replicas = num_replicas;
+                        task.numel = shard_numels[shard_idx];
 
-            __nv_bfloat16* replica_remote_weight_buffer_ptr =
-                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank_idx]);
-            __nv_bfloat16* replica_remote_fc1_weight_ptr =
-                replica_remote_weight_buffer_ptr + replica_local_offset * config.expert_total_numel;
-            __nv_bfloat16* replica_remote_fc2_weight_ptr = replica_remote_fc1_weight_ptr + config.expert_fc1_numel;
+                        for (int replica_idx = 0; replica_idx < num_replicas; ++replica_idx) {
+                            const int replica_global_phy_idx =
+                                l2p_ptr[logical_idx * config.max_replicas_dim + replica_idx + 1];
+                            const int replica_global_rank_idx =
+                                replica_global_phy_idx / config.num_local_physical_experts;
+                            EP_HOST_ASSERT(
+                                is_in_same_nvl_domain(config.rank_idx, replica_global_rank_idx, config.num_nvl_ranks) &&
+                                "Replica rank is not in the same NVL domain as the master rank");
+                            const int replica_nvl_rank_idx = replica_global_rank_idx % config.num_nvl_ranks;
+                            const int replica_local_offset =
+                                replica_global_phy_idx % config.num_local_physical_experts -
+                                config.num_local_master_experts;
+                            EP_HOST_ASSERT(replica_local_offset >= 0 &&
+                                           replica_local_offset < config.num_local_redundant_experts);
+                            EP_HOST_ASSERT(remote_weight_ptrs[replica_nvl_rank_idx] != nullptr);
 
-            fc1_task.replica_remote_addrs[child_idx] = replica_remote_fc1_weight_ptr;
-            fc2_task.replica_remote_addrs[child_idx] = replica_remote_fc2_weight_ptr;
-            ++child_idx;
+                            __nv_bfloat16* replica_remote_weight_buffer_ptr =
+                                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank_idx]);
+                            task.replica_remote_addrs[replica_idx] = replica_remote_weight_buffer_ptr +
+                                replica_local_offset * config.expert_total_numel + shard_offsets[shard_idx];
+                        }
+                    }
+                }
+                continue;
+            }
+
+            const int relay_count = kernels::choose_weight_sync_relay_count(num_replicas, config);
+            if (relay_count <= 0) {
+                continue;
+            }
+
+            bool replica_selected[MAX_NVL_DOMAIN_SIZE - 1] = {false};
+            int relay_replica_indices[MAX_NVL_DOMAIN_SIZE - 1] = {0};
+            int relay_global_ranks[MAX_NVL_DOMAIN_SIZE - 1] = {0};
+            int relay_nvl_ranks[MAX_NVL_DOMAIN_SIZE - 1] = {0};
+            int relay_local_offsets[MAX_NVL_DOMAIN_SIZE - 1] = {0};
+            int relay_child_counts[MAX_NVL_DOMAIN_SIZE - 1] = {0};
+            int leaf_owner_relay[MAX_NVL_DOMAIN_SIZE - 1];
+            std::fill_n(leaf_owner_relay, MAX_NVL_DOMAIN_SIZE - 1, -1);
+
+            for (int relay_idx = 0; relay_idx < relay_count; ++relay_idx) {
+                int best_replica_idx = -1;
+                int best_rank_used_penalty = 2;
+                int64_t best_sender_load = 0;
+                int best_rank = 0;
+                int best_nvl_rank = 0;
+                int best_local_offset = 0;
+
+                for (int replica_idx = 0; replica_idx < num_replicas; ++replica_idx) {
+                    if (replica_selected[replica_idx]) {
+                        continue;
+                    }
+
+                    const int replica_global_phy_idx = l2p_ptr[logical_idx * config.max_replicas_dim + replica_idx + 1];
+                    const int replica_global_rank_idx = replica_global_phy_idx / config.num_local_physical_experts;
+                    const int replica_nvl_rank_idx = replica_global_rank_idx % config.num_nvl_ranks;
+                    const int replica_local_offset =
+                        replica_global_phy_idx % config.num_local_physical_experts - config.num_local_master_experts;
+
+                    bool rank_used = false;
+                    for (int prev = 0; prev < relay_idx; ++prev) {
+                        if (relay_global_ranks[prev] == replica_global_rank_idx) {
+                            rank_used = true;
+                            break;
+                        }
+                    }
+                    const int rank_used_penalty = rank_used ? 1 : 0;
+                    const int64_t candidate_sender_load = sender_load_bytes[replica_nvl_rank_idx];
+                    const bool is_better = best_replica_idx < 0 || rank_used_penalty < best_rank_used_penalty ||
+                        (rank_used_penalty == best_rank_used_penalty &&
+                         (candidate_sender_load < best_sender_load ||
+                          (candidate_sender_load == best_sender_load &&
+                           (replica_global_rank_idx < best_rank ||
+                            (replica_global_rank_idx == best_rank && replica_idx < best_replica_idx)))));
+                    if (!is_better) {
+                        continue;
+                    }
+
+                    best_replica_idx = replica_idx;
+                    best_rank_used_penalty = rank_used_penalty;
+                    best_sender_load = candidate_sender_load;
+                    best_rank = replica_global_rank_idx;
+                    best_nvl_rank = replica_nvl_rank_idx;
+                    best_local_offset = replica_local_offset;
+                }
+
+                EP_HOST_ASSERT(best_replica_idx >= 0);
+                replica_selected[best_replica_idx] = true;
+                relay_replica_indices[relay_idx] = best_replica_idx;
+                relay_global_ranks[relay_idx] = best_rank;
+                relay_nvl_ranks[relay_idx] = best_nvl_rank;
+                relay_local_offsets[relay_idx] = best_local_offset;
+            }
+
+            int leaf_replica_indices[MAX_NVL_DOMAIN_SIZE - 1] = {0};
+            int leaf_count = 0;
+            for (int replica_idx = 0; replica_idx < num_replicas; ++replica_idx) {
+                if (!replica_selected[replica_idx]) {
+                    leaf_replica_indices[leaf_count++] = replica_idx;
+                }
+            }
+
+            int64_t projected_relay_loads[MAX_NVL_DOMAIN_SIZE - 1] = {0};
+            for (int relay_idx = 0; relay_idx < relay_count; ++relay_idx) {
+                projected_relay_loads[relay_idx] = sender_load_bytes[relay_nvl_ranks[relay_idx]];
+            }
+
+            for (int leaf_order = 0; leaf_order < leaf_count; ++leaf_order) {
+                const int replica_idx = leaf_replica_indices[leaf_order];
+                int owner_relay = -1;
+                if (leaf_order < relay_count) {
+                    owner_relay = leaf_order;
+                } else {
+                    for (int relay_idx = 0; relay_idx < relay_count; ++relay_idx) {
+                        const bool is_better = owner_relay < 0 ||
+                            projected_relay_loads[relay_idx] < projected_relay_loads[owner_relay] ||
+                            (projected_relay_loads[relay_idx] == projected_relay_loads[owner_relay] &&
+                             (relay_child_counts[relay_idx] < relay_child_counts[owner_relay] ||
+                              (relay_child_counts[relay_idx] == relay_child_counts[owner_relay] &&
+                               (relay_global_ranks[relay_idx] < relay_global_ranks[owner_relay] ||
+                                (relay_global_ranks[relay_idx] == relay_global_ranks[owner_relay] &&
+                                 relay_replica_indices[relay_idx] < relay_replica_indices[owner_relay])))));
+                        if (is_better) {
+                            owner_relay = relay_idx;
+                        }
+                    }
+                }
+
+                EP_HOST_ASSERT(owner_relay >= 0);
+                leaf_owner_relay[replica_idx] = owner_relay;
+                relay_child_counts[owner_relay] += 1;
+                projected_relay_loads[owner_relay] += weight_bytes_per_expert;
+            }
+
+            sender_load_bytes[domain_nvl_rank] += static_cast<int64_t>(relay_count) * weight_bytes_per_expert;
+            for (int relay_idx = 0; relay_idx < relay_count; ++relay_idx) {
+                sender_load_bytes[relay_nvl_ranks[relay_idx]] +=
+                    static_cast<int64_t>(relay_child_counts[relay_idx]) * weight_bytes_per_expert;
+            }
+
+            if (master_rank == config.rank_idx) {
+                __nv_bfloat16* local_master_addrs[2] = {
+                    reinterpret_cast<__nv_bfloat16*>(local_master_fc1_weight_ptrs[local_master_idx]),
+                    reinterpret_cast<__nv_bfloat16*>(local_master_fc2_weight_ptrs[local_master_idx]),
+                };
+                for (int shard_idx = 0; shard_idx < 2; ++shard_idx) {
+                    const int num_chunks = kernels::weight_sync_num_chunks(shard_numels[shard_idx]);
+                    for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+                        kernels::WeightSyncTask& task = stage1_tasks_cpu[stage1_num_tasks++];
+                        init_weight_sync_task_cpu(task);
+                        task.master_local_addr =
+                            local_master_addrs[shard_idx] + kernels::weight_sync_chunk_offset_elements(chunk_idx);
+                        task.num_replicas = relay_count;
+                        task.numel = kernels::weight_sync_chunk_numel(shard_numels[shard_idx], chunk_idx);
+                        task.num_ready_signals = relay_count;
+
+                        for (int relay_idx = 0; relay_idx < relay_count; ++relay_idx) {
+                            EP_HOST_ASSERT(remote_weight_ptrs[relay_nvl_ranks[relay_idx]] != nullptr);
+                            __nv_bfloat16* replica_remote_weight_buffer_ptr =
+                                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[relay_nvl_ranks[relay_idx]]);
+                            task.replica_remote_addrs[relay_idx] = replica_remote_weight_buffer_ptr +
+                                relay_local_offsets[relay_idx] * config.expert_total_numel + shard_offsets[shard_idx] +
+                                kernels::weight_sync_chunk_offset_elements(chunk_idx);
+                            task.ready_signal_slots[relay_idx] = kernels::weight_sync_ready_flag_slot(
+                                config, relay_local_offsets[relay_idx], shard_idx, chunk_idx);
+                            task.ready_signal_nvl_ranks[relay_idx] = relay_nvl_ranks[relay_idx];
+                        }
+                    }
+                }
+            }
+
+            for (int relay_idx = 0; relay_idx < relay_count; ++relay_idx) {
+                if (relay_global_ranks[relay_idx] != config.rank_idx || relay_child_counts[relay_idx] <= 0) {
+                    continue;
+                }
+
+                __nv_bfloat16* local_relay_base =
+                    local_replica_weight_buffer + relay_local_offsets[relay_idx] * config.expert_total_numel;
+                for (int shard_idx = 0; shard_idx < 2; ++shard_idx) {
+                    const int num_chunks = kernels::weight_sync_num_chunks(shard_numels[shard_idx]);
+                    for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+                        kernels::WeightSyncTask& task = stage2_tasks_cpu[stage2_num_tasks++];
+                        init_weight_sync_task_cpu(task);
+                        task.master_local_addr = local_relay_base + shard_offsets[shard_idx] +
+                            kernels::weight_sync_chunk_offset_elements(chunk_idx);
+                        task.num_replicas = relay_child_counts[relay_idx];
+                        task.numel = kernels::weight_sync_chunk_numel(shard_numels[shard_idx], chunk_idx);
+                        task.wait_ready_slot = kernels::weight_sync_ready_flag_slot(
+                            config, relay_local_offsets[relay_idx], shard_idx, chunk_idx);
+
+                        int child_idx = 0;
+                        for (int replica_idx = 0; replica_idx < num_replicas; ++replica_idx) {
+                            if (leaf_owner_relay[replica_idx] != relay_idx) {
+                                continue;
+                            }
+
+                            const int replica_global_phy_idx =
+                                l2p_ptr[logical_idx * config.max_replicas_dim + replica_idx + 1];
+                            const int replica_global_rank_idx =
+                                replica_global_phy_idx / config.num_local_physical_experts;
+                            EP_HOST_ASSERT(
+                                is_in_same_nvl_domain(config.rank_idx, replica_global_rank_idx, config.num_nvl_ranks) &&
+                                "Replica rank is not in the same NVL domain as the relay rank");
+                            const int replica_nvl_rank_idx = replica_global_rank_idx % config.num_nvl_ranks;
+                            const int replica_local_offset =
+                                replica_global_phy_idx % config.num_local_physical_experts -
+                                config.num_local_master_experts;
+                            EP_HOST_ASSERT(replica_local_offset >= 0 &&
+                                           replica_local_offset < config.num_local_redundant_experts);
+                            EP_HOST_ASSERT(remote_weight_ptrs[replica_nvl_rank_idx] != nullptr);
+
+                            __nv_bfloat16* replica_remote_weight_buffer_ptr =
+                                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank_idx]);
+                            task.replica_remote_addrs[child_idx++] = replica_remote_weight_buffer_ptr +
+                                replica_local_offset * config.expert_total_numel + shard_offsets[shard_idx] +
+                                kernels::weight_sync_chunk_offset_elements(chunk_idx);
+                        }
+                    }
+                }
+            }
         }
-
-        num_tasks += 2;
     }
-    return num_tasks;
 }
 
 }  // namespace
@@ -497,6 +627,7 @@ Manager::Manager(const int& num_layers,
       balance_threshold_(balance_threshold),
       placement_cpu_dirty_(num_layers, false),
       comm_stream(at::cuda::getStreamFromPool(true)),
+      relay_stream(at::cuda::getStreamFromPool(true)),
       placement_ready_events_(is_train ? num_layers : 1),
       placement_ready_stream_ids_(is_train ? num_layers : 1, -1)
 
@@ -513,7 +644,9 @@ Manager::Manager(const int& num_layers,
     EP_HOST_ASSERT(weight_sync_relay_min_fanout_gain_ >= 0);
     num_global_physical_experts = num_local_physical_experts * runtime::num_ranks;
     num_global_logical_experts = num_local_master_experts * runtime::num_ranks;
-    _weight_sync_task_capacity = 2 * num_local_physical_experts;
+    _weight_sync_task_capacity = num_local_physical_experts *
+        (kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc1_numel)) +
+         kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc2_numel)));
 
     // Allocate global placement tensors using contiguous per-layer buffers on CPU and GPU.
     // This reduces number of H2D/D2H memory copies.
@@ -537,6 +670,18 @@ Manager::Manager(const int& num_layers,
                                                                  {num_local_redundant_experts, expert_total_numel},
                                                                  torch::kBFloat16,
                                                                  torch::Device(torch::kCUDA, device_id));
+
+    const int max_relay_chunks_per_shard =
+        kernels::weight_sync_num_chunks(static_cast<size_t>(std::max(expert_fc1_numel, expert_fc2_numel)));
+    const int64_t local_ready_flag_count =
+        static_cast<int64_t>(num_local_redundant_experts) * 2 * max_relay_chunks_per_shard;
+    local_weight_sync_ready_flags =
+        reinterpret_cast<uint64_t*>(nvshmem::alloc(local_ready_flag_count * sizeof(uint64_t), NVSHMEM_ALIGNMENT));
+    EP_HOST_ASSERT(local_weight_sync_ready_flags != nullptr &&
+                   "Failed to allocate NVSHMEM ready-flag buffer for relay weight sync");
+    if (local_ready_flag_count > 0) {
+        CUDA_RUNTIME_CHECK(cudaMemset(local_weight_sync_ready_flags, 0, local_ready_flag_count * sizeof(uint64_t)));
+    }
 
     // Grad buffer only needed for training
     if (is_train) {
@@ -562,12 +707,22 @@ Manager::Manager(const int& num_layers,
         global_replica_weight_buffer_ptrs[i] = nvshmem::ptr(local_replica_weight_buffer, target_rank);
         EP_HOST_ASSERT(global_replica_weight_buffer_ptrs[i] != nullptr &&
                        "nvshmem_ptr failed for weight buffer - target PE may not be in same NVL domain");
+        global_weight_sync_ready_flag_ptrs[i] =
+            reinterpret_cast<uint64_t*>(nvshmem::ptr(local_weight_sync_ready_flags, target_rank));
+        EP_HOST_ASSERT(global_weight_sync_ready_flag_ptrs[i] != nullptr &&
+                       "nvshmem_ptr failed for ready-flag buffer - target PE may not be in same NVL domain");
         if (is_train) {
             global_replica_grad_buffer_ptrs[i] = nvshmem::ptr(local_replica_grad_buffer, target_rank);
             EP_HOST_ASSERT(global_replica_grad_buffer_ptrs[i] != nullptr &&
                            "nvshmem_ptr failed for grad buffer - target PE may not be in same NVL domain");
         }
     }
+
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_ready_flag_ptrs_gpu, MAX_NVL_DOMAIN_SIZE * sizeof(uint64_t*)));
+    CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_ready_flag_ptrs_gpu,
+                                  global_weight_sync_ready_flag_ptrs,
+                                  MAX_NVL_DOMAIN_SIZE * sizeof(uint64_t*),
+                                  cudaMemcpyHostToDevice));
 
     // Allocate intermediate buffers for grad reduce tasks (regular CUDA memory)
     CUDA_RUNTIME_CHECK(
@@ -579,9 +734,7 @@ Manager::Manager(const int& num_layers,
     const int shared_task_capacity =
         MAX_GRAD_REDUCE_TASK_NUM > _weight_sync_task_capacity ? MAX_GRAD_REDUCE_TASK_NUM : _weight_sync_task_capacity;
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_tile_offsets_gpu, (shared_task_capacity + 1) * sizeof(int)));
-    const int task_tile_offsets_cpu_capacity = (3 * num_local_master_experts) > (_weight_sync_task_capacity + 1)
-        ? (3 * num_local_master_experts)
-        : (_weight_sync_task_capacity + 1);
+    const int task_tile_offsets_cpu_capacity = _weight_sync_task_capacity + 1;
     CUDA_RUNTIME_CHECK(cudaMallocHost((void**)&_task_tile_offsets_cpu, task_tile_offsets_cpu_capacity * sizeof(int)));
 
     // Allocate intermediate buffers for weight sync tasks
@@ -589,6 +742,18 @@ Manager::Manager(const int& num_layers,
         cudaMallocHost((void**)&_weight_sync_tasks_cpu, _weight_sync_task_capacity * sizeof(kernels::WeightSyncTask)));
     CUDA_RUNTIME_CHECK(
         cudaMalloc((void**)&_weight_sync_tasks_gpu, _weight_sync_task_capacity * sizeof(kernels::WeightSyncTask)));
+    CUDA_RUNTIME_CHECK(
+        cudaMalloc((void**)&_weight_sync_task_remaining_tiles_gpu, _weight_sync_task_capacity * sizeof(int)));
+    CUDA_RUNTIME_CHECK(cudaMallocHost((void**)&_relay_weight_sync_tasks_cpu,
+                                      _weight_sync_task_capacity * sizeof(kernels::WeightSyncTask)));
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_relay_weight_sync_tasks_gpu,
+                                  _weight_sync_task_capacity * sizeof(kernels::WeightSyncTask)));
+    CUDA_RUNTIME_CHECK(
+        cudaMallocHost((void**)&_relay_task_tile_offsets_cpu, (_weight_sync_task_capacity + 1) * sizeof(int)));
+    CUDA_RUNTIME_CHECK(
+        cudaMalloc((void**)&_relay_task_tile_offsets_gpu, (_weight_sync_task_capacity + 1) * sizeof(int)));
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_relay_task_metadata_gpu, 2 * sizeof(int)));
+    CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_relay_global_tile_counter_gpu, sizeof(int)));
 
     // Task metadata buffer: [total_tasks, total_tiles] — shared between weight_sync and grad_reduce
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_metadata_gpu, 2 * sizeof(int)));
@@ -635,11 +800,11 @@ Manager::Manager(const int& num_layers,
             cudaMalloc((void**)&_local_master_ptrs_staging_gpu, 2 * num_local_master_experts * sizeof(int64_t)));
 
         // Pre-compute upper bounds for GPU-path grid sizing
-        int64_t max_fc_numel = std::max(expert_fc1_numel, expert_fc2_numel);
-        int ws_tiles_per_task =
-            static_cast<int>((max_fc_numel + WEIGHT_SYNC_TILE_ELEMENTS - 1) / WEIGHT_SYNC_TILE_ELEMENTS);
-        _max_ws_total_tiles = _weight_sync_task_capacity * ws_tiles_per_task;
+        const int max_stage_tiles_per_expert = kernels::weight_sync_num_tiles(static_cast<size_t>(expert_fc1_numel)) +
+            kernels::weight_sync_num_tiles(static_cast<size_t>(expert_fc2_numel));
+        _max_ws_total_tiles = num_local_physical_experts * max_stage_tiles_per_expert;
 
+        int64_t max_fc_numel = std::max(expert_fc1_numel, expert_fc2_numel);
         int max_replicas = runtime::num_nvl_ranks - 1;
         _max_gr_total_tasks = 2 * num_local_master_experts * max_replicas;
         int gr_tiles_per_task =
@@ -728,6 +893,10 @@ void Manager::destroy() {
     // Free NVSHMEM symmetric heap buffers
     nvshmem::free(local_replica_weight_buffer);
     local_replica_weight_buffer = nullptr;
+    if (local_weight_sync_ready_flags != nullptr) {
+        nvshmem::free(local_weight_sync_ready_flags);
+        local_weight_sync_ready_flags = nullptr;
+    }
     if (local_replica_grad_buffer != nullptr) {
         nvshmem::free(local_replica_grad_buffer);
         local_replica_grad_buffer = nullptr;
@@ -747,6 +916,7 @@ void Manager::destroy() {
     for (int i = 0; i < runtime::num_nvl_ranks; ++i) {
         global_replica_weight_buffer_ptrs[i] = nullptr;
         global_replica_grad_buffer_ptrs[i] = nullptr;
+        global_weight_sync_ready_flag_ptrs[i] = nullptr;
     }
 
     // Free intermediate CUDA buffers
@@ -764,9 +934,24 @@ void Manager::destroy() {
     // Free weight sync buffers
     CUDA_RUNTIME_CHECK(cudaFreeHost(_weight_sync_tasks_cpu));
     CUDA_RUNTIME_CHECK(cudaFree(_weight_sync_tasks_gpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_weight_sync_task_remaining_tiles_gpu));
+    CUDA_RUNTIME_CHECK(cudaFreeHost(_relay_weight_sync_tasks_cpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_relay_weight_sync_tasks_gpu));
+    CUDA_RUNTIME_CHECK(cudaFreeHost(_relay_task_tile_offsets_cpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_relay_task_tile_offsets_gpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_relay_task_metadata_gpu));
+    CUDA_RUNTIME_CHECK(cudaFree(_relay_global_tile_counter_gpu));
     _weight_sync_tasks_cpu = nullptr;
     _weight_sync_tasks_gpu = nullptr;
+    _weight_sync_task_remaining_tiles_gpu = nullptr;
+    _relay_weight_sync_tasks_cpu = nullptr;
+    _relay_weight_sync_tasks_gpu = nullptr;
+    _relay_task_tile_offsets_cpu = nullptr;
+    _relay_task_tile_offsets_gpu = nullptr;
+    _relay_task_metadata_gpu = nullptr;
+    _relay_global_tile_counter_gpu = nullptr;
     _weight_sync_task_capacity = 0;
+    _weight_sync_epoch = 0;
 
     // Free task metadata buffer
     CUDA_RUNTIME_CHECK(cudaFree(_task_metadata_gpu));
@@ -788,6 +973,10 @@ void Manager::destroy() {
     if (_local_master_ptrs_staging_gpu) {
         CUDA_RUNTIME_CHECK(cudaFree(_local_master_ptrs_staging_gpu));
         _local_master_ptrs_staging_gpu = nullptr;
+    }
+    if (_remote_ready_flag_ptrs_gpu) {
+        CUDA_RUNTIME_CHECK(cudaFree(_remote_ready_flag_ptrs_gpu));
+        _remote_ready_flag_ptrs_gpu = nullptr;
     }
 
     // Free sparse reroute counters
@@ -1371,8 +1560,10 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
         stream_wait(comm_stream, previous_event.value());
+        stream_wait(relay_stream, previous_event.value());
     } else {
         stream_wait(comm_stream, compute_stream);
+        stream_wait(relay_stream, compute_stream);
     }
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);
@@ -1381,6 +1572,8 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.numel() == num_local_master_experts);
     const bool enable_relay_stages = weight_sync_plan_mode_ != static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
         num_local_redundant_experts > 0 && runtime::num_nvl_ranks > 2;
+    const uint64_t current_epoch = ++_weight_sync_epoch;
+    bool launched_stage2 = false;
 
     if (use_gpu_solver_ || use_quota_solver_) {
         // GPU task build path: tasks built entirely on GPU
@@ -1411,47 +1604,54 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         }
 
         auto [p2l_gpu, l2p_gpu, lcnts_gpu] = placement.get_gpu_ptrs(layer_id);
-        kernels::build_weight_sync_tasks(_task_build_config_gpu,
-                                         p2l_gpu,
-                                         l2p_gpu,
-                                         lcnts_gpu,
-                                         _remote_weight_ptrs_gpu,
-                                         local_master_fc1_weight_ptrs_gpu,
-                                         local_master_fc2_weight_ptrs_gpu,
-                                         _weight_sync_tasks_gpu,
-                                         _task_tile_offsets_gpu,
-                                         _task_metadata_gpu,
-                                         _global_task_or_tile_counter_gpu,
-                                         comm_stream);
+        kernels::build_weight_sync_task_lists(_task_build_config_gpu,
+                                              p2l_gpu,
+                                              l2p_gpu,
+                                              lcnts_gpu,
+                                              _remote_weight_ptrs_gpu,
+                                              local_master_fc1_weight_ptrs_gpu,
+                                              local_master_fc2_weight_ptrs_gpu,
+                                              reinterpret_cast<__nv_bfloat16*>(local_replica_weight_buffer),
+                                              _weight_sync_tasks_gpu,
+                                              _task_tile_offsets_gpu,
+                                              _task_metadata_gpu,
+                                              _weight_sync_task_remaining_tiles_gpu,
+                                              _global_task_or_tile_counter_gpu,
+                                              _relay_weight_sync_tasks_gpu,
+                                              _relay_task_tile_offsets_gpu,
+                                              _relay_task_metadata_gpu,
+                                              _relay_global_tile_counter_gpu,
+                                              comm_stream);
+        EventHandle task_build_ready(comm_stream);
 
         kernels::run_weight_sync_from_gpu(_weight_sync_tasks_gpu,
                                           _task_tile_offsets_gpu,
                                           _task_metadata_gpu,
                                           _global_task_or_tile_counter_gpu,
+                                          _weight_sync_task_remaining_tiles_gpu,
+                                          local_weight_sync_ready_flags,
+                                          _remote_ready_flag_ptrs_gpu,
+                                          current_epoch,
                                           comm_stream,
                                           runtime::num_device_sms,
-                                          _max_ws_total_tiles);
+                                          _max_ws_total_tiles,
+                                          2);
 
         if (enable_relay_stages) {
-            nvshmem::barrier(false, comm_stream.stream());
-            kernels::build_weight_sync_relay_tasks(_task_build_config_gpu,
-                                                   p2l_gpu,
-                                                   l2p_gpu,
-                                                   lcnts_gpu,
-                                                   _remote_weight_ptrs_gpu,
-                                                   reinterpret_cast<__nv_bfloat16*>(local_replica_weight_buffer),
-                                                   _weight_sync_tasks_gpu,
-                                                   _task_tile_offsets_gpu,
-                                                   _task_metadata_gpu,
-                                                   _global_task_or_tile_counter_gpu,
-                                                   comm_stream);
-            kernels::run_weight_sync_from_gpu(_weight_sync_tasks_gpu,
-                                              _task_tile_offsets_gpu,
-                                              _task_metadata_gpu,
-                                              _global_task_or_tile_counter_gpu,
-                                              comm_stream,
+            stream_wait(relay_stream, task_build_ready);
+            kernels::run_weight_sync_from_gpu(_relay_weight_sync_tasks_gpu,
+                                              _relay_task_tile_offsets_gpu,
+                                              _relay_task_metadata_gpu,
+                                              _relay_global_tile_counter_gpu,
+                                              nullptr,
+                                              local_weight_sync_ready_flags,
+                                              _remote_ready_flag_ptrs_gpu,
+                                              current_epoch,
+                                              relay_stream,
                                               runtime::num_device_sms,
-                                              _max_ws_total_tiles);
+                                              _max_ws_total_tiles,
+                                              1);
+            launched_stage2 = true;
         }
     } else {
         // CPU task build path
@@ -1478,16 +1678,22 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         cpu_task_build_config.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas_;
         cpu_task_build_config.weight_sync_relay_max_relays = weight_sync_relay_max_relays_;
         cpu_task_build_config.weight_sync_relay_min_fanout_gain = weight_sync_relay_min_fanout_gain_;
-
-        const int stage1_num_tasks = build_weight_sync_stage1_tasks_cpu(cpu_task_build_config,
-                                                                        p2l_ptr,
-                                                                        l2p_ptr,
-                                                                        lcnts_ptr,
-                                                                        global_replica_weight_buffer_ptrs,
-                                                                        local_master_fc1_weight_ptrs,
-                                                                        local_master_fc2_weight_ptrs,
-                                                                        _weight_sync_tasks_cpu);
+        int stage1_num_tasks = 0;
+        int stage2_num_tasks = 0;
+        build_weight_sync_task_lists_cpu(cpu_task_build_config,
+                                         p2l_ptr,
+                                         l2p_ptr,
+                                         lcnts_ptr,
+                                         global_replica_weight_buffer_ptrs,
+                                         local_master_fc1_weight_ptrs,
+                                         local_master_fc2_weight_ptrs,
+                                         reinterpret_cast<__nv_bfloat16*>(local_replica_weight_buffer),
+                                         _weight_sync_tasks_cpu,
+                                         _relay_weight_sync_tasks_cpu,
+                                         stage1_num_tasks,
+                                         stage2_num_tasks);
         EP_HOST_ASSERT(stage1_num_tasks <= _weight_sync_task_capacity);
+        EP_HOST_ASSERT(stage2_num_tasks <= _weight_sync_task_capacity);
         if (stage1_num_tasks > 0) {
             kernels::run_weight_sync(_weight_sync_tasks_cpu,
                                      _weight_sync_tasks_gpu,
@@ -1495,45 +1701,44 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                      _task_tile_offsets_gpu,
                                      _task_tile_offsets_cpu,
                                      _task_metadata_gpu,
+                                     _weight_sync_task_remaining_tiles_gpu,
+                                     local_weight_sync_ready_flags,
+                                     _remote_ready_flag_ptrs_gpu,
+                                     current_epoch,
                                      stage1_num_tasks,
                                      comm_stream,
-                                     runtime::num_device_sms);
+                                     runtime::num_device_sms,
+                                     2);
         }
 
-        int stage2_num_tasks = 0;
-        if (enable_relay_stages) {
-            if (stage1_num_tasks > 0) {
-                CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
-            }
-            nvshmem::barrier(false, comm_stream.stream());
-            stage2_num_tasks =
-                build_weight_sync_stage2_tasks_cpu(cpu_task_build_config,
-                                                   p2l_ptr,
-                                                   l2p_ptr,
-                                                   lcnts_ptr,
-                                                   global_replica_weight_buffer_ptrs,
-                                                   reinterpret_cast<__nv_bfloat16*>(local_replica_weight_buffer),
-                                                   _weight_sync_tasks_cpu);
-            EP_HOST_ASSERT(stage2_num_tasks <= _weight_sync_task_capacity);
-            if (stage2_num_tasks > 0) {
-                kernels::run_weight_sync(_weight_sync_tasks_cpu,
-                                         _weight_sync_tasks_gpu,
-                                         _global_task_or_tile_counter_gpu,
-                                         _task_tile_offsets_gpu,
-                                         _task_tile_offsets_cpu,
-                                         _task_metadata_gpu,
-                                         stage2_num_tasks,
-                                         comm_stream,
-                                         runtime::num_device_sms);
-            }
+        if (enable_relay_stages && stage2_num_tasks > 0) {
+            kernels::run_weight_sync(_relay_weight_sync_tasks_cpu,
+                                     _relay_weight_sync_tasks_gpu,
+                                     _relay_global_tile_counter_gpu,
+                                     _relay_task_tile_offsets_gpu,
+                                     _relay_task_tile_offsets_cpu,
+                                     _relay_task_metadata_gpu,
+                                     nullptr,
+                                     local_weight_sync_ready_flags,
+                                     _remote_ready_flag_ptrs_gpu,
+                                     current_epoch,
+                                     stage2_num_tasks,
+                                     relay_stream,
+                                     runtime::num_device_sms,
+                                     1);
+            launched_stage2 = true;
         }
 
         if (stage1_num_tasks == 0 && stage2_num_tasks == 0) {
             if (async) {
-                event = EventHandle(comm_stream);
+                event = EventHandle(compute_stream);
             }
             return event;
         }
+    }
+
+    if (launched_stage2) {
+        stream_wait(comm_stream, relay_stream);
     }
 
     // Wait streams
