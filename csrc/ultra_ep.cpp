@@ -1011,7 +1011,8 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                                 std::string& mode,
                                                 std::optional<EventHandle>& previous_event,
-                                                bool async) {
+                                                bool async,
+                                                int grad_reduce_sm_factor) {
     EP_HOST_ASSERT(is_available());
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -1072,7 +1073,20 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                          comm_stream);
 
         // Launch main kernel using GPU-resident tasks
-        if (mode == "low_sm") {
+        if (mode == "low_sm" && grad_reduce_sm_factor > 0) {
+            // Adaptive mode: use high_sm kernel with CTA count controlled by sm_factor.
+            // sm_factor=1 → ~total_tasks CTAs (similar occupancy to low_sm).
+            // Large sm_factor → converges to high_sm behavior (tile-level parallelism).
+            int num_ctas_override = std::min(runtime::num_device_sms * 2, _max_gr_total_tasks * grad_reduce_sm_factor);
+            kernels::run_grad_reduce_high_sm_from_gpu(_grad_reduce_tasks_gpu,
+                                                      _task_tile_offsets_gpu,
+                                                      _task_metadata_gpu,
+                                                      _global_task_or_tile_counter_gpu,
+                                                      comm_stream,
+                                                      runtime::num_device_sms,
+                                                      _max_gr_total_tiles,
+                                                      num_ctas_override);
+        } else if (mode == "low_sm") {
             kernels::run_grad_reduce_low_sm_from_gpu(_grad_reduce_tasks_gpu,
                                                      _global_task_or_tile_counter_gpu,
                                                      _task_metadata_gpu,
@@ -1140,7 +1154,18 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
         }
 
         // Call device-side kernels
-        if (mode == "low_sm") {
+        if (mode == "low_sm" && grad_reduce_sm_factor > 0) {
+            int num_ctas_override = std::min(runtime::num_device_sms * 2, num_tasks * grad_reduce_sm_factor);
+            kernels::run_grad_reduce_high_sm(_grad_reduce_tasks_cpu,
+                                             _grad_reduce_tasks_gpu,
+                                             _global_task_or_tile_counter_gpu,
+                                             _task_tile_offsets_gpu,
+                                             _task_metadata_gpu,
+                                             num_tasks,
+                                             comm_stream,
+                                             runtime::num_device_sms,
+                                             num_ctas_override);
+        } else if (mode == "low_sm") {
             kernels::run_grad_reduce_low_sm(_grad_reduce_tasks_cpu,
                                             _grad_reduce_tasks_gpu,
                                             _global_task_or_tile_counter_gpu,
