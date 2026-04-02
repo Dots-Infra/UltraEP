@@ -403,7 +403,8 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                              int* task_metadata_gpu,
                              const int total_tasks,
                              cudaStream_t stream,
-                             const int num_device_sms) {
+                             const int num_device_sms,
+                             int num_ctas_override) {
     if (total_tasks == 0)
         return;
 
@@ -433,7 +434,12 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                                        stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
 
-    int num_ctas = min(num_device_sms * 2, total_tiles);
+    int num_ctas;
+    if (num_ctas_override > 0) {
+        num_ctas = min(num_ctas_override, total_tiles);
+    } else {
+        num_ctas = min(num_device_sms * 2, total_tiles);
+    }
     num_ctas = max(num_ctas, 1);
 
     launch_grad_reduce_high_sm(
@@ -463,8 +469,14 @@ void run_grad_reduce_high_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
                                       int* global_tile_counter_gpu,
                                       cudaStream_t stream,
                                       int num_device_sms,
-                                      int max_possible_tiles) {
-    int num_ctas = min(num_device_sms * 2, max_possible_tiles);
+                                      int max_possible_tiles,
+                                      int num_ctas_override) {
+    int num_ctas;
+    if (num_ctas_override > 0) {
+        num_ctas = min(num_ctas_override, max_possible_tiles);
+    } else {
+        num_ctas = min(num_device_sms * 2, max_possible_tiles);
+    }
     num_ctas = max(num_ctas, 1);
 
     launch_grad_reduce_high_sm(

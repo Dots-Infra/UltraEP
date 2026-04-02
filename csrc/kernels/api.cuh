@@ -32,7 +32,8 @@ void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
                              int* task_metadata_gpu,
                              const int total_tasks,
                              cudaStream_t stream,
-                             const int num_device_sms);
+                             const int num_device_sms,
+                             int num_ctas_override = 0);
 
 // Run gradient reduce using GPU-resident tasks (no H2D copy)
 // task_metadata_gpu must already contain {total_tasks, total_tiles} (written by build kernel)
@@ -48,7 +49,8 @@ void run_grad_reduce_high_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
                                       int* global_tile_counter_gpu,
                                       cudaStream_t stream,
                                       int num_device_sms,
-                                      int max_possible_tiles);
+                                      int max_possible_tiles,
+                                      int num_ctas_override = 0);
 
 // ============================================================================
 // Weight Sync: Broadcast master weights to replicas

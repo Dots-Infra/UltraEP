@@ -29,6 +29,7 @@ class Manager:
         quota_locality_aware: bool = True,
         quota_min_tokens_per_replica: int = 1024,
         quota_allow_zero_master_quota: bool = False,
+        grad_reduce_sm_factor: int = 0,
         quota_oracle_mode: str = "fastt",
         quota_oracle_eps: float = 0.01,
         weight_sync_plan_mode: str = "adaptive",
@@ -81,6 +82,16 @@ class Manager:
 
         # Per-real-layer micro-batch slot counters (wraps modulo max_microbatches)
         self._mb_counters = [0] * self.real_num_alloc_layers
+
+        # Env var overrides
+        env_quota_min = os.environ.get("ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA")
+        if env_quota_min is not None:
+            quota_min_tokens_per_replica = int(env_quota_min)
+
+        env_sm_factor = os.environ.get("ULTRA_EP_GRAD_REDUCE_SM_FACTOR")
+        if env_sm_factor is not None:
+            grad_reduce_sm_factor = int(env_sm_factor)
+        self.grad_reduce_sm_factor = grad_reduce_sm_factor
 
         # Expert loads logging
         self.log_expert_loads = os.environ.get("ULTRA_EP_LOG_EXPERT_LOADS", "0") == "1"
@@ -357,6 +368,7 @@ class Manager:
             mode,
             getattr(previous_event, "event", None),
             async_finish,
+            self.grad_reduce_sm_factor,
         )
         return EventHandle(event)
 

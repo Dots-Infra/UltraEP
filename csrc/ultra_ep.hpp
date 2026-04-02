@@ -324,7 +324,8 @@ public:
                                            torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                            std::string& mode,
                                            std::optional<EventHandle>& previous_event,
-                                           bool async);
+                                           bool async,
+                                           int grad_reduce_sm_factor = 0);
     // Sync replica weights with masters
     // Parameters (ptr tensor of local master weight buffers, for the current layer):
     // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
@@ -438,7 +439,15 @@ static void register_apis(pybind11::module_& m) {
         .def("reroute_cpu", &Manager::reroute_cpu)
         .def("reroute_cuda_forward", &Manager::reroute_cuda_forward)
         .def("reroute_cuda_backward", &Manager::reroute_cuda_backward)
-        .def("grad_reduce", &Manager::grad_reduce)
+        .def("grad_reduce",
+             &Manager::grad_reduce,
+             pybind11::arg("layer_id"),
+             pybind11::arg("local_master_fc1_grad_ptr_tensor"),
+             pybind11::arg("local_master_fc2_grad_ptr_tensor"),
+             pybind11::arg("mode"),
+             pybind11::arg("previous_event"),
+             pybind11::arg("async_finish"),
+             pybind11::arg("grad_reduce_sm_factor") = 0)
         .def("weight_sync", &Manager::weight_sync)
         .def("get_comm_stream", &Manager::get_comm_stream)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
