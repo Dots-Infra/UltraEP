@@ -23,6 +23,15 @@
 
 namespace ultra_ep::kernels {
 
+__device__ __forceinline__ int gcd_int(int a, int b) {
+    while (b != 0) {
+        const int t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
 // ============================================================================
 // Forward pass 1: count active tokens per (expert, tile)
 // ============================================================================
@@ -73,7 +82,8 @@ __global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_
                                                const int L,
                                                const int P,
                                                const int max_replicas,
-                                               const int num_tiles) {
+                                               const int num_tiles,
+                                               const bool interleave_by_rank_quota) {
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int expert_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -111,6 +121,41 @@ __global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_
         }
     }
 
+    int quota_local_total = 0;
+    int quota_perm_stride = 1;
+    int quota_perm_offset = 0;
+    if constexpr (QUOTA_MODE) {
+        if (C > 0) {
+            quota_local_total = (C <= PREFETCH_REPLICAS)
+                                    ? local_prefix[C - 1]
+                                    : rank_quota_prefix[expert_id * max_replicas + C - 1];
+        }
+        if (interleave_by_rank_quota && quota_local_total > 1) {
+            if (lane == 0) {
+                // Deterministic affine permutation over [0, quota_local_total):
+                // mapped = (rank * stride + offset) % quota_local_total.
+                // Choose stride coprime with modulus to preserve exact per-replica counts.
+                int stride = quota_local_total / 2 + 1;
+                if (stride >= quota_local_total) {
+                    stride = quota_local_total - 1;
+                }
+                if (stride < 1) {
+                    stride = 1;
+                }
+                while (gcd_int(stride, quota_local_total) != 1) {
+                    ++stride;
+                    if (stride >= quota_local_total) {
+                        stride = 1;
+                    }
+                }
+                quota_perm_stride = stride;
+                quota_perm_offset = expert_id % quota_local_total;
+            }
+            quota_perm_stride = __shfl_sync(0xFFFFFFFF, quota_perm_stride, 0);
+            quota_perm_offset = __shfl_sync(0xFFFFFFFF, quota_perm_offset, 0);
+        }
+    }
+
     // Warp-parallel prefix-sum: sum tile_counts[expert][0..tile_id-1] to get base_rank.
     // Each round loads 32 values via coalesced warp read and reduces with shuffles.
     int base_rank = 0;
@@ -145,16 +190,21 @@ __global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_
             int replica_idx = 0;
             int phys = -1;
             if constexpr (QUOTA_MODE) {
+                int quota_rank = my_rank;
+                if (interleave_by_rank_quota && quota_local_total > 1) {
+                    quota_rank = static_cast<int>(
+                        (static_cast<int64_t>(my_rank) * quota_perm_stride + quota_perm_offset) % quota_local_total);
+                }
                 // Branchless upper_bound: count how many prefix values <= my_rank.
                 // This avoids warp divergence from a break-based scan (D5 design).
 #pragma unroll
                 for (int j = 0; j < PREFETCH_REPLICAS; ++j) {
                     if (j < prefetch_count) {
-                        replica_idx += (my_rank >= local_prefix[j]) ? 1 : 0;
+                        replica_idx += (quota_rank >= local_prefix[j]) ? 1 : 0;
                     }
                 }
                 for (int j = PREFETCH_REPLICAS; j < C; ++j) {
-                    replica_idx += (my_rank >= rank_quota_prefix[expert_id * max_replicas + j]) ? 1 : 0;
+                    replica_idx += (quota_rank >= rank_quota_prefix[expert_id * max_replicas + j]) ? 1 : 0;
                 }
                 // Clamp to valid range [0, C-1]
                 replica_idx = min(replica_idx, max(C - 1, 0));
@@ -251,7 +301,8 @@ void run_reroute_forward(const bool* routing_map,
         L,
         P,
         max_replicas,
-        num_tiles);
+        num_tiles,
+        false);
 }
 
 void run_reroute_forward_quota(const bool* routing_map,
@@ -266,6 +317,7 @@ void run_reroute_forward_quota(const bool* routing_map,
                                int L,
                                int P,
                                int max_replicas,
+                               bool interleave_by_rank_quota,
                                cudaStream_t stream) {
     if (T == 0 || L == 0)
         return;
@@ -294,7 +346,8 @@ void run_reroute_forward_quota(const bool* routing_map,
         L,
         P,
         max_replicas,
-        num_tiles);
+        num_tiles,
+        interleave_by_rank_quota);
 }
 
 void run_reroute_backward(const void* grad_expanded_probs,

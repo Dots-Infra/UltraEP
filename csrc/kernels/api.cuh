@@ -174,6 +174,7 @@ void run_reroute_forward_quota(const bool* routing_map,
                                int L,
                                int P,
                                int max_replicas,
+                               bool interleave_by_rank_quota,
                                cudaStream_t stream);
 
 // Backward (row-parallel gather): gather gradients from [T,P] physical to [T,L] logical.

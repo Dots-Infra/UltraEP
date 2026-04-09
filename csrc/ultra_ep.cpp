@@ -934,6 +934,7 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
                                                L,
                                                P,
                                                runtime::num_ranks,
+                                               quota_locality_aware_,
                                                stream);
         } else {
             kernels::run_reroute_forward(routing_map.data_ptr<bool>(),
