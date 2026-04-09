@@ -314,10 +314,7 @@ Manager::Manager(const int& num_layers,
                  const bool& quota_locality_aware,
                  const int32_t& quota_min_tokens_per_replica,
                  const bool& quota_allow_zero_master_quota,
-                 const int& quota_solver_version,
-                 const int& quota_v1_oracle_mode,
                  const float& quota_v1_oracle_eps,
-                 const int& quota_v1_oracle_batch_k,
                  const int& quota_v1_kernel_stage)
     : num_layers(num_layers),
       num_local_master_experts(num_local_master_experts),
@@ -333,10 +330,7 @@ Manager::Manager(const int& num_layers,
       quota_locality_aware_(quota_locality_aware),
       quota_min_tokens_per_replica_(quota_min_tokens_per_replica),
       quota_allow_zero_master_quota_(quota_allow_zero_master_quota),
-      quota_solver_version_(quota_solver_version),
-      quota_v1_oracle_mode_(quota_v1_oracle_mode),
       quota_v1_oracle_eps_(quota_v1_oracle_eps),
-      quota_v1_oracle_batch_k_(quota_v1_oracle_batch_k),
       quota_v1_kernel_stage_(quota_v1_kernel_stage),
       balance_threshold_(balance_threshold),
       placement_cpu_dirty_(num_layers, false),
@@ -349,6 +343,9 @@ Manager::Manager(const int& num_layers,
     EP_HOST_ASSERT(runtime::is_runtime_initialized and "Runtime must be initialized before creating Manager");
     EP_HOST_ASSERT(!(use_quota_solver_ && use_gpu_solver_) &&
                    "use_quota_solver and use_gpu_solver are mutually exclusive; quota solver runs on GPU independently");
+    EP_HOST_ASSERT(
+        (quota_v1_kernel_stage_ == 0 || quota_v1_kernel_stage_ == 1) &&
+        "quota v1 supports only kernel_stage in {0,1}; stage 2/3 has been removed");
     num_global_physical_experts = num_local_physical_experts * runtime::num_ranks;
     num_global_logical_experts = num_local_master_experts * runtime::num_ranks;
 
@@ -731,10 +728,7 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
                                        quota_min_tokens_per_replica_,
                                        quota_allow_zero_master_quota_,
                                        quota_locality_aware_,
-                                       quota_solver_version_,
-                                       quota_v1_oracle_mode_,
                                        quota_v1_oracle_eps_,
-                                       quota_v1_oracle_batch_k_,
                                        quota_v1_kernel_stage_,
                                        nullptr);
         placement_cpu_dirty_[layer_id] = true;
@@ -822,10 +816,7 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
                                        quota_min_tokens_per_replica_,
                                        quota_allow_zero_master_quota_,
                                        quota_locality_aware_,
-                                       quota_solver_version_,
-                                       quota_v1_oracle_mode_,
                                        quota_v1_oracle_eps_,
-                                       quota_v1_oracle_batch_k_,
                                        quota_v1_kernel_stage_,
                                        nullptr);
         placement_cpu_dirty_[layer_id] = true;

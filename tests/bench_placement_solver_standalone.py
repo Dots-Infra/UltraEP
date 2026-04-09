@@ -53,13 +53,6 @@ except ImportError:
     sys.exit(1)
 
 
-V1_ORACLE_MODE_MAP = {
-    "baseline": 0,
-    "fast_t": 1,
-    "fast_t_batch": 2,
-}
-
-
 def parse_workload(spec: str) -> EPConfig:
     parts = [p for p in re.split(r"[:x/]", spec.strip()) if p]
     if len(parts) != 4:
@@ -359,14 +352,13 @@ def run_quota_benchmark(
     verbose: bool,
     locality_aware: bool = True,
     min_tokens_per_replica: int = 1,
-    solver_version: int = 1,
-    v1_oracle_mode: int = 0,
     v1_oracle_eps: float = 0.01,
-    v1_oracle_batch_k: int = 4,
     v1_kernel_stage: int = 0,
 ) -> Tuple[Dict[str, float], Dict[str, object]]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device is required for PlacementSolverQuota")
+    if v1_kernel_stage not in (0, 1):
+        raise ValueError("v1_kernel_stage supports only {0, 1}; stage 2/3 has been removed")
 
     solver, p2l, l2p, lcnts, quota, quota_prefix, rank_quota_prefix = (
         make_quota_solver_and_buffers(config)
@@ -374,9 +366,7 @@ def run_quota_benchmark(
     loads_gpu = loads.cuda()
     # 预计算 per-rank loads（不计入 solver 计时）
     expert_loads_per_rank = split_loads_per_rank(loads, config.num_ranks).cuda()
-    v1_oracle_stats = None
-    if solver_version == 1 and v1_oracle_mode in (1, 2):
-        v1_oracle_stats = torch.zeros(3, dtype=torch.int32, device=loads_gpu.device)
+    v1_oracle_stats = torch.zeros(3, dtype=torch.int32, device=loads_gpu.device)
 
     def reset():
         p2l.fill_(-1)
@@ -396,10 +386,7 @@ def run_quota_benchmark(
             min_tokens_per_replica,  # min_tokens_per_replica
             True,                    # allow_zero_master_quota
             locality_aware,
-            solver_version,
-            v1_oracle_mode,
             v1_oracle_eps,
-            v1_oracle_batch_k,
             v1_kernel_stage,
             v1_oracle_stats,
         )
@@ -409,8 +396,7 @@ def run_quota_benchmark(
         reset()
         solve_once()
     torch.cuda.synchronize()
-    if v1_oracle_stats is not None:
-        v1_oracle_stats.zero_()
+    v1_oracle_stats.zero_()
 
     # 正确性验证
     reset()
@@ -445,16 +431,15 @@ def run_quota_benchmark(
         torch.cuda.synchronize()
         times_us.append(start_evt.elapsed_time(end_evt) * 1000.0)  # ms → µs
 
-    if v1_oracle_stats is not None:
-        attempts, fast_success, fast_fallback = (
-            int(x) for x in v1_oracle_stats.detach().cpu().tolist()
-        )
-        placement_metrics["v1_fast_attempts"] = attempts
-        placement_metrics["v1_fast_success"] = fast_success
-        placement_metrics["v1_fast_fallback"] = fast_fallback
-        placement_metrics["v1_fast_fallback_rate"] = (
-            fast_fallback / attempts if attempts > 0 else 0.0
-        )
+    attempts, fast_success, fast_fallback = (
+        int(x) for x in v1_oracle_stats.detach().cpu().tolist()
+    )
+    placement_metrics["v1_fast_attempts"] = attempts
+    placement_metrics["v1_fast_success"] = fast_success
+    placement_metrics["v1_fast_fallback"] = fast_fallback
+    placement_metrics["v1_fast_fallback_rate"] = (
+        fast_fallback / attempts if attempts > 0 else 0.0
+    )
 
     return summarize_times_us(times_us), placement_metrics
 
@@ -526,12 +511,8 @@ def benchmark_one_distribution(
     verbose: bool,
     quota: bool = False,
     locality_aware: bool = True,
-    quota_solver_versions: List[int] = None,
-    quota_v1_oracle_mode: int = 0,
     quota_v1_oracle_eps: float = 0.01,
-    quota_v1_oracle_batch_k: int = 4,
     quota_v1_kernel_stages: List[int] = None,
-    quota_v1_ab: bool = False,
 ) -> bool:
     num_experts = config.num_ranks * config.num_local_master
     loads = generate_loads(dist_name, num_experts, total_tokens, seed)
@@ -586,38 +567,18 @@ def benchmark_one_distribution(
             print("  Quota SKIP  CUDA device is not available")
             all_passed = False
         else:
-            solver_runs: List[Tuple[int, int, int, str]] = []
-            versions = quota_solver_versions if quota_solver_versions else [1]
+            solver_runs: List[Tuple[int, str]] = []
             v1_stages = quota_v1_kernel_stages if quota_v1_kernel_stages else [0]
             stage_label_map = {
                 0: "base",
                 1: "v4a",
-                2: "v4b",
-                3: "v4c",
             }
-            for solver_version in versions:
-                if solver_version == 1:
-                    label_map = {v: k for k, v in V1_ORACLE_MODE_MAP.items()}
-                    oracle_modes = [(quota_v1_oracle_mode, label_map.get(quota_v1_oracle_mode, "custom"))]
-                    if quota_v1_ab:
-                        oracle_modes = [
-                            (0, "baseline"),
-                            (1, "fast_t"),
-                            (2, "fast_t_batch"),
-                        ]
-                    for kernel_stage in v1_stages:
-                        stage_label = stage_label_map.get(kernel_stage, f"v4s{kernel_stage}")
-                        for oracle_mode, oracle_label in oracle_modes:
-                            solver_runs.append((1, oracle_mode, kernel_stage, f"{oracle_label},{stage_label}"))
-                elif solver_version == 2:
-                    solver_runs.append((2, 0, 0, "v2"))
-                elif solver_version == 3:
-                    solver_runs.append((3, 0, 0, "v3"))
-                else:
-                    solver_runs.append((solver_version, 0, 0, f"v{solver_version}"))
+            for kernel_stage in v1_stages:
+                stage_label = stage_label_map.get(kernel_stage, f"v4s{kernel_stage}")
+                solver_runs.append((kernel_stage, f"fast_t,{stage_label}"))
 
             for loc in ([True, False] if config.num_local_redundant > 0 else [True]):
-                for solver_version, oracle_mode, kernel_stage, oracle_label in solver_runs:
+                for kernel_stage, oracle_label in solver_runs:
                     try:
                         quota_latency, quota_metrics = run_quota_benchmark(
                             config,
@@ -626,10 +587,7 @@ def benchmark_one_distribution(
                             bench_iters,
                             verbose,
                             locality_aware=loc,
-                            solver_version=solver_version,
-                            v1_oracle_mode=oracle_mode,
                             v1_oracle_eps=quota_v1_oracle_eps,
-                            v1_oracle_batch_k=quota_v1_oracle_batch_k,
                             v1_kernel_stage=kernel_stage,
                         )
                         print_quota_report(
@@ -661,12 +619,8 @@ def benchmark_workload(
     verbose: bool,
     quota: bool = False,
     locality_aware: bool = True,
-    quota_solver_versions: List[int] = None,
-    quota_v1_oracle_mode: int = 0,
     quota_v1_oracle_eps: float = 0.01,
-    quota_v1_oracle_batch_k: int = 4,
     quota_v1_kernel_stages: List[int] = None,
-    quota_v1_ab: bool = False,
 ) -> bool:
     print("\n" + "=" * 100)
     print(f"Workload: {format_config(config)}")
@@ -687,12 +641,8 @@ def benchmark_workload(
             verbose=verbose,
             quota=quota,
             locality_aware=locality_aware,
-            quota_solver_versions=quota_solver_versions,
-            quota_v1_oracle_mode=quota_v1_oracle_mode,
             quota_v1_oracle_eps=quota_v1_oracle_eps,
-            quota_v1_oracle_batch_k=quota_v1_oracle_batch_k,
             quota_v1_kernel_stages=quota_v1_kernel_stages,
-            quota_v1_ab=quota_v1_ab,
         ) and ok
     return ok
 
@@ -729,46 +679,12 @@ def main() -> None:
         help="同时跑 PlacementSolverQuota benchmark（locality=on 和 off 各一轮）",
     )
     parser.add_argument(
-        "--quota-v2",
-        action="store_true",
-        help="quota solver 使用 V2 kernel（solver_version=2）",
-    )
-    parser.add_argument(
-        "--quota-v3",
-        action="store_true",
-        help="quota solver 使用 V3 kernel（solver_version=3，并行 D1）",
-    )
-    parser.add_argument(
-        "--quota-v1-oracle-mode",
-        choices=tuple(V1_ORACLE_MODE_MAP.keys()),
-        default="baseline",
-        help="V1 oracle 模式：baseline / fast_t / fast_t_batch",
-    )
-    parser.add_argument(
         "--quota-v1-eps",
         type=float,
         default=0.01,
         help="V1 fast_t 模式阈值附加系数 eps（默认 0.01）",
     )
-    parser.add_argument(
-        "--quota-v1-batch-k",
-        type=int,
-        default=4,
-        help="V1 fast_t_batch 模式 batch-k（默认 4）",
-    )
-    parser.add_argument(
-        "--quota-v1-ab",
-        action="store_true",
-        help="V1 oracle A/B：一次跑 baseline, fast_t, fast_t_batch",
-    )
     parser.add_argument("--quota-v4a", action="store_true", help="V1 kernel 启用 V4a 优化阶段")
-    parser.add_argument("--quota-v4b", action="store_true", help="V1 kernel 启用 V4b 优化阶段")
-    parser.add_argument("--quota-v4c", action="store_true", help="V1 kernel 启用 V4c 优化阶段")
-    parser.add_argument(
-        "--quota-v4-ab",
-        action="store_true",
-        help="V1 kernel V4 A/B/C 阶段 A/B test（一次跑 stage=1,2,3）",
-    )
     parser.add_argument(
         "--locality-aware",
         action="store_true",
@@ -781,7 +697,7 @@ def main() -> None:
         action="store_false",
     )
     args = parser.parse_args()
-    if args.quota_v2 or args.quota_v3 or args.quota_v1_ab or args.quota_v4a or args.quota_v4b or args.quota_v4c or args.quota_v4_ab:
+    if args.quota_v4a:
         args.quota = True
 
     try:
@@ -800,36 +716,9 @@ def main() -> None:
         args.quota = False
 
     all_passed = True
-    quota_v1_oracle_mode = V1_ORACLE_MODE_MAP[args.quota_v1_oracle_mode]
-    quota_solver_versions: List[int] = []
     quota_v1_kernel_stages: List[int] = [0]
     if args.quota:
-        include_v1 = (
-            args.quota_v1_ab
-            or args.quota_v4_ab
-            or args.quota_v4a
-            or args.quota_v4b
-            or args.quota_v4c
-            or (not args.quota_v2 and not args.quota_v3)
-        )
-        if args.quota_v4_ab:
-            quota_v1_kernel_stages = [1, 2, 3]
-        else:
-            stages = []
-            if args.quota_v4a:
-                stages.append(1)
-            if args.quota_v4b:
-                stages.append(2)
-            if args.quota_v4c:
-                stages.append(3)
-            if stages:
-                quota_v1_kernel_stages = stages
-        if include_v1:
-            quota_solver_versions.append(1)
-        if args.quota_v2:
-            quota_solver_versions.append(2)
-        if args.quota_v3:
-            quota_solver_versions.append(3)
+        quota_v1_kernel_stages = [1] if args.quota_v4a else [0]
     for config in workloads:
         all_passed = benchmark_workload(
             config=config,
@@ -843,12 +732,8 @@ def main() -> None:
             verbose=args.verbose,
             quota=args.quota,
             locality_aware=args.locality_aware,
-            quota_solver_versions=quota_solver_versions,
-            quota_v1_oracle_mode=quota_v1_oracle_mode,
             quota_v1_oracle_eps=args.quota_v1_eps,
-            quota_v1_oracle_batch_k=args.quota_v1_batch_k,
             quota_v1_kernel_stages=quota_v1_kernel_stages,
-            quota_v1_ab=args.quota_v1_ab,
         ) and all_passed
 
     print("\n" + ("ALL CHECKS PASSED" if all_passed else "SOME CHECKS FAILED"))

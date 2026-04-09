@@ -191,10 +191,7 @@ public:
                int32_t min_tokens_per_replica = 1,
                bool allow_zero_master_quota = true,
                bool locality_aware = true,
-               int solver_version = 1,
-               int v1_oracle_mode = 0,
                float v1_oracle_eps = 0.01f,
-               int v1_oracle_batch_k = 4,
                int v1_kernel_stage = 0,
                int32_t* v1_oracle_stats = nullptr) const;
 
@@ -332,10 +329,7 @@ inline void register_apis(pybind11::module_& m) {
                 int32_t min_tokens_per_replica,
                 bool allow_zero_master_quota,
                 bool locality_aware,
-                int solver_version,
-                int v1_oracle_mode,
                 float v1_oracle_eps,
-                int v1_oracle_batch_k,
                 int v1_kernel_stage,
                 pybind11::object v1_oracle_stats_obj) {
                  int32_t* v1_oracle_stats = nullptr;
@@ -356,6 +350,9 @@ inline void register_apis(pybind11::module_& m) {
                  EP_HOST_ASSERT(quota_prefix.device().is_cuda() && quota_prefix.dtype() == torch::kInt32);
                  EP_HOST_ASSERT(rank_quota_prefix.device().is_cuda() &&
                                 rank_quota_prefix.dtype() == torch::kInt32);
+                 EP_HOST_ASSERT(
+                     (v1_kernel_stage == 0 || v1_kernel_stage == 1) &&
+                     "quota v1 supports only kernel_stage in {0,1}; stage 2/3 has been removed");
                  EP_HOST_ASSERT(expert_loads.is_contiguous() && expert_loads_per_rank.is_contiguous());
                  EP_HOST_ASSERT(p2l_map.is_contiguous() && l2p_map.is_contiguous() && lcnts.is_contiguous());
                  EP_HOST_ASSERT(quota.is_contiguous() && quota_prefix.is_contiguous() &&
@@ -374,10 +371,7 @@ inline void register_apis(pybind11::module_& m) {
                             min_tokens_per_replica,
                             allow_zero_master_quota,
                             locality_aware,
-                            solver_version,
-                            v1_oracle_mode,
                             v1_oracle_eps,
-                            v1_oracle_batch_k,
                             v1_kernel_stage,
                             v1_oracle_stats);
              },
@@ -393,10 +387,7 @@ inline void register_apis(pybind11::module_& m) {
              pybind11::arg("min_tokens_per_replica") = 1,
              pybind11::arg("allow_zero_master_quota") = true,
              pybind11::arg("locality_aware") = true,
-             pybind11::arg("solver_version") = 1,
-             pybind11::arg("v1_oracle_mode") = 0,
              pybind11::arg("v1_oracle_eps") = 0.01f,
-             pybind11::arg("v1_oracle_batch_k") = 4,
              pybind11::arg("v1_kernel_stage") = 0,
              pybind11::arg("v1_oracle_stats") = pybind11::none());
 

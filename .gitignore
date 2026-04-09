@@ -27,3 +27,4 @@ bench_result/
 # Docs and local notes
 *.md
 !README.md
+!AGENTS.md

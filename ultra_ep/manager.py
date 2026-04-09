@@ -29,10 +29,7 @@ class Manager:
         quota_locality_aware: bool = True,
         quota_min_tokens_per_replica: int = 1,
         quota_allow_zero_master_quota: bool = True,
-        quota_solver_version: int = 1,
-        quota_v1_oracle_mode: int = 0,
         quota_v1_oracle_eps: float = 0.01,
-        quota_v1_oracle_batch_k: int = 4,
         quota_v1_kernel_stage: int = 0,
     ):
         # Initialize global nvshmem runtime (if not initialized)
@@ -96,6 +93,10 @@ class Manager:
         self.explicitly_destroy = explicitly_destroy
         self.use_gpu_solver = use_gpu_solver
         self.use_quota_solver = use_quota_solver
+        if quota_v1_kernel_stage not in (0, 1):
+            raise ValueError(
+                "quota_v1_kernel_stage supports only {0, 1}; stage 2/3 has been removed"
+            )
         # Quota solver keeps placement/reroute data on GPU, so grad/weight task build
         # should also use the GPU path to avoid hot-path D2H placement sync.
         self.use_gpu_task_build = self.use_gpu_solver or self.use_quota_solver
@@ -113,10 +114,7 @@ class Manager:
             quota_locality_aware,
             quota_min_tokens_per_replica,
             quota_allow_zero_master_quota,
-            quota_solver_version,
-            quota_v1_oracle_mode,
             quota_v1_oracle_eps,
-            quota_v1_oracle_batch_k,
             quota_v1_kernel_stage,
         )
         assert self.runtime.is_available()
