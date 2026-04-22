@@ -190,7 +190,8 @@ public:
                int32_t min_tokens_per_replica = 1,
                bool allow_zero_master_quota = true,
                bool locality_aware = true,
-               float oracle_eps = 0.01f) const;
+               float oracle_eps = 0.01f,
+               int kernel_stage = 1) const;
 
 private:
     int num_global_logical_experts_;
@@ -329,7 +330,8 @@ inline void register_apis(pybind11::module_& m) {
                int32_t min_tokens_per_replica,
                bool allow_zero_master_quota,
                bool locality_aware,
-               float oracle_eps) {
+               float oracle_eps,
+               int kernel_stage) {
                 EP_HOST_ASSERT(expert_loads.device().is_cuda() && expert_loads.dtype() == torch::kInt32);
                 EP_HOST_ASSERT(expert_loads_per_rank.device().is_cuda() &&
                                expert_loads_per_rank.dtype() == torch::kInt32);
@@ -343,6 +345,8 @@ inline void register_apis(pybind11::module_& m) {
                 EP_HOST_ASSERT(p2l_map.is_contiguous() && l2p_map.is_contiguous() && lcnts.is_contiguous());
                 EP_HOST_ASSERT(quota.is_contiguous() && quota_prefix.is_contiguous() &&
                                rank_quota_prefix.is_contiguous());
+                EP_HOST_ASSERT((kernel_stage == 0 || kernel_stage == 1) &&
+                               "quota kernel_stage supports only {0,1}; stage 2/3 has been removed");
                 auto stream = at::cuda::getCurrentCUDAStream();
                 self.solve(expert_loads.data_ptr<int32_t>(),
                            expert_loads_per_rank.data_ptr<int32_t>(),
@@ -357,7 +361,8 @@ inline void register_apis(pybind11::module_& m) {
                            min_tokens_per_replica,
                            allow_zero_master_quota,
                            locality_aware,
-                           oracle_eps);
+                           oracle_eps,
+                           kernel_stage);
             },
             pybind11::arg("expert_loads"),
             pybind11::arg("expert_loads_per_rank"),
@@ -371,7 +376,8 @@ inline void register_apis(pybind11::module_& m) {
             pybind11::arg("min_tokens_per_replica") = 1,
             pybind11::arg("allow_zero_master_quota") = true,
             pybind11::arg("locality_aware") = true,
-            pybind11::arg("oracle_eps") = 0.01f);
+            pybind11::arg("oracle_eps") = 0.01f,
+            pybind11::arg("kernel_stage") = 1);
 
     pybind11::class_<RerouteSolver>(m, "RerouteSolver")
         .def(pybind11::init<int, int, int>())

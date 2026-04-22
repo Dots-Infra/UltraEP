@@ -87,6 +87,7 @@ def solve_quota_case(
     min_tokens_per_replica: int = 1,
     allow_zero_master_quota: bool = True,
     oracle_eps: float = 0.01,
+    kernel_stage: int = 1,
 ):
     expert_loads = expert_loads.to(torch.int32)
     expert_loads_per_rank = split_loads_per_rank(expert_loads, config.num_ranks)
@@ -108,6 +109,7 @@ def solve_quota_case(
         allow_zero_master_quota,
         locality_aware,
         oracle_eps,
+        kernel_stage,
     )
     torch.cuda.synchronize()
 
@@ -275,6 +277,40 @@ def test_e2e_reroute_quota():
             assert total == int(my_loads[expert_idx].item())
 
         print(f"{case_name}: PASS", flush=True)
+
+
+def test_quota_kernel_stage_variants():
+    config = EPConfig(
+        num_ranks=4,
+        num_local_master=4,
+        num_local_redundant=2,
+        num_nvl_ranks=4,
+    )
+    num_experts = config.num_ranks * config.num_local_master
+    skewed_loads = torch.tensor(
+        [512, 320, 256, 192] + [32] * (num_experts - 4), dtype=torch.int32
+    )
+
+    for kernel_stage in (0, 1):
+        outputs = solve_quota_case(
+            config,
+            skewed_loads,
+            locality_aware=True,
+            oracle_eps=0.01,
+            kernel_stage=kernel_stage,
+        )
+        validate_quota_state(
+            config,
+            outputs["expert_loads"],
+            outputs["expert_loads_per_rank"],
+            outputs["p2l"],
+            outputs["l2p"],
+            outputs["lcnts"],
+            outputs["quota"],
+            outputs["quota_prefix"],
+            outputs["rank_quota_prefix"],
+            my_rank=0,
+        )
 
 
 def main():

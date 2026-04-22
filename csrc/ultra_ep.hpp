@@ -272,6 +272,8 @@ class Manager {
     int32_t quota_min_tokens_per_replica_ = 1;
     bool quota_allow_zero_master_quota_ = true;
     float quota_oracle_eps_ = 0.01f;
+    int quota_kernel_stage_ = 1;
+    bool quota_reroute_interleave_ = true;
     int weight_sync_plan_mode_ = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive);
     int weight_sync_relay_min_replicas_ = 6;
     int weight_sync_relay_max_relays_ = 8;
@@ -305,6 +307,8 @@ public:
             const int32_t& quota_min_tokens_per_replica = 1,
             const bool& quota_allow_zero_master_quota = true,
             const float& quota_oracle_eps = 0.01f,
+            const int& quota_kernel_stage = 1,
+            const bool& quota_reroute_interleave = true,
             const int& weight_sync_plan_mode = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
             const int& weight_sync_relay_min_replicas = 6,
             const int& weight_sync_relay_max_relays = 8,
@@ -409,6 +413,8 @@ static void register_apis(pybind11::module_& m) {
                             bool,
                             float,
                             int,
+                            bool,
+                            int,
                             int,
                             int,
                             int>(),
@@ -426,6 +432,8 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("quota_min_tokens_per_replica") = 1,
              pybind11::arg("quota_allow_zero_master_quota") = true,
              pybind11::arg("quota_oracle_eps") = 0.01f,
+             pybind11::arg("quota_kernel_stage") = 1,
+             pybind11::arg("quota_reroute_interleave") = true,
              pybind11::arg("weight_sync_plan_mode") = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
              pybind11::arg("weight_sync_relay_min_replicas") = 6,
              pybind11::arg("weight_sync_relay_max_relays") = 8,

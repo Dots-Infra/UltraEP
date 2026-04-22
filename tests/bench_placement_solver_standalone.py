@@ -248,6 +248,7 @@ def run_quota_benchmark(
     min_tokens_per_replica: int = 1,
     allow_zero_master_quota: bool = True,
     oracle_eps: float = 0.01,
+    kernel_stage: int = 1,
 ) -> Tuple[Dict[str, float], Dict[str, object]]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device is required for PlacementSolverQuota")
@@ -282,6 +283,7 @@ def run_quota_benchmark(
             allow_zero_master_quota,
             locality_aware,
             oracle_eps,
+            kernel_stage,
         )
 
     for _ in range(warmup_iters):
@@ -355,11 +357,12 @@ def print_quota_report(
     metrics: Dict[str, object],
     baseline: float,
     locality_aware: bool,
+    kernel_stage: int,
 ):
     imbalance = metrics["quota_imbalance"]
     improvement = baseline / imbalance if imbalance > 0 else 0.0
     print(
-        f"  QUOTA(locality={'on' if locality_aware else 'off'},oracle=fastt) "
+        f"  QUOTA(locality={'on' if locality_aware else 'off'},oracle=fastt,stage={kernel_stage}) "
         f"{format_latency(latency)}  "
         f"imbalance={imbalance:.4f}  "
         f"fill={metrics['total_filled_redundant']}/{metrics['max_possible_redundant']}  "
@@ -382,6 +385,7 @@ def benchmark_one_distribution(
     min_tokens_per_replica: int = 1,
     allow_zero_master_quota: bool = True,
     quota_oracle_eps: float = 0.01,
+    quota_kernel_stage: int = 1,
 ) -> bool:
     num_experts = config.num_ranks * config.num_local_master
     loads = generate_loads(distribution_name, num_experts, total_tokens, seed)
@@ -450,9 +454,14 @@ def benchmark_one_distribution(
                     min_tokens_per_replica=min_tokens_per_replica,
                     allow_zero_master_quota=allow_zero_master_quota,
                     oracle_eps=quota_oracle_eps,
+                    kernel_stage=quota_kernel_stage,
                 )
                 print_quota_report(
-                    quota_latency, quota_metrics, baseline, locality_aware
+                    quota_latency,
+                    quota_metrics,
+                    baseline,
+                    locality_aware,
+                    quota_kernel_stage,
                 )
             except AssertionError as exc:
                 print(f"  QUOTA FAIL  {exc}")
@@ -476,6 +485,7 @@ def benchmark_workload(
     min_tokens_per_replica: int = 1,
     allow_zero_master_quota: bool = True,
     quota_oracle_eps: float = 0.01,
+    quota_kernel_stage: int = 1,
 ) -> bool:
     print("\n" + "=" * 100)
     print(f"Workload: {format_config(config)}")
@@ -500,6 +510,7 @@ def benchmark_workload(
                 min_tokens_per_replica=min_tokens_per_replica,
                 allow_zero_master_quota=allow_zero_master_quota,
                 quota_oracle_eps=quota_oracle_eps,
+                quota_kernel_stage=quota_kernel_stage,
             )
             and ok
         )
@@ -563,6 +574,13 @@ def main() -> None:
         default=0.01,
         help="Fastt oracle epsilon",
     )
+    parser.add_argument(
+        "--quota-kernel-stage",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Quota solver kernel stage: 0 for baseline path, 1 for the v4a-optimized path",
+    )
     args = parser.parse_args()
 
     try:
@@ -598,6 +616,7 @@ def main() -> None:
                 min_tokens_per_replica=args.quota_min_tokens_per_replica,
                 allow_zero_master_quota=not args.quota_disallow_zero_master_quota,
                 quota_oracle_eps=args.quota_oracle_eps,
+                quota_kernel_stage=args.quota_kernel_stage,
             )
             and all_passed
         )

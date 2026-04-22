@@ -601,6 +601,8 @@ Manager::Manager(const int& num_layers,
                  const int32_t& quota_min_tokens_per_replica,
                  const bool& quota_allow_zero_master_quota,
                  const float& quota_oracle_eps,
+                 const int& quota_kernel_stage,
+                 const bool& quota_reroute_interleave,
                  const int& weight_sync_plan_mode,
                  const int& weight_sync_relay_min_replicas,
                  const int& weight_sync_relay_max_relays,
@@ -620,6 +622,8 @@ Manager::Manager(const int& num_layers,
       quota_min_tokens_per_replica_(quota_min_tokens_per_replica),
       quota_allow_zero_master_quota_(quota_allow_zero_master_quota),
       quota_oracle_eps_(quota_oracle_eps),
+      quota_kernel_stage_(quota_kernel_stage),
+      quota_reroute_interleave_(quota_reroute_interleave),
       weight_sync_plan_mode_(weight_sync_plan_mode),
       weight_sync_relay_min_replicas_(weight_sync_relay_min_replicas),
       weight_sync_relay_max_relays_(weight_sync_relay_max_relays),
@@ -642,6 +646,8 @@ Manager::Manager(const int& num_layers,
     EP_HOST_ASSERT(weight_sync_relay_min_replicas_ >= 0);
     EP_HOST_ASSERT(weight_sync_relay_max_relays_ >= 1);
     EP_HOST_ASSERT(weight_sync_relay_min_fanout_gain_ >= 0);
+    EP_HOST_ASSERT((quota_kernel_stage_ == 0 || quota_kernel_stage_ == 1) &&
+                   "quota kernel_stage supports only {0,1}; stage 2/3 has been removed");
     num_global_physical_experts = num_local_physical_experts * runtime::num_ranks;
     num_global_logical_experts = num_local_master_experts * runtime::num_ranks;
     _weight_sync_task_capacity = num_local_physical_experts *
@@ -1095,7 +1101,8 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
                                        quota_min_tokens_per_replica_,
                                        quota_allow_zero_master_quota_,
                                        quota_locality_aware_,
-                                       quota_oracle_eps_);
+                                       quota_oracle_eps_,
+                                       quota_kernel_stage_);
         placement_cpu_dirty_[layer_id] = true;
     } else if (use_gpu_solver_) {
         nvshmem::int32_allreduce(global_logical_expert_loads_gpu, num_global_logical_experts, curr_stream.stream());
@@ -1176,7 +1183,8 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
                                        quota_min_tokens_per_replica_,
                                        quota_allow_zero_master_quota_,
                                        quota_locality_aware_,
-                                       quota_oracle_eps_);
+                                       quota_oracle_eps_,
+                                       quota_kernel_stage_);
         placement_cpu_dirty_[layer_id] = true;
         record_placement_ready(layer_id, comm_stream);
     } else if (use_gpu_solver_) {
@@ -1302,6 +1310,7 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::reroute_cuda_forward(const int
                                                L,
                                                P,
                                                runtime::num_ranks,
+                                               quota_reroute_interleave_,
                                                stream);
         } else {
             kernels::run_reroute_forward(routing_map.data_ptr<bool>(),

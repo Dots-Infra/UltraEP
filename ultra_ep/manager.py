@@ -30,8 +30,9 @@ class Manager:
         quota_min_tokens_per_replica: int = 1024,
         quota_allow_zero_master_quota: bool = False,
         grad_reduce_sm_factor: int = 0,
-        quota_oracle_mode: str = "fastt",
         quota_oracle_eps: float = 0.01,
+        quota_kernel_stage: int = 1,
+        quota_reroute_interleave: bool = True,
         weight_sync_plan_mode: str = "adaptive",
         weight_sync_relay_min_replicas: int = 6,
         weight_sync_relay_max_relays: int = 8,
@@ -107,10 +108,9 @@ class Manager:
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
         self.use_gpu_solver = use_gpu_solver
-        normalized_quota_oracle_mode = quota_oracle_mode.lower().replace("_", "")
-        if normalized_quota_oracle_mode != "fastt":
+        if quota_kernel_stage not in (0, 1):
             raise ValueError(
-                "UltraEP only supports quota_oracle_mode='fastt' in the pruned quota solver path"
+                "quota_kernel_stage supports only {0, 1}; stage 2/3 has been removed"
             )
         normalized_weight_sync_plan_mode = weight_sync_plan_mode.lower().replace(
             "_", ""
@@ -128,6 +128,8 @@ class Manager:
         # Quota solver keeps placement/reroute data on GPU, so grad/weight task build
         # should also use the GPU path to avoid hot-path D2H placement sync.
         self.use_gpu_task_build = self.use_gpu_solver or self.use_quota_eplb_solver
+        self.quota_kernel_stage = quota_kernel_stage
+        self.quota_reroute_interleave = quota_reroute_interleave
         self.weight_sync_plan_mode = normalized_weight_sync_plan_mode
         self.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas
         self.weight_sync_relay_max_relays = weight_sync_relay_max_relays
@@ -147,6 +149,8 @@ class Manager:
             quota_min_tokens_per_replica,
             quota_allow_zero_master_quota,
             quota_oracle_eps,
+            quota_kernel_stage,
+            quota_reroute_interleave,
             weight_sync_plan_mode_map[normalized_weight_sync_plan_mode],
             weight_sync_relay_min_replicas,
             weight_sync_relay_max_relays,

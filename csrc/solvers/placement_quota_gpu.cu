@@ -2262,6 +2262,7 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
                                              bool allow_zero_master_quota,
                                              bool locality_aware,
                                              float oracle_eps,
+                                             int kernel_stage,
                                              int my_rank) {
     (void)num_ranks;
 
@@ -2275,6 +2276,8 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
     const int E = num_logical_per_nvl;
     const int G = num_nvl_ranks;
     const int stride_elems = ((E + 3) / 4) * 4;
+    const int clamped_kernel_stage = max(min(kernel_stage, 1), 0);
+    const bool enable_v4a = (clamped_kernel_stage >= 1);
     const bool use_fast_t_oracle = true;
     const bool use_dynamic_q_floor = true;
     const int oracle_batch_k = 1;
@@ -2405,27 +2408,49 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
         }
     }
     const bool do_binary_search = (num_local_redundant > 0 && G > 1);
-    __syncthreads();
-    if (tid == 0) {
-        smem_num_exports = 0;
-    }
-    __syncthreads();
-
-    if (do_binary_search) {
+    if (enable_v4a) {
         if (tid == 0) {
-            smem_fast_plan_done = 0;
-            int total_rank_load = 0;
-            int max_rank_load = 0;
-            for (int r = 0; r < G; ++r) {
-                total_rank_load += smem_rank_load[r];
-                max_rank_load = max(max_rank_load, static_cast<int>(smem_rank_load[r]));
+            smem_num_exports = 0;
+            if (do_binary_search) {
+                smem_fast_plan_done = 0;
+                int total_rank_load = 0;
+                int max_rank_load = 0;
+                for (int r = 0; r < G; ++r) {
+                    total_rank_load += smem_rank_load[r];
+                    max_rank_load = max(max_rank_load, static_cast<int>(smem_rank_load[r]));
+                }
+                const float bt = fmaxf(balance_threshold, 1.0f);
+                smem_bs_lo = static_cast<int>(ceilf((static_cast<float>(total_rank_load) / G) * bt));
+                smem_bs_hi = max(max_rank_load, smem_bs_lo);
+                smem_precheck_done = false;
             }
-            const float bt = fmaxf(balance_threshold, 1.0f);
-            smem_bs_lo = static_cast<int>(ceilf((static_cast<float>(total_rank_load) / G) * bt));
-            smem_bs_hi = max(max_rank_load, smem_bs_lo);
-            smem_precheck_done = false;
         }
         __syncthreads();
+    } else {
+        __syncthreads();
+        if (tid == 0) {
+            smem_num_exports = 0;
+        }
+        __syncthreads();
+    }
+
+    if (do_binary_search) {
+        if (!enable_v4a) {
+            if (tid == 0) {
+                smem_fast_plan_done = 0;
+                int total_rank_load = 0;
+                int max_rank_load = 0;
+                for (int r = 0; r < G; ++r) {
+                    total_rank_load += smem_rank_load[r];
+                    max_rank_load = max(max_rank_load, static_cast<int>(smem_rank_load[r]));
+                }
+                const float bt = fmaxf(balance_threshold, 1.0f);
+                smem_bs_lo = static_cast<int>(ceilf((static_cast<float>(total_rank_load) / G) * bt));
+                smem_bs_hi = max(max_rank_load, smem_bs_lo);
+                smem_precheck_done = false;
+            }
+            __syncthreads();
+        }
 
         if (use_fast_t_oracle) {
             int fast_threshold = smem_bs_lo;
@@ -2735,7 +2760,9 @@ __global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_
             const int row_offset = l_global * max_replicas_dim;
             const int slot = smem_expert_slot[expert_local]++;
             const int target_local = entry.target_rank_local;
-            const int phys_base = (domain_start_rank + target_local) * num_local_physical + num_local_master;
+            const int phys_base = enable_v4a
+                                      ? smem_rank_phys_base[target_local]
+                                      : ((domain_start_rank + target_local) * num_local_physical + num_local_master);
             const int phys_idx = phys_base + smem_next_slot[target_local]++;
             p2l_map[phys_idx] = l_global;
             l2p_map[row_offset + slot] = phys_idx;
@@ -2952,7 +2979,10 @@ void PlacementSolverQuota::solve(const int32_t* expert_loads_gpu,
                                  int32_t min_tokens_per_replica,
                                  bool allow_zero_master_quota,
                                  bool locality_aware,
-                                 float oracle_eps) const {
+                                 float oracle_eps,
+                                 int kernel_stage) const {
+    EP_HOST_ASSERT((kernel_stage == 0 || kernel_stage == 1) &&
+                   "quota kernel_stage supports only {0,1}; stage 2/3 has been removed");
     if (num_nvl_domains_ == 0) {
         return;
     }
@@ -3009,6 +3039,7 @@ void PlacementSolverQuota::solve(const int32_t* expert_loads_gpu,
                                                                         allow_zero_master_quota,
                                                                         locality_aware,
                                                                         oracle_eps,
+                                                                        kernel_stage,
                                                                         my_rank);
     CUDA_RUNTIME_CHECK(cudaGetLastError());
 }
