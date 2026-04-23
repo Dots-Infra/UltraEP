@@ -603,6 +603,7 @@ Manager::Manager(const int& num_layers,
                  const float& quota_oracle_eps,
                  const int& quota_kernel_stage,
                  const bool& quota_reroute_interleave,
+                 const int& grad_reduce_num_sms,
                  const int& weight_sync_plan_mode,
                  const int& weight_sync_relay_min_replicas,
                  const int& weight_sync_relay_max_relays,
@@ -624,6 +625,7 @@ Manager::Manager(const int& num_layers,
       quota_oracle_eps_(quota_oracle_eps),
       quota_kernel_stage_(quota_kernel_stage),
       quota_reroute_interleave_(quota_reroute_interleave),
+      grad_reduce_num_sms_(grad_reduce_num_sms),
       weight_sync_plan_mode_(weight_sync_plan_mode),
       weight_sync_relay_min_replicas_(weight_sync_relay_min_replicas),
       weight_sync_relay_max_relays_(weight_sync_relay_max_relays),
@@ -646,6 +648,9 @@ Manager::Manager(const int& num_layers,
     EP_HOST_ASSERT(weight_sync_relay_min_replicas_ >= 0);
     EP_HOST_ASSERT(weight_sync_relay_max_relays_ >= 1);
     EP_HOST_ASSERT(weight_sync_relay_min_fanout_gain_ >= 0);
+    EP_HOST_ASSERT(grad_reduce_num_sms_ > 0);
+    EP_HOST_ASSERT(grad_reduce_num_sms_ % 2 == 0 && "grad_reduce_num_sms must be even");
+    grad_reduce_num_sms_ = std::min(grad_reduce_num_sms_, runtime::num_device_sms);
     EP_HOST_ASSERT((quota_kernel_stage_ == 0 || quota_kernel_stage_ == 1) &&
                    "quota kernel_stage supports only {0,1}; stage 2/3 has been removed");
     num_global_physical_experts = num_local_physical_experts * runtime::num_ranks;
@@ -1394,10 +1399,8 @@ torch::Tensor Manager::reroute_cuda_backward(const int& layer_id,
 std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
-                                                std::string& mode,
                                                 std::optional<EventHandle>& previous_event,
-                                                bool async,
-                                                int grad_reduce_sm_factor) {
+                                                bool async) {
     EP_HOST_ASSERT(is_available());
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -1457,40 +1460,14 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                          _global_task_or_tile_counter_gpu,
                                          comm_stream);
 
-        // Launch main kernel using GPU-resident tasks
-        if (mode == "low_sm" && grad_reduce_sm_factor > 0) {
-            // Adaptive mode: use high_sm kernel with CTA count controlled by sm_factor.
-            // sm_factor=1 → ~total_tasks CTAs (similar occupancy to low_sm).
-            // Large sm_factor → converges to high_sm behavior (tile-level parallelism).
-            int num_ctas_override = std::min(runtime::num_device_sms * 2, _max_gr_total_tasks * grad_reduce_sm_factor);
-            kernels::run_grad_reduce_high_sm_from_gpu(_grad_reduce_tasks_gpu,
-                                                      _task_tile_offsets_gpu,
-                                                      _task_metadata_gpu,
-                                                      _global_task_or_tile_counter_gpu,
-                                                      comm_stream,
-                                                      runtime::num_device_sms,
-                                                      _max_gr_total_tiles,
-                                                      num_ctas_override);
-        } else if (mode == "low_sm") {
-            kernels::run_grad_reduce_low_sm_from_gpu(_grad_reduce_tasks_gpu,
-                                                     _global_task_or_tile_counter_gpu,
-                                                     _task_metadata_gpu,
-                                                     comm_stream,
-                                                     runtime::num_device_sms,
-                                                     _max_gr_total_tasks);
-        } else if (mode == "high_sm") {
-            kernels::run_grad_reduce_high_sm_from_gpu(_grad_reduce_tasks_gpu,
-                                                      _task_tile_offsets_gpu,
-                                                      _task_metadata_gpu,
-                                                      _global_task_or_tile_counter_gpu,
-                                                      comm_stream,
-                                                      runtime::num_device_sms,
-                                                      _max_gr_total_tiles);
-        } else {
-            EP_HOST_ASSERT(false && "Invalid grad reduce mode");
-        }
+        kernels::run_grad_reduce_from_gpu(_grad_reduce_tasks_gpu,
+                                          _task_tile_offsets_gpu,
+                                          _task_metadata_gpu,
+                                          _global_task_or_tile_counter_gpu,
+                                          comm_stream,
+                                          grad_reduce_num_sms_);
     } else {
-        // CPU task build path (original)
+        // CPU task build path
         EP_HOST_ASSERT(!local_master_fc1_grad_ptr_tensor.is_cuda());
         EP_HOST_ASSERT(!local_master_fc2_grad_ptr_tensor.is_cuda());
         void** local_master_fc1_grad_ptrs =
@@ -1538,38 +1515,14 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
             return event;
         }
 
-        // Call device-side kernels
-        if (mode == "low_sm" && grad_reduce_sm_factor > 0) {
-            int num_ctas_override = std::min(runtime::num_device_sms * 2, num_tasks * grad_reduce_sm_factor);
-            kernels::run_grad_reduce_high_sm(_grad_reduce_tasks_cpu,
-                                             _grad_reduce_tasks_gpu,
-                                             _global_task_or_tile_counter_gpu,
-                                             _task_tile_offsets_gpu,
-                                             _task_metadata_gpu,
-                                             num_tasks,
-                                             comm_stream,
-                                             runtime::num_device_sms,
-                                             num_ctas_override);
-        } else if (mode == "low_sm") {
-            kernels::run_grad_reduce_low_sm(_grad_reduce_tasks_cpu,
-                                            _grad_reduce_tasks_gpu,
-                                            _global_task_or_tile_counter_gpu,
-                                            _task_metadata_gpu,
-                                            num_tasks,
-                                            comm_stream,
-                                            runtime::num_device_sms);
-        } else if (mode == "high_sm") {
-            kernels::run_grad_reduce_high_sm(_grad_reduce_tasks_cpu,
-                                             _grad_reduce_tasks_gpu,
-                                             _global_task_or_tile_counter_gpu,
-                                             _task_tile_offsets_gpu,
-                                             _task_metadata_gpu,
-                                             num_tasks,
-                                             comm_stream,
-                                             runtime::num_device_sms);
-        } else {
-            EP_HOST_ASSERT(false && "Invalid grad reduce mode");
-        }
+        kernels::run_grad_reduce(_grad_reduce_tasks_cpu,
+                                 _grad_reduce_tasks_gpu,
+                                 _global_task_or_tile_counter_gpu,
+                                 _task_tile_offsets_gpu,
+                                 _task_metadata_gpu,
+                                 num_tasks,
+                                 comm_stream,
+                                 grad_reduce_num_sms_);
     }
 
     // Wait streams

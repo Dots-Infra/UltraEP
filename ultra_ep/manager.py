@@ -29,7 +29,7 @@ class Manager:
         quota_locality_aware: bool = True,
         quota_min_tokens_per_replica: int = 1024,
         quota_allow_zero_master_quota: bool = False,
-        grad_reduce_sm_factor: int = 0,
+        grad_reduce_num_sms: int = 24,
         quota_oracle_eps: float = 0.01,
         quota_kernel_stage: int = 1,
         quota_reroute_interleave: bool = True,
@@ -88,11 +88,14 @@ class Manager:
         env_quota_min = os.environ.get("ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA")
         if env_quota_min is not None:
             quota_min_tokens_per_replica = int(env_quota_min)
-
-        env_sm_factor = os.environ.get("ULTRA_EP_GRAD_REDUCE_SM_FACTOR")
-        if env_sm_factor is not None:
-            grad_reduce_sm_factor = int(env_sm_factor)
-        self.grad_reduce_sm_factor = grad_reduce_sm_factor
+        env_grad_reduce_num_sms = os.environ.get("ULTRA_EP_GRAD_REDUCE_NUM_SMS")
+        if env_grad_reduce_num_sms is not None:
+            grad_reduce_num_sms = int(env_grad_reduce_num_sms)
+        if grad_reduce_num_sms <= 0:
+            raise ValueError("grad_reduce_num_sms must be positive")
+        if grad_reduce_num_sms % 2 != 0:
+            raise ValueError("grad_reduce_num_sms must be even")
+        self.grad_reduce_num_sms = grad_reduce_num_sms
 
         # Expert loads logging
         self.log_expert_loads = os.environ.get("ULTRA_EP_LOG_EXPERT_LOADS", "0") == "1"
@@ -151,6 +154,7 @@ class Manager:
             quota_oracle_eps,
             quota_kernel_stage,
             quota_reroute_interleave,
+            self.grad_reduce_num_sms,
             weight_sync_plan_mode_map[normalized_weight_sync_plan_mode],
             weight_sync_relay_min_replicas,
             weight_sync_relay_max_relays,
@@ -333,7 +337,6 @@ class Manager:
     def grad_reduce(
         self,
         layer_id: int,
-        mode: str = "low_sm",
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
     ):
@@ -343,6 +346,10 @@ class Manager:
             layer_id: Virtual layer ID (encodes both real layer and micro-batch
                 slot).  Used for placement map lookup in C++.  Master pointer
                 pools are looked up by the real layer ID derived from this.
+
+        Notes:
+            The grad-reduce SM budget is controlled globally via the
+            ``ULTRA_EP_GRAD_REDUCE_NUM_SMS`` environment variable.
         """
         assert layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
@@ -369,10 +376,8 @@ class Manager:
             layer_id,
             fc1_grad_ptr_pool,
             fc2_grad_ptr_pool,
-            mode,
             getattr(previous_event, "event", None),
             async_finish,
-            self.grad_reduce_sm_factor,
         )
         return EventHandle(event)
 

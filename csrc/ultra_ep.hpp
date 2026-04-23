@@ -274,6 +274,7 @@ class Manager {
     float quota_oracle_eps_ = 0.01f;
     int quota_kernel_stage_ = 1;
     bool quota_reroute_interleave_ = true;
+    int grad_reduce_num_sms_ = 24;
     int weight_sync_plan_mode_ = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive);
     int weight_sync_relay_min_replicas_ = 6;
     int weight_sync_relay_max_relays_ = 8;
@@ -309,6 +310,7 @@ public:
             const float& quota_oracle_eps = 0.01f,
             const int& quota_kernel_stage = 1,
             const bool& quota_reroute_interleave = true,
+            const int& grad_reduce_num_sms = 24,
             const int& weight_sync_plan_mode = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
             const int& weight_sync_relay_min_replicas = 6,
             const int& weight_sync_relay_max_relays = 8,
@@ -326,10 +328,8 @@ public:
     std::optional<EventHandle> grad_reduce(const int& layer_id,
                                            torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                            torch::Tensor& local_master_fc2_grad_ptr_tensor,
-                                           std::string& mode,
                                            std::optional<EventHandle>& previous_event,
-                                           bool async,
-                                           int grad_reduce_sm_factor = 0);
+                                           bool async);
     // Sync replica weights with masters
     // Parameters (ptr tensor of local master weight buffers, for the current layer):
     // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
@@ -417,6 +417,7 @@ static void register_apis(pybind11::module_& m) {
                             int,
                             int,
                             int,
+                            int,
                             int>(),
              pybind11::arg("num_layers"),
              pybind11::arg("num_local_master_experts"),
@@ -434,6 +435,7 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("quota_oracle_eps") = 0.01f,
              pybind11::arg("quota_kernel_stage") = 1,
              pybind11::arg("quota_reroute_interleave") = true,
+             pybind11::arg("grad_reduce_num_sms") = 24,
              pybind11::arg("weight_sync_plan_mode") = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
              pybind11::arg("weight_sync_relay_min_replicas") = 6,
              pybind11::arg("weight_sync_relay_max_relays") = 8,
@@ -452,10 +454,8 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("layer_id"),
              pybind11::arg("local_master_fc1_grad_ptr_tensor"),
              pybind11::arg("local_master_fc2_grad_ptr_tensor"),
-             pybind11::arg("mode"),
              pybind11::arg("previous_event"),
-             pybind11::arg("async_finish"),
-             pybind11::arg("grad_reduce_sm_factor") = 0)
+             pybind11::arg("async_finish"))
         .def("weight_sync", &Manager::weight_sync)
         .def("get_comm_stream", &Manager::get_comm_stream)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)

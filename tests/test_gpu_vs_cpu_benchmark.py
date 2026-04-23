@@ -270,9 +270,7 @@ def benchmark_full_pipeline(
             pre_fn=lambda: replica_weight_buffer.random_(0, 3),
         )
         stage_stats["grad_reduce"] = bench_stats(
-            lambda: manager.grad_reduce(
-                layer_id, mode=args.grad_reduce_mode, async_finish=False
-            ),
+            lambda: manager.grad_reduce(layer_id, async_finish=False),
             num_warmups=args.warmup_iters,
             num_tests=args.bench_iters,
             use_barrier=True,
@@ -287,9 +285,7 @@ def benchmark_full_pipeline(
             manager.update_placement(layer_id, routing_map)
             manager.reroute(layer_id, probs, routing_map, backend="cuda")
             manager.weight_sync(layer_id, async_finish=False)
-            manager.grad_reduce(
-                layer_id, mode=args.grad_reduce_mode, async_finish=False
-            )
+            manager.grad_reduce(layer_id, async_finish=False)
 
         stage_stats["total"] = bench_stats(
             pipeline_fn,
@@ -436,9 +432,6 @@ def main():
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--bench-iters", type=int, default=50)
-    parser.add_argument(
-        "--grad-reduce-mode", choices=("low_sm", "high_sm"), default="low_sm"
-    )
     parser.add_argument("--hot-expert-ratio-per-nvl-domain", type=float, default=0.03)
     parser.add_argument("--zipf-alpha", type=float, default=1.2)
     parser.add_argument("--single-hot-ratio", type=float, default=0.8)

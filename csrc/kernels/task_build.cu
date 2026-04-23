@@ -434,7 +434,7 @@ __global__ void build_grad_reduce_tasks_kernel(const TaskBuildConfig* __restrict
         }
     }
 
-    // Compute tile offsets (prefix sum) — used by high_sm mode
+    // Compute tile offsets (prefix sum) for tile-level grad_reduce scheduling
     tile_offsets[0] = 0;
     for (int t = 0; t < num_tasks; ++t) {
         int tiles = ceil_div_i64(static_cast<int64_t>(tasks[t].numel), GRAD_REDUCE_TILE_ELEMENTS);

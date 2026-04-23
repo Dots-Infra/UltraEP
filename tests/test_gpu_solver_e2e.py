@@ -297,7 +297,7 @@ def test_full_pipeline(args):
         replica_grad_buffer.copy_(replica_grad_ref)
 
         dist.barrier()
-        mgr.grad_reduce(layer_id, mode="low_sm", async_finish=False)
+        mgr.grad_reduce(layer_id, async_finish=False)
         dist.barrier()
 
         # After grad_reduce, replica grad buffer should be zeroed

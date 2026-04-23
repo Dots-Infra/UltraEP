@@ -73,8 +73,7 @@ Used during **inference** or the **forward** pass of training. It broadcasts the
 
 ### 2. `grad_reduce` (CUDA)
 Used during the **backward** pass of training. It aggregates (reduces) gradients from all redundant experts back to their respective master experts, then zeros replica gradient buffers. Since the replica grad buffer is cross-layer shared, `grad_reduce` must complete before the next layer starts computing expert gradients.
-- High-SM mode (`high_sm`): Optimized for maximum throughput when GPU resources are primarily dedicated to this reduction.
-- Low-SM mode (`low_sm`): Recommended when you need to overlap the gradient reduction with other backward computations (e.g., Attention or MLP calculations) to hide communication latency.
+`grad_reduce` now always uses the tile-parallel persistent kernel. Its overlap / occupancy budget is controlled by the `ULTRA_EP_GRAD_REDUCE_NUM_SMS` environment variable, which defaults to `24`.
 
 ### 3. `update_placement` (CPU)
 Dynamically adjusts expert placement based on real-time load statistics. It runs an EPLB-style greedy replication and bin-packing algorithm on the CPU. The algorithm is deterministic, ensuring all ranks compute identical placements without additional communication.
@@ -130,7 +129,7 @@ manager.weight_sync(layer_id=layer_x, async_finish=False)
 # --- Backward Pass ---
 # Run MoE backward to get gradients...
 # Reduce replica gradients back to masters
-manager.grad_reduce(layer_id=layer_x, mode='low_sm', async_finish=False)
+manager.grad_reduce(layer_id=layer_x, async_finish=False)
 ```
 
 ## 🔍 Hardware Support & Constraints

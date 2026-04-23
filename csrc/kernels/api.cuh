@@ -16,41 +16,25 @@ struct GradReduceTask {
     size_t numel;
 };
 
-// Run gradient reduce operation across all tasks (CPU task-build path)
+// Run gradient reduce operation across all tasks (CPU task-build path).
 // task_metadata_gpu: device buffer [2], written by this function as {total_tasks, total_tiles}
-void run_grad_reduce_low_sm(const GradReduceTask* grad_reduce_tasks_cpu,
-                            GradReduceTask* grad_reduce_tasks_gpu,
-                            int* global_task_counter_gpu,
-                            int* task_metadata_gpu,
-                            const int total_tasks,
-                            cudaStream_t stream,
-                            const int num_device_sms);
-void run_grad_reduce_high_sm(const GradReduceTask* grad_reduce_tasks_cpu,
-                             GradReduceTask* grad_reduce_tasks_gpu,
-                             int* global_tile_counter_gpu,
-                             int* task_tile_offsets_gpu,
-                             int* task_metadata_gpu,
-                             const int total_tasks,
-                             cudaStream_t stream,
-                             const int num_device_sms,
-                             int num_ctas_override = 0);
+void run_grad_reduce(const GradReduceTask* grad_reduce_tasks_cpu,
+                     GradReduceTask* grad_reduce_tasks_gpu,
+                     int* global_tile_counter_gpu,
+                     int* task_tile_offsets_gpu,
+                     int* task_metadata_gpu,
+                     const int total_tasks,
+                     cudaStream_t stream,
+                     int num_sms);
 
-// Run gradient reduce using GPU-resident tasks (no H2D copy)
+// Run gradient reduce using GPU-resident tasks (no H2D copy).
 // task_metadata_gpu must already contain {total_tasks, total_tiles} (written by build kernel)
-void run_grad_reduce_low_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
-                                     int* global_task_counter_gpu,
-                                     int* task_metadata_gpu,
-                                     cudaStream_t stream,
-                                     int num_device_sms,
-                                     int max_possible_tasks);
-void run_grad_reduce_high_sm_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
-                                      int* task_tile_offsets_gpu,
-                                      int* task_metadata_gpu,
-                                      int* global_tile_counter_gpu,
-                                      cudaStream_t stream,
-                                      int num_device_sms,
-                                      int max_possible_tiles,
-                                      int num_ctas_override = 0);
+void run_grad_reduce_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
+                              int* task_tile_offsets_gpu,
+                              int* task_metadata_gpu,
+                              int* global_tile_counter_gpu,
+                              cudaStream_t stream,
+                              int num_sms);
 
 // ============================================================================
 // Weight Sync: Broadcast master weights to replicas
