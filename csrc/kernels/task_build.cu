@@ -1,5 +1,6 @@
 #include "api.cuh"
 #include "config.cuh"
+#include "launch.cuh"
 
 namespace ultra_ep::kernels {
 
@@ -37,21 +38,22 @@ static __device__ __forceinline__ void init_weight_sync_task(WeightSyncTask& tas
     task.num_ready_signals = 0;
 }
 
-__global__ void build_weight_sync_task_lists_kernel(const TaskBuildConfig* __restrict__ config,
-                                                    const int32_t* __restrict__ p2l,
-                                                    const int32_t* __restrict__ l2p,
-                                                    const int32_t* __restrict__ lcnts,
-                                                    void* const* __restrict__ remote_weight_ptrs,
-                                                    const int64_t* __restrict__ local_master_fc1_ptrs,
-                                                    const int64_t* __restrict__ local_master_fc2_ptrs,
-                                                    __nv_bfloat16* __restrict__ local_replica_weight_buffer,
-                                                    WeightSyncTask* __restrict__ stage1_tasks,
-                                                    int* __restrict__ stage1_tile_offsets,
-                                                    int* __restrict__ stage1_task_metadata,
-                                                    int* __restrict__ stage1_remaining_tiles,
-                                                    WeightSyncTask* __restrict__ stage2_tasks,
-                                                    int* __restrict__ stage2_tile_offsets,
-                                                    int* __restrict__ stage2_task_metadata) {
+__global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
+    const TaskBuildConfig* __restrict__ config,
+    const int32_t* __restrict__ p2l,
+    const int32_t* __restrict__ l2p,
+    const int32_t* __restrict__ lcnts,
+    void* const* __restrict__ remote_weight_ptrs,
+    const int64_t* __restrict__ local_master_fc1_ptrs,
+    const int64_t* __restrict__ local_master_fc2_ptrs,
+    __nv_bfloat16* __restrict__ local_replica_weight_buffer,
+    WeightSyncTask* __restrict__ stage1_tasks,
+    int* __restrict__ stage1_tile_offsets,
+    int* __restrict__ stage1_task_metadata,
+    int* __restrict__ stage1_remaining_tiles,
+    WeightSyncTask* __restrict__ stage2_tasks,
+    int* __restrict__ stage2_tile_offsets,
+    int* __restrict__ stage2_task_metadata) {
     if (threadIdx.x != 0) {
         return;
     }
@@ -355,21 +357,24 @@ void build_weight_sync_task_lists(const TaskBuildConfig* config_gpu,
                                   int* stage2_task_metadata_gpu,
                                   int* stage2_global_tile_counter_gpu,
                                   cudaStream_t stream) {
-    build_weight_sync_task_lists_kernel<<<1, 32, 0, stream>>>(config_gpu,
-                                                              p2l_gpu,
-                                                              l2p_gpu,
-                                                              lcnts_gpu,
-                                                              remote_weight_ptrs_gpu,
-                                                              local_master_fc1_ptrs_gpu,
-                                                              local_master_fc2_ptrs_gpu,
-                                                              local_replica_weight_buffer,
-                                                              stage1_tasks_gpu,
-                                                              stage1_task_tile_offsets_gpu,
-                                                              stage1_task_metadata_gpu,
-                                                              stage1_task_remaining_tiles_gpu,
-                                                              stage2_tasks_gpu,
-                                                              stage2_task_tile_offsets_gpu,
-                                                              stage2_task_metadata_gpu);
+    const auto config = make_launch_config(dim3(1), dim3(32), stream);
+    launch_kernel(build_weight_sync_task_lists_kernel,
+                          config,
+                          config_gpu,
+                          p2l_gpu,
+                          l2p_gpu,
+                          lcnts_gpu,
+                          remote_weight_ptrs_gpu,
+                          local_master_fc1_ptrs_gpu,
+                          local_master_fc2_ptrs_gpu,
+                          local_replica_weight_buffer,
+                          stage1_tasks_gpu,
+                          stage1_task_tile_offsets_gpu,
+                          stage1_task_metadata_gpu,
+                          stage1_task_remaining_tiles_gpu,
+                          stage2_tasks_gpu,
+                          stage2_task_tile_offsets_gpu,
+                          stage2_task_metadata_gpu);
 
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(stage1_global_tile_counter_gpu, 0, sizeof(int), stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(stage2_global_tile_counter_gpu, 0, sizeof(int), stream));
@@ -379,16 +384,17 @@ void build_weight_sync_task_lists(const TaskBuildConfig* config_gpu,
 // Grad Reduce Task Build
 // ---------------------------------------------------------------------------
 
-__global__ void build_grad_reduce_tasks_kernel(const TaskBuildConfig* __restrict__ config,
-                                               const int32_t* __restrict__ p2l,
-                                               const int32_t* __restrict__ l2p,
-                                               const int32_t* __restrict__ lcnts,
-                                               void* const* __restrict__ remote_grad_ptrs,
-                                               const int64_t* __restrict__ local_master_fc1_ptrs,
-                                               const int64_t* __restrict__ local_master_fc2_ptrs,
-                                               GradReduceTask* __restrict__ tasks,
-                                               int* __restrict__ tile_offsets,
-                                               int* __restrict__ task_metadata) {
+__global__ __launch_bounds__(32) void build_grad_reduce_tasks_kernel(
+    const TaskBuildConfig* __restrict__ config,
+    const int32_t* __restrict__ p2l,
+    const int32_t* __restrict__ l2p,
+    const int32_t* __restrict__ lcnts,
+    void* const* __restrict__ remote_grad_ptrs,
+    const int64_t* __restrict__ local_master_fc1_ptrs,
+    const int64_t* __restrict__ local_master_fc2_ptrs,
+    GradReduceTask* __restrict__ tasks,
+    int* __restrict__ tile_offsets,
+    int* __restrict__ task_metadata) {
     if (threadIdx.x != 0)
         return;
 
@@ -458,16 +464,19 @@ void build_grad_reduce_tasks(const TaskBuildConfig* config_gpu,
                              int* task_metadata_gpu,
                              int* global_task_or_tile_counter_gpu,
                              cudaStream_t stream) {
-    build_grad_reduce_tasks_kernel<<<1, 32, 0, stream>>>(config_gpu,
-                                                         p2l_gpu,
-                                                         l2p_gpu,
-                                                         lcnts_gpu,
-                                                         remote_grad_ptrs_gpu,
-                                                         local_master_fc1_ptrs_gpu,
-                                                         local_master_fc2_ptrs_gpu,
-                                                         tasks_gpu,
-                                                         task_tile_offsets_gpu,
-                                                         task_metadata_gpu);
+    const auto config = make_launch_config(dim3(1), dim3(32), stream);
+    launch_kernel(build_grad_reduce_tasks_kernel,
+                          config,
+                          config_gpu,
+                          p2l_gpu,
+                          l2p_gpu,
+                          lcnts_gpu,
+                          remote_grad_ptrs_gpu,
+                          local_master_fc1_ptrs_gpu,
+                          local_master_fc2_ptrs_gpu,
+                          tasks_gpu,
+                          task_tile_offsets_gpu,
+                          task_metadata_gpu);
 
     // Reset task/tile counter for the subsequent main kernel
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_task_or_tile_counter_gpu, 0, sizeof(int), stream));

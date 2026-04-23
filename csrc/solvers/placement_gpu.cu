@@ -22,6 +22,7 @@
 #include <climits>
 #include <cstdint>
 
+#include "../kernels/launch.cuh"
 #include "../utils/exception.cuh"
 #include "api.hpp"
 
@@ -177,19 +178,19 @@ __device__ void bitonic_sort_replicas(ReplicaEntry* arr, int n_padded) {
 // ============================================================================
 
 template <int EPL, bool COMPACT_EOR>
-__global__ void placement_solve_kernel_v3(const int32_t* __restrict__ expert_loads,
-                                          int32_t* __restrict__ p2l_map,
-                                          int32_t* __restrict__ l2p_map,
-                                          int32_t* __restrict__ lcnts,
-                                          int num_nvl_ranks,
-                                          int num_local_master,
-                                          int num_local_redundant,
-                                          int num_local_physical,
-                                          int max_replicas_dim,
-                                          int num_logical_per_nvl,
-                                          int num_redundant_per_nvl,
-                                          int num_global_physical,
-                                          float balance_threshold) {
+__global__ __launch_bounds__(64) void placement_solve_kernel_v3(const int32_t* __restrict__ expert_loads,
+                                                                     int32_t* __restrict__ p2l_map,
+                                                                     int32_t* __restrict__ l2p_map,
+                                                                     int32_t* __restrict__ lcnts,
+                                                                     int num_nvl_ranks,
+                                                                     int num_local_master,
+                                                                     int num_local_redundant,
+                                                                     int num_local_physical,
+                                                                     int max_replicas_dim,
+                                                                     int num_logical_per_nvl,
+                                                                     int num_redundant_per_nvl,
+                                                                     int num_global_physical,
+                                                                     float balance_threshold) {
     const int domain = blockIdx.x;
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -859,20 +860,22 @@ void PlacementSolverGPU::solve(const int32_t* expert_loads_gpu,
 #define LAUNCH_V3(EPL_VAL, COMPACT_VAL)                                                                     \
     do {                                                                                                    \
         constexpr int NTHREADS = (COMPACT_VAL) ? 64 : 32;                                                   \
-        dim3 block(NTHREADS);                                                                               \
-        placement_solve_kernel_v3<EPL_VAL, COMPACT_VAL><<<grid, block, 0, stream>>>(expert_loads_gpu,       \
-                                                                                    p2l_gpu,                \
-                                                                                    l2p_gpu,                \
-                                                                                    lcnts_gpu,              \
-                                                                                    num_nvl_ranks_,         \
-                                                                                    num_local_master_,      \
-                                                                                    num_local_redundant_,   \
-                                                                                    num_local_physical_,    \
-                                                                                    max_replicas_dim_,      \
-                                                                                    num_logical_per_nvl_,   \
-                                                                                    num_redundant_per_nvl_, \
-                                                                                    num_global_physical_,   \
-                                                                                    balance_threshold);     \
+        const auto config = ultra_ep::kernels::make_launch_config(grid, dim3(NTHREADS), stream);   \
+        ultra_ep::kernels::launch_kernel(placement_solve_kernel_v3<EPL_VAL, COMPACT_VAL>,          \
+                                                 config,                                                    \
+                                                 expert_loads_gpu,                                          \
+                                                 p2l_gpu,                                                   \
+                                                 l2p_gpu,                                                   \
+                                                 lcnts_gpu,                                                 \
+                                                 num_nvl_ranks_,                                            \
+                                                 num_local_master_,                                         \
+                                                 num_local_redundant_,                                      \
+                                                 num_local_physical_,                                       \
+                                                 max_replicas_dim_,                                         \
+                                                 num_logical_per_nvl_,                                      \
+                                                 num_redundant_per_nvl_,                                    \
+                                                 num_global_physical_,                                      \
+                                                 balance_threshold);                                        \
     } while (0)
 
     if (compact) {

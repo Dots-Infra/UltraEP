@@ -1,12 +1,13 @@
 #include "../utils/exception.cuh"
 #include "api.cuh"
+#include "launch.cuh"
 
 namespace ultra_ep::kernels {
 
-__global__ void rmap_local_sum_kernel(const bool* __restrict__ routing_map,
-                                      int32_t* __restrict__ expert_loads,
-                                      int T,
-                                      int L) {
+__global__ __launch_bounds__(1024) void rmap_local_sum_kernel(const bool* __restrict__ routing_map,
+                                                                   int32_t* __restrict__ expert_loads,
+                                                                   int T,
+                                                                   int L) {
     // index for global_logical_expert (dimension 1), in range [0, L-1]
     int tx = threadIdx.x;
     // row group index within current Block (dimension 0), in range [0, blockDim.y-1]
@@ -67,10 +68,8 @@ void rmap_local_sum(int T,
 
     size_t smem_size = block.y * block.x * sizeof(int);
 
-    CUDA_RUNTIME_CHECK(
-        cudaFuncSetAttribute(rmap_local_sum_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    rmap_local_sum_kernel<<<grid, block, smem_size, stream>>>(routing_map_ptr, expert_loads_ptr, T, L);
+    const auto config = make_launch_config(grid, block, stream, smem_size);
+    launch_kernel(rmap_local_sum_kernel, config, routing_map_ptr, expert_loads_ptr, T, L);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,10 +82,10 @@ void rmap_local_sum(int T,
 
 static constexpr int HIST_BLOCK_SIZE = 256;
 
-__global__ void sparse_topk_histogram_kernel(const int64_t* __restrict__ topk_ids,
-                                             int32_t* __restrict__ expert_loads,
-                                             const int num_entries,
-                                             const int num_experts) {
+__global__ __launch_bounds__(HIST_BLOCK_SIZE) void sparse_topk_histogram_kernel(const int64_t* __restrict__ topk_ids,
+                                                                                      int32_t* __restrict__ expert_loads,
+                                                                                      const int num_entries,
+                                                                                      const int num_experts) {
     extern __shared__ int32_t smem_hist[];
 
     for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
@@ -124,11 +123,8 @@ void topk_local_sum(const int64_t* topk_ids_ptr,
         int smem_bytes = L * sizeof(int32_t);
         int num_blocks = min(256, (num_entries + HIST_BLOCK_SIZE - 1) / HIST_BLOCK_SIZE);
 
-        CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(
-            sparse_topk_histogram_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
-
-        sparse_topk_histogram_kernel<<<num_blocks, HIST_BLOCK_SIZE, smem_bytes, stream>>>(
-            topk_ids_ptr, expert_loads_ptr, num_entries, L);
+        const auto config = make_launch_config(dim3(num_blocks), dim3(HIST_BLOCK_SIZE), stream, smem_bytes);
+        launch_kernel(sparse_topk_histogram_kernel, config, topk_ids_ptr, expert_loads_ptr, num_entries, L);
     }
 }
 

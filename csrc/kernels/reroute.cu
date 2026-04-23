@@ -20,6 +20,7 @@
 
 #include "api.cuh"
 #include "config.cuh"
+#include "launch.cuh"
 
 namespace ultra_ep::kernels {
 
@@ -36,11 +37,12 @@ __device__ __forceinline__ int gcd_int(int a, int b) {
 // Forward pass 1: count active tokens per (expert, tile)
 // ============================================================================
 template <int TILE_T, int WARPS_PER_BLOCK>
-__global__ void reroute_forward_count_kernel(const bool* __restrict__ routing_map,
-                                             int32_t* __restrict__ tile_counts,
-                                             const int T,
-                                             const int L,
-                                             const int num_tiles) {
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void reroute_forward_count_kernel(
+    const bool* __restrict__ routing_map,
+    int32_t* __restrict__ tile_counts,
+    const int T,
+    const int L,
+    const int num_tiles) {
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int expert_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -70,20 +72,21 @@ __global__ void reroute_forward_count_kernel(const bool* __restrict__ routing_ma
 // Forward pass 2: prefix-sum of tile counts + scatter
 // ============================================================================
 template <typename scalar_t, int TILE_T, int WARPS_PER_BLOCK, bool QUOTA_MODE>
-__global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_map,
-                                               const scalar_t* __restrict__ probs,
-                                               const int32_t* __restrict__ l2p_map,
-                                               const int32_t* __restrict__ lcnts,
-                                               const int32_t* __restrict__ rank_quota_prefix,
-                                               const int32_t* __restrict__ tile_counts,
-                                               bool* __restrict__ expanded_routing_map,
-                                               scalar_t* __restrict__ expanded_probs,
-                                               const int T,
-                                               const int L,
-                                               const int P,
-                                               const int max_replicas,
-                                               const int num_tiles,
-                                               const bool interleave_by_rank_quota) {
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void reroute_forward_scatter_kernel(
+    const bool* __restrict__ routing_map,
+    const scalar_t* __restrict__ probs,
+    const int32_t* __restrict__ l2p_map,
+    const int32_t* __restrict__ lcnts,
+    const int32_t* __restrict__ rank_quota_prefix,
+    const int32_t* __restrict__ tile_counts,
+    bool* __restrict__ expanded_routing_map,
+    scalar_t* __restrict__ expanded_probs,
+    const int T,
+    const int L,
+    const int P,
+    const int max_replicas,
+    const int num_tiles,
+    const bool interleave_by_rank_quota) {
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int expert_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -225,16 +228,17 @@ __global__ void reroute_forward_scatter_kernel(const bool* __restrict__ routing_
 // Backward kernel: row-parallel gather using expanded_routing_map lookup
 // ============================================================================
 template <typename scalar_t>
-__global__ void reroute_backward_gather_kernel(const scalar_t* __restrict__ grad_expanded_probs,
-                                               const bool* __restrict__ routing_map,
-                                               const bool* __restrict__ expanded_routing_map,
-                                               const int32_t* __restrict__ l2p_map,
-                                               const int32_t* __restrict__ lcnts,
-                                               scalar_t* __restrict__ grad_probs,
-                                               const int T,
-                                               const int L,
-                                               const int P,
-                                               const int max_replicas) {
+__global__ __launch_bounds__(1024) void reroute_backward_gather_kernel(
+    const scalar_t* __restrict__ grad_expanded_probs,
+    const bool* __restrict__ routing_map,
+    const bool* __restrict__ expanded_routing_map,
+    const int32_t* __restrict__ l2p_map,
+    const int32_t* __restrict__ lcnts,
+    scalar_t* __restrict__ grad_probs,
+    const int T,
+    const int L,
+    const int P,
+    const int max_replicas) {
     const int t = blockIdx.x * blockDim.y + threadIdx.y;
     const int l = blockIdx.y * blockDim.x + threadIdx.x;
 
@@ -279,28 +283,28 @@ void run_reroute_forward(const bool* routing_map,
 
     const int num_tiles = (T + TILE_T - 1) / TILE_T;
     const int num_expert_blocks = (L + WPB - 1) / WPB;
-    dim3 grid(num_expert_blocks, num_tiles);
-    dim3 block(TPB);
+    const auto config = make_launch_config(dim3(num_expert_blocks, num_tiles), dim3(TPB), stream);
 
     // Pass 1: count active tokens per (expert, tile)
-    reroute_forward_count_kernel<TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map, tile_counts, T, L, num_tiles);
+    launch_kernel(reroute_forward_count_kernel<TILE_T, WPB>, config, routing_map, tile_counts, T, L, num_tiles);
 
     // Pass 2: prefix-sum + scatter (type-dispatched)
-    reroute_forward_scatter_kernel<float, TILE_T, WPB, false>
-        <<<grid, block, 0, stream>>>(routing_map,
-                                     static_cast<const float*>(probs),
-                                     l2p_map,
-                                     lcnts,
-                                     nullptr,
-                                     tile_counts,
-                                     expanded_routing_map,
-                                     static_cast<float*>(expanded_probs),
-                                     T,
-                                     L,
-                                     P,
-                                     max_replicas,
-                                     num_tiles,
-                                     false);
+    launch_kernel(reroute_forward_scatter_kernel<float, TILE_T, WPB, false>,
+                          config,
+                          routing_map,
+                          static_cast<const float*>(probs),
+                          l2p_map,
+                          lcnts,
+                          static_cast<const int32_t*>(nullptr),
+                          tile_counts,
+                          expanded_routing_map,
+                          static_cast<float*>(expanded_probs),
+                          T,
+                          L,
+                          P,
+                          max_replicas,
+                          num_tiles,
+                          false);
 }
 
 void run_reroute_forward_quota(const bool* routing_map,
@@ -326,26 +330,26 @@ void run_reroute_forward_quota(const bool* routing_map,
 
     const int num_tiles = (T + TILE_T - 1) / TILE_T;
     const int num_expert_blocks = (L + WPB - 1) / WPB;
-    dim3 grid(num_expert_blocks, num_tiles);
-    dim3 block(TPB);
+    const auto config = make_launch_config(dim3(num_expert_blocks, num_tiles), dim3(TPB), stream);
 
-    reroute_forward_count_kernel<TILE_T, WPB><<<grid, block, 0, stream>>>(routing_map, tile_counts, T, L, num_tiles);
+    launch_kernel(reroute_forward_count_kernel<TILE_T, WPB>, config, routing_map, tile_counts, T, L, num_tiles);
 
-    reroute_forward_scatter_kernel<float, TILE_T, WPB, true>
-        <<<grid, block, 0, stream>>>(routing_map,
-                                     static_cast<const float*>(probs),
-                                     l2p_map,
-                                     lcnts,
-                                     rank_quota_prefix,
-                                     tile_counts,
-                                     expanded_routing_map,
-                                     static_cast<float*>(expanded_probs),
-                                     T,
-                                     L,
-                                     P,
-                                     max_replicas,
-                                     num_tiles,
-                                     interleave_by_rank_quota);
+    launch_kernel(reroute_forward_scatter_kernel<float, TILE_T, WPB, true>,
+                          config,
+                          routing_map,
+                          static_cast<const float*>(probs),
+                          l2p_map,
+                          lcnts,
+                          rank_quota_prefix,
+                          tile_counts,
+                          expanded_routing_map,
+                          static_cast<float*>(expanded_probs),
+                          T,
+                          L,
+                          P,
+                          max_replicas,
+                          num_tiles,
+                          interleave_by_rank_quota);
 }
 
 void run_reroute_backward(const void* grad_expanded_probs,
@@ -365,19 +369,21 @@ void run_reroute_backward(const void* grad_expanded_probs,
     // 2D block: x = expert dimension (up to 256), y = rows per block
     const int block_x = min(L, 256);
     const int block_y = min(REROUTE_BWD_ROWS_PER_BLOCK, 1024 / block_x);
-    dim3 block(block_x, block_y);
-    dim3 grid((T + block_y - 1) / block_y, (L + block_x - 1) / block_x);
+    const auto config = make_launch_config(
+        dim3((T + block_y - 1) / block_y, (L + block_x - 1) / block_x), dim3(block_x, block_y), stream);
 
-    reroute_backward_gather_kernel<float><<<grid, block, 0, stream>>>(static_cast<const float*>(grad_expanded_probs),
-                                                                      routing_map,
-                                                                      expanded_routing_map,
-                                                                      l2p_map,
-                                                                      lcnts,
-                                                                      static_cast<float*>(grad_probs),
-                                                                      T,
-                                                                      L,
-                                                                      P,
-                                                                      max_replicas);
+    launch_kernel(reroute_backward_gather_kernel<float>,
+                          config,
+                          static_cast<const float*>(grad_expanded_probs),
+                          routing_map,
+                          expanded_routing_map,
+                          l2p_map,
+                          lcnts,
+                          static_cast<float*>(grad_probs),
+                          T,
+                          L,
+                          P,
+                          max_replicas);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,14 +432,14 @@ __device__ __forceinline__ int sparse_replica_index(const int local_ordinal,
 }
 
 template <bool QUOTA_MODE>
-__global__ void reroute_sparse_kernel(int64_t* __restrict__ topk_ids,
-                                      const int32_t* __restrict__ l2p_map,
-                                      const int32_t* __restrict__ replica_counts,
-                                      const int32_t* __restrict__ rank_quota_prefix,
-                                      int* __restrict__ counters,
-                                      const int num_entries,
-                                      const int max_replicas,
-                                      const int num_experts) {
+__global__ __launch_bounds__(256) void reroute_sparse_kernel(int64_t* __restrict__ topk_ids,
+                                                                  const int32_t* __restrict__ l2p_map,
+                                                                  const int32_t* __restrict__ replica_counts,
+                                                                  const int32_t* __restrict__ rank_quota_prefix,
+                                                                  int* __restrict__ counters,
+                                                                  const int num_entries,
+                                                                  const int max_replicas,
+                                                                  const int num_experts) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_entries; idx += gridDim.x * blockDim.x) {
         int64_t logical_id = topk_ids[idx];
         if (logical_id < 0 || logical_id >= num_experts)
@@ -470,8 +476,17 @@ void run_reroute_sparse_impl(int64_t* topk_ids_ptr,
     if (num_entries > 0) {
         constexpr int BLOCK = 256;
         int num_blocks = min(256, (num_entries + BLOCK - 1) / BLOCK);
-        reroute_sparse_kernel<QUOTA_MODE><<<num_blocks, BLOCK, 0, stream>>>(
-            topk_ids_ptr, l2p_map_gpu, lcnts_gpu, rank_quota_prefix_gpu, counters_gpu, num_entries, max_replicas, L);
+        const auto config = make_launch_config(dim3(num_blocks), dim3(BLOCK), stream);
+        launch_kernel(reroute_sparse_kernel<QUOTA_MODE>,
+                              config,
+                              topk_ids_ptr,
+                              l2p_map_gpu,
+                              lcnts_gpu,
+                              rank_quota_prefix_gpu,
+                              counters_gpu,
+                              num_entries,
+                              max_replicas,
+                              L);
     }
 }
 
@@ -518,10 +533,10 @@ void run_reroute_sparse_quota(int64_t* topk_ids_ptr,
                                   stream);
 }
 
-__global__ void reduce_per_rank_loads_kernel(const int32_t* __restrict__ loads_per_rank,
-                                             int32_t* __restrict__ global_loads,
-                                             int G,
-                                             int L) {
+__global__ __launch_bounds__(256) void reduce_per_rank_loads_kernel(const int32_t* __restrict__ loads_per_rank,
+                                                                          int32_t* __restrict__ global_loads,
+                                                                          int G,
+                                                                          int L) {
     for (int l = blockIdx.x * blockDim.x + threadIdx.x; l < L; l += blockDim.x * gridDim.x) {
         int32_t total = 0;
         for (int r = 0; r < G; ++r) {
@@ -536,7 +551,8 @@ void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads,
         return;
     constexpr int BLOCK = 256;
     int grid = min(1024, (L + BLOCK - 1) / BLOCK);
-    reduce_per_rank_loads_kernel<<<grid, BLOCK, 0, stream>>>(loads_per_rank, global_loads, G, L);
+    const auto config = make_launch_config(dim3(grid), dim3(BLOCK), stream);
+    launch_kernel(reduce_per_rank_loads_kernel, config, loads_per_rank, global_loads, G, L);
 }
 
 }  // namespace ultra_ep::kernels

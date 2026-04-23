@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include "../kernels/launch.cuh"
 #include "../kernels/ptx.cuh"
 #include "../utils/exception.cuh"
 #include "api.hpp"
@@ -1253,25 +1254,26 @@ __device__ __noinline__ void build_rank_quota_prefix_slow(int expert_local,
 }
 
 template <int EPL, bool COMPACT_EOR, bool PARALLEL_D1 = false>
-__global__ void quota_placement_solve_kernel_v2(const int32_t* __restrict__ expert_loads,
-                                                const int32_t* __restrict__ expert_loads_per_rank,
-                                                int32_t* __restrict__ p2l_map,
-                                                int32_t* __restrict__ l2p_map,
-                                                int32_t* __restrict__ lcnts,
-                                                int32_t* __restrict__ quota,
-                                                int32_t* __restrict__ quota_prefix,
-                                                int32_t* __restrict__ rank_quota_prefix,
-                                                int num_nvl_ranks,
-                                                int num_local_master,
-                                                int num_local_redundant,
-                                                int num_local_physical,
-                                                int max_replicas_dim,
-                                                int num_logical_per_nvl,
-                                                int num_redundant_per_nvl,
-                                                int num_global_logical_experts,
-                                                float balance_threshold,
-                                                bool locality_aware,
-                                                int my_rank) {
+__global__ __launch_bounds__(64) void quota_placement_solve_kernel_v2(
+    const int32_t* __restrict__ expert_loads,
+    const int32_t* __restrict__ expert_loads_per_rank,
+    int32_t* __restrict__ p2l_map,
+    int32_t* __restrict__ l2p_map,
+    int32_t* __restrict__ lcnts,
+    int32_t* __restrict__ quota,
+    int32_t* __restrict__ quota_prefix,
+    int32_t* __restrict__ rank_quota_prefix,
+    int num_nvl_ranks,
+    int num_local_master,
+    int num_local_redundant,
+    int num_local_physical,
+    int max_replicas_dim,
+    int num_logical_per_nvl,
+    int num_redundant_per_nvl,
+    int num_global_logical_experts,
+    float balance_threshold,
+    bool locality_aware,
+    int my_rank) {
     extern __shared__ int32_t smem_domain_loads[];
 
     const int domain = blockIdx.x;
@@ -2241,29 +2243,30 @@ __global__ void quota_placement_solve_kernel_v2(const int32_t* __restrict__ expe
     }
 }
 
-__global__ void quota_placement_solve_kernel(const int32_t* __restrict__ expert_loads,
-                                             const int32_t* __restrict__ expert_loads_per_rank,
-                                             int32_t* __restrict__ p2l_map,
-                                             int32_t* __restrict__ l2p_map,
-                                             int32_t* __restrict__ lcnts,
-                                             int32_t* __restrict__ quota,
-                                             int32_t* __restrict__ quota_prefix,
-                                             int32_t* __restrict__ rank_quota_prefix,
-                                             int num_ranks,
-                                             int num_nvl_ranks,
-                                             int num_local_master,
-                                             int num_local_redundant,
-                                             int num_local_physical,
-                                             int max_replicas_dim,
-                                             int num_global_logical_experts,
-                                             int num_logical_per_nvl,
-                                             float balance_threshold,
-                                             int32_t min_tokens_per_replica,
-                                             bool allow_zero_master_quota,
-                                             bool locality_aware,
-                                             float oracle_eps,
-                                             int kernel_stage,
-                                             int my_rank) {
+__global__ __launch_bounds__(QUOTA_SOLVER_THREADS) void quota_placement_solve_kernel(
+    const int32_t* __restrict__ expert_loads,
+    const int32_t* __restrict__ expert_loads_per_rank,
+    int32_t* __restrict__ p2l_map,
+    int32_t* __restrict__ l2p_map,
+    int32_t* __restrict__ lcnts,
+    int32_t* __restrict__ quota,
+    int32_t* __restrict__ quota_prefix,
+    int32_t* __restrict__ rank_quota_prefix,
+    int num_ranks,
+    int num_nvl_ranks,
+    int num_local_master,
+    int num_local_redundant,
+    int num_local_physical,
+    int max_replicas_dim,
+    int num_global_logical_experts,
+    int num_logical_per_nvl,
+    float balance_threshold,
+    int32_t min_tokens_per_replica,
+    bool allow_zero_master_quota,
+    bool locality_aware,
+    float oracle_eps,
+    int kernel_stage,
+    int my_rank) {
     (void)num_ranks;
 
     extern __shared__ char smem_dynamic_raw[];
@@ -3010,37 +3013,37 @@ void PlacementSolverQuota::solve(const int32_t* expert_loads_gpu,
     const size_t domain_loads_bytes = static_cast<size_t>(num_nvl_ranks_) * stride_elems * sizeof(int32_t);
     const size_t occ_offset = (domain_loads_bytes + 7u) & ~size_t(7);
     const int my_rank = runtime::is_runtime_initialized ? runtime::rank_idx : 0;
-    dim3 grid(num_nvl_domains_);
+    const dim3 grid(num_nvl_domains_);
 
     const size_t occ_bytes = 2 * static_cast<size_t>(QUOTA_SOLVER_WARPS) * num_logical_per_nvl_ * sizeof(uint64_t);
     const size_t smem_size_v1 = occ_offset + occ_bytes;
-    CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(
-        quota_placement_solve_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size_v1)));
-
-    dim3 block(QUOTA_SOLVER_THREADS);
-    quota_placement_solve_kernel<<<grid, block, smem_size_v1, stream>>>(expert_loads_gpu,
-                                                                        expert_loads_per_rank_gpu,
-                                                                        p2l_gpu,
-                                                                        l2p_gpu,
-                                                                        lcnts_gpu,
-                                                                        quota_gpu,
-                                                                        quota_prefix_gpu,
-                                                                        rank_quota_prefix_gpu,
-                                                                        num_ranks_,
-                                                                        num_nvl_ranks_,
-                                                                        num_local_master_,
-                                                                        num_local_redundant_,
-                                                                        num_local_physical_,
-                                                                        max_replicas_dim_,
-                                                                        num_global_logical_experts_,
-                                                                        num_logical_per_nvl_,
-                                                                        balance_threshold,
-                                                                        min_tokens_per_replica,
-                                                                        allow_zero_master_quota,
-                                                                        locality_aware,
-                                                                        oracle_eps,
-                                                                        kernel_stage,
-                                                                        my_rank);
+    const auto config = ultra_ep::kernels::make_launch_config(
+        grid, dim3(QUOTA_SOLVER_THREADS), stream, smem_size_v1);
+    ultra_ep::kernels::launch_kernel(quota_placement_solve_kernel,
+                                             config,
+                                             expert_loads_gpu,
+                                             expert_loads_per_rank_gpu,
+                                             p2l_gpu,
+                                             l2p_gpu,
+                                             lcnts_gpu,
+                                             quota_gpu,
+                                             quota_prefix_gpu,
+                                             rank_quota_prefix_gpu,
+                                             num_ranks_,
+                                             num_nvl_ranks_,
+                                             num_local_master_,
+                                             num_local_redundant_,
+                                             num_local_physical_,
+                                             max_replicas_dim_,
+                                             num_global_logical_experts_,
+                                             num_logical_per_nvl_,
+                                             balance_threshold,
+                                             min_tokens_per_replica,
+                                             allow_zero_master_quota,
+                                             locality_aware,
+                                             oracle_eps,
+                                             kernel_stage,
+                                             my_rank);
     CUDA_RUNTIME_CHECK(cudaGetLastError());
 }
 

@@ -2,6 +2,7 @@
 
 #include "api.cuh"
 #include "config.cuh"
+#include "launch.cuh"
 
 namespace ultra_ep::kernels {
 
@@ -73,10 +74,11 @@ __device__ __forceinline__ TileInfo get_tile_info(const GradReduceTask* tasks,
 }
 
 // task_metadata: device pointer to [total_tasks, total_tiles]
-__global__ void grad_reduce_kernel(const GradReduceTask* grad_reduce_tasks,
-                                   const int* task_tile_offsets,
-                                   const int* task_metadata,
-                                   int* global_tile_counter) {
+__global__ __launch_bounds__(GRAD_REDUCE_THREADS_PER_BLOCK) void grad_reduce_kernel(
+    const GradReduceTask* grad_reduce_tasks,
+    const int* task_tile_offsets,
+    const int* task_metadata,
+    int* global_tile_counter) {
     extern __shared__ float smem_pool[];
 
     ptx::mbarrier* mbarrier_ptr = ptx::create_mbarrier();
@@ -161,26 +163,6 @@ __global__ void grad_reduce_kernel(const GradReduceTask* grad_reduce_tasks,
 }
 
 // ============================================================================
-// Launch helpers
-// ============================================================================
-
-static void launch_grad_reduce(GradReduceTask* grad_reduce_tasks_gpu,
-                               int* task_tile_offsets_gpu,
-                               int* task_metadata_gpu,
-                               int* global_tile_counter_gpu,
-                               int num_ctas,
-                               cudaStream_t stream) {
-    dim3 grid(num_ctas);
-    dim3 block(GRAD_REDUCE_THREADS_PER_BLOCK);
-    int smem_size = GRAD_REDUCE_TILE_SIZE_BYTES;
-
-    CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(grad_reduce_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    grad_reduce_kernel<<<grid, block, smem_size, stream>>>(
-        grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu);
-}
-
-// ============================================================================
 // CPU task-build path
 // ============================================================================
 
@@ -221,8 +203,10 @@ void run_grad_reduce(const GradReduceTask* grad_reduce_tasks_cpu,
                                        stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
 
-    launch_grad_reduce(
-        grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu, num_sms, stream);
+    const auto config = make_launch_config(
+        dim3(num_sms), dim3(GRAD_REDUCE_THREADS_PER_BLOCK), stream, GRAD_REDUCE_TILE_SIZE_BYTES);
+    launch_kernel(
+        grad_reduce_kernel, config, grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu);
 }
 
 // ============================================================================
@@ -235,8 +219,10 @@ void run_grad_reduce_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
                               int* global_tile_counter_gpu,
                               cudaStream_t stream,
                               int num_sms) {
-    launch_grad_reduce(
-        grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu, num_sms, stream);
+    const auto config = make_launch_config(
+        dim3(num_sms), dim3(GRAD_REDUCE_THREADS_PER_BLOCK), stream, GRAD_REDUCE_TILE_SIZE_BYTES);
+    launch_kernel(
+        grad_reduce_kernel, config, grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu);
 }
 
 }  // namespace ultra_ep::kernels

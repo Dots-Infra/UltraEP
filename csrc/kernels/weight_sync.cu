@@ -2,6 +2,7 @@
 
 #include "api.cuh"
 #include "config.cuh"
+#include "launch.cuh"
 
 namespace ultra_ep::kernels {
 
@@ -117,14 +118,15 @@ __device__ __forceinline__ void wait_for_weight_sync_task_ready(const WeightSync
 // This achieves true overlap of local HBM reads and remote NVLINK writes.
 //
 // task_metadata: device pointer to [total_tasks, total_tiles] (set by CPU or GPU task build)
-__global__ void weight_sync_kernel(const WeightSyncTask* weight_sync_tasks,
-                                   const int* task_tile_offsets,
-                                   const int* task_metadata,
-                                   int* global_tile_counter,
-                                   int* task_remaining_tiles,
-                                   uint64_t* local_ready_flags,
-                                   uint64_t* const* remote_ready_flag_ptrs,
-                                   uint64_t current_epoch) {
+__global__ __launch_bounds__(WEIGHT_SYNC_THREADS_PER_BLOCK) void weight_sync_kernel(
+    const WeightSyncTask* weight_sync_tasks,
+    const int* task_tile_offsets,
+    const int* task_metadata,
+    int* global_tile_counter,
+    int* task_remaining_tiles,
+    uint64_t* local_ready_flags,
+    uint64_t* const* remote_ready_flag_ptrs,
+    uint64_t current_epoch) {
     // Double-buffered shared memory
     extern __shared__ __nv_bfloat16 smem_base[];
     __nv_bfloat16* smem[2] = {smem_base, smem_base + WEIGHT_SYNC_TILE_ELEMENTS};
@@ -275,36 +277,6 @@ __global__ void weight_sync_kernel(const WeightSyncTask* weight_sync_tasks,
     }
 }
 
-// Helper to configure and launch the weight sync kernel
-static void launch_weight_sync_kernel(WeightSyncTask* weight_sync_tasks_gpu,
-                                      int* task_tile_offsets_gpu,
-                                      int* task_metadata_gpu,
-                                      int* global_tile_counter_gpu,
-                                      int* task_remaining_tiles_gpu,
-                                      uint64_t* local_ready_flags,
-                                      uint64_t* const* remote_ready_flag_ptrs_gpu,
-                                      uint64_t current_epoch,
-                                      int num_ctas,
-                                      cudaStream_t stream) {
-    dim3 grid(num_ctas);
-    dim3 block(WEIGHT_SYNC_THREADS_PER_BLOCK);
-
-    // Double buffer shared memory
-    int smem_size = WEIGHT_SYNC_TILE_SIZE_BYTES * WEIGHT_SYNC_PIPELINE_STAGES;
-
-    CUDA_RUNTIME_CHECK(
-        cudaFuncSetAttribute(weight_sync_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    weight_sync_kernel<<<grid, block, smem_size, stream>>>(weight_sync_tasks_gpu,
-                                                           task_tile_offsets_gpu,
-                                                           task_metadata_gpu,
-                                                           global_tile_counter_gpu,
-                                                           task_remaining_tiles_gpu,
-                                                           local_ready_flags,
-                                                           remote_ready_flag_ptrs_gpu,
-                                                           current_epoch);
-}
-
 // CPU task-build path: H2D copy tasks + tile offsets, write metadata, then launch kernel
 void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
                      WeightSyncTask* weight_sync_tasks_gpu,
@@ -360,19 +332,22 @@ void run_weight_sync(const WeightSyncTask* weight_sync_tasks_cpu,
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
 
     // Configure kernel launch
-    int num_ctas = min(num_device_sms * cta_multiplier, total_tiles);
-    num_ctas = max(num_ctas, 1);
+    const int num_ctas = clamp_num_ctas(num_device_sms * cta_multiplier, total_tiles);
+    const auto config = make_launch_config(dim3(num_ctas),
+                                                   dim3(WEIGHT_SYNC_THREADS_PER_BLOCK),
+                                                   stream,
+                                                   WEIGHT_SYNC_TILE_SIZE_BYTES * WEIGHT_SYNC_PIPELINE_STAGES);
 
-    launch_weight_sync_kernel(weight_sync_tasks_gpu,
-                              task_tile_offsets_gpu,
-                              task_metadata_gpu,
-                              global_tile_counter_gpu,
-                              task_remaining_tiles_gpu,
-                              local_ready_flags,
-                              remote_ready_flag_ptrs_gpu,
-                              current_epoch,
-                              num_ctas,
-                              stream);
+    launch_kernel(weight_sync_kernel,
+                          config,
+                          weight_sync_tasks_gpu,
+                          task_tile_offsets_gpu,
+                          task_metadata_gpu,
+                          global_tile_counter_gpu,
+                          task_remaining_tiles_gpu,
+                          local_ready_flags,
+                          remote_ready_flag_ptrs_gpu,
+                          current_epoch);
 }
 
 // GPU task-build path: tasks already on GPU (written by build_weight_sync_tasks kernel)
@@ -389,19 +364,22 @@ void run_weight_sync_from_gpu(WeightSyncTask* tasks_gpu,
                               int max_possible_tiles,
                               int cta_multiplier) {
     // Use conservative upper bound for grid size; persistent kernel handles over-launch
-    int num_ctas = min(num_device_sms * cta_multiplier, max_possible_tiles);
-    num_ctas = max(num_ctas, 1);
+    const int num_ctas = clamp_num_ctas(num_device_sms * cta_multiplier, max_possible_tiles);
+    const auto config = make_launch_config(dim3(num_ctas),
+                                                   dim3(WEIGHT_SYNC_THREADS_PER_BLOCK),
+                                                   stream,
+                                                   WEIGHT_SYNC_TILE_SIZE_BYTES * WEIGHT_SYNC_PIPELINE_STAGES);
 
-    launch_weight_sync_kernel(tasks_gpu,
-                              task_tile_offsets_gpu,
-                              task_metadata_gpu,
-                              global_tile_counter_gpu,
-                              task_remaining_tiles_gpu,
-                              local_ready_flags,
-                              remote_ready_flag_ptrs_gpu,
-                              current_epoch,
-                              num_ctas,
-                              stream);
+    launch_kernel(weight_sync_kernel,
+                          config,
+                          tasks_gpu,
+                          task_tile_offsets_gpu,
+                          task_metadata_gpu,
+                          global_tile_counter_gpu,
+                          task_remaining_tiles_gpu,
+                          local_ready_flags,
+                          remote_ready_flag_ptrs_gpu,
+                          current_epoch);
 }
 
 }  // namespace ultra_ep::kernels
