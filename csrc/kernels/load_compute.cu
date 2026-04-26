@@ -128,4 +128,28 @@ void topk_local_sum(const int64_t* topk_ids_ptr,
     }
 }
 
+
+__global__ __launch_bounds__(256) void reduce_per_rank_loads_kernel(const int32_t* __restrict__ loads_per_rank,
+                                                                          int32_t* __restrict__ global_loads,
+                                                                          int G,
+                                                                          int L) {
+    for (int l = blockIdx.x * blockDim.x + threadIdx.x; l < L; l += blockDim.x * gridDim.x) {
+        int32_t total = 0;
+        for (int r = 0; r < G; ++r) {
+            total += loads_per_rank[r * L + l];
+        }
+        global_loads[l] = total;
+    }
+}
+
+void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads, int G, int L, cudaStream_t stream) {
+    if (G <= 0 || L <= 0)
+        return;
+    constexpr int BLOCK = 256;
+    int grid = min(1024, (L + BLOCK - 1) / BLOCK);
+    const auto config = make_launch_config(dim3(grid), dim3(BLOCK), stream);
+    launch_kernel(reduce_per_rank_loads_kernel, config, loads_per_rank, global_loads, G, L);
+}
+
+
 }  // namespace ultra_ep::kernels

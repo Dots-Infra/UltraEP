@@ -9,10 +9,9 @@
 #include <string>
 #include <tuple>
 
-#include "config.hpp"
 #include "kernels/api.cuh"
+#include "kernels/config.cuh"
 #include "runtime.hpp"
-#include "solvers/api.hpp"
 #include "utils/event.hpp"
 #include "utils/exception.cuh"
 #include "utils/nvshmem.cuh"
@@ -55,14 +54,14 @@ struct GlobalExpertPlacement {
     torch::Tensor logical_instance_quota;
     torch::Tensor logical_instance_quota_prefix;
 
-    // GPU tensor views (strided views into gpu_buffer)
-    torch::Tensor physical_to_logical_map_gpu;
-    torch::Tensor logical_to_physical_map_gpu;
-    torch::Tensor logical_replica_counts_gpu;
-    torch::Tensor logical_instance_quota_gpu;
-    torch::Tensor logical_instance_quota_prefix_gpu;
+    // Device tensor views (strided views into device_buffer)
+    torch::Tensor physical_to_logical_map_device;
+    torch::Tensor logical_to_physical_map_device;
+    torch::Tensor logical_replica_counts_device;
+    torch::Tensor logical_instance_quota_device;
+    torch::Tensor logical_instance_quota_prefix_device;
     // Per-rank quota prefix only needs a device copy.
-    torch::Tensor rank_quota_prefix_gpu;
+    torch::Tensor rank_quota_prefix;
 
     // Contiguous per-layer buffer management.
     // Layout per layer:
@@ -70,9 +69,9 @@ struct GlobalExpertPlacement {
     // with padding to alignment.
     // Cross-layer stride is per_layer_stride_numel (may be > per_layer_data_numel for alignment).
     int32_t* cpu_buffer = nullptr;  // pinned host memory
-    int32_t* gpu_buffer = nullptr;  // device memory
+    int32_t* device_buffer = nullptr;
     int32_t* quota_buf_cpu = nullptr;
-    int32_t* quota_buf_gpu = nullptr;
+    int32_t* quota_buf_device = nullptr;
 
     int num_layers_ = 0;
     int p2l_numel = 0;               // = num_global_physical_experts
@@ -100,13 +99,13 @@ struct GlobalExpertPlacement {
     // Free contiguous buffers. Safe to call multiple times.
     void cleanup();
 
-    // Copy placement data from CPU to GPU for one layer (layer_id >= 0) or all layers (layer_id == -1).
+    // Copy placement data from CPU to device for one layer (layer_id >= 0) or all layers (layer_id == -1).
     // Uses the given CUDA stream (or current stream if not specified).
-    void to_gpu(const int layer_id = -1,
-                const bool async = true,
-                std::optional<at::cuda::CUDAStream> stream = std::nullopt) const;
+    void to_device(const int layer_id = -1,
+                   const bool async = true,
+                   std::optional<at::cuda::CUDAStream> stream = std::nullopt) const;
 
-    // Copy placement data from GPU to CPU for one layer (layer_id >= 0) or all layers (layer_id == -1).
+    // Copy placement data from device to CPU for one layer (layer_id >= 0) or all layers (layer_id == -1).
     // Used to refresh the host-visible mirror on demand for CPU fallbacks and debugging.
     void to_cpu(const int layer_id = -1,
                 const bool async = true,
@@ -114,63 +113,9 @@ struct GlobalExpertPlacement {
 
     // Raw pointer access for a specific layer.
     std::tuple<int32_t*, int32_t*, int32_t*> get_cpu_ptrs(int layer_id) const;
-    std::tuple<int32_t*, int32_t*, int32_t*> get_gpu_ptrs(int layer_id) const;
+    std::tuple<int32_t*, int32_t*, int32_t*> get_device_ptrs(int layer_id) const;
     std::tuple<int32_t*, int32_t*, int32_t*> get_quota_cpu_ptrs(int layer_id) const;
-    std::tuple<int32_t*, int32_t*, int32_t*> get_quota_gpu_ptrs(int layer_id) const;
-};
-
-// Pre-allocated CUDA output buffers for reroute (lazy init).
-// NOTE: forward buffer is layer-independent in training to ensure correctness.
-//       Backward buffer can be reused across layers (layers process sequentially).
-class RerouteOutputBuffer {
-    bool is_train_;
-    int num_layers_;
-    int num_global_logical_experts_;
-    int num_global_physical_experts_;
-    // FWD: [num_layers, T, P] (train), [T, P] (inference)
-    torch::Tensor reroute_expand_probs_buf_;  // probs dtype
-    // FWD: [num_layers, T, P] (train), [T, P] (inference)
-    torch::Tensor reroute_expand_rmap_buf_;  // bool
-    // BWD: [T, L] (only for train, shared across layers)
-    torch::Tensor reroute_grad_probs_buf_;  // probs dtype
-    // FWD scratch: [L, max_num_tiles] int32 — tile counts for two-pass forward
-    torch::Tensor reroute_tile_counts_buf_;
-    // Flags: track if each layer is zero-filled
-    std::vector<bool> reroute_layer_valid_flags_;  // train
-    bool reroute_inf_valid_flag_ = false;
-    bool reroute_bwd_valid_flag_ = false;
-    // Sizes:
-    size_t reroute_expand_probs_nbytes_per_layer_ = 0;
-    size_t reroute_expand_rmap_nbytes_per_layer_ = 0;
-
-public:
-    RerouteOutputBuffer(const int num_layers,
-                        const int num_global_logical_experts,
-                        const int num_global_physical_experts,
-                        const bool is_train);
-    std::tuple<void*, bool*> get_or_create_fwd_bufs(const int num_tokens,
-                                                    const int layer_id,
-                                                    const torch::ScalarType probs_dtype);
-    void* get_or_create_bwd_buf(const int num_tokens, const torch::ScalarType probs_dtype);
-    int32_t* get_or_create_tile_counts(const int L, const int num_tiles);
-    void zero_out_fwd_bufs(const int layer_id, at::cuda::CUDAStream& stream);
-    void zero_out_bwd_buf(at::cuda::CUDAStream& stream);
-    bool get_fwd_valid_flag(const int layer_id) {
-        return is_train_ ? reroute_layer_valid_flags_[layer_id] : reroute_inf_valid_flag_;
-    };
-    void set_fwd_valid_flag(const int layer_id, bool valid) {
-        if (is_train_) {
-            reroute_layer_valid_flags_[layer_id] = valid;
-        } else {
-            reroute_inf_valid_flag_ = valid;
-        }
-    };
-    bool get_bwd_valid_flag() { return reroute_bwd_valid_flag_; };
-    void set_bwd_valid_flag(bool valid) { reroute_bwd_valid_flag_ = valid; };
-
-    // Retrieve forward's expanded_routing_map pointer for use in backward.
-    // The buffer persists from forward to backward within the same training iteration.
-    const bool* get_fwd_expanded_rmap_ptr(const int layer_id) const;
+    std::tuple<int32_t*, int32_t*, int32_t*> get_quota_ptrs(int layer_id) const;
 };
 
 class Manager {
@@ -213,61 +158,47 @@ class Manager {
 
     // Host-side remote memory pointers obtained via nvshmem_ptr() for NVL ranks
     // Shape: [num_nvl_ranks,]
-    void* global_replica_weight_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
-    void* global_replica_grad_buffer_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
-    uint64_t* global_weight_sync_ready_flag_ptrs[MAX_NVL_DOMAIN_SIZE] = {nullptr};
+    void* global_replica_weight_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
+    void* global_replica_grad_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
+    uint64_t* global_weight_sync_ready_flag_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
 
     // Intermediate buffers for grad reduce tasks
-    kernels::GradReduceTask* _grad_reduce_tasks_cpu = nullptr;
-    kernels::GradReduceTask* _grad_reduce_tasks_gpu = nullptr;
-    int* _global_task_or_tile_counter_gpu = nullptr;
-    int* _task_tile_offsets_gpu = nullptr;
+    kernels::GradReduceTask* _grad_reduce_tasks = nullptr;
+    int* _global_task_or_tile_counter = nullptr;
+    int* _task_tile_offsets = nullptr;
 
     // Intermediate buffers for weight sync tasks
-    kernels::WeightSyncTask* _weight_sync_tasks_cpu = nullptr;
-    kernels::WeightSyncTask* _weight_sync_tasks_gpu = nullptr;
+    kernels::WeightSyncTask* _weight_sync_tasks = nullptr;
     int _weight_sync_task_capacity = 0;
-    // Reuse _global_task_or_tile_counter_gpu and _task_tile_offsets_gpu for stage-1
-    // weight sync and grad_reduce.
-    int* _task_tile_offsets_cpu = nullptr;
-    int* _weight_sync_task_remaining_tiles_gpu = nullptr;
-    kernels::WeightSyncTask* _relay_weight_sync_tasks_cpu = nullptr;
-    kernels::WeightSyncTask* _relay_weight_sync_tasks_gpu = nullptr;
-    int* _relay_task_tile_offsets_cpu = nullptr;
-    int* _relay_task_tile_offsets_gpu = nullptr;
-    int* _relay_task_metadata_gpu = nullptr;
-    int* _relay_global_tile_counter_gpu = nullptr;
+    int* _weight_sync_task_remaining_tiles = nullptr;
+    kernels::WeightSyncTask* _relay_weight_sync_tasks = nullptr;
+    int* _relay_task_tile_offsets = nullptr;
+    int* _relay_task_metadata = nullptr;
+    int* _relay_global_tile_counter = nullptr;
     uint64_t* local_weight_sync_ready_flags = nullptr;
     uint64_t _weight_sync_epoch = 0;
 
-    // Task metadata: [total_tasks, total_tiles] written by CPU or GPU task build path,
-    // read by the stage-1 kernel from device memory.
-    int* _task_metadata_gpu = nullptr;
+    // Task metadata: [total_tasks, total_tiles], written by task-build kernels and
+    // consumed by the stage-1 persistent kernels.
+    int* _task_metadata = nullptr;
 
-    // GPU task build support: config + remote pointer tables + staging buffer
-    kernels::TaskBuildConfig* _task_build_config_gpu = nullptr;
-    void** _remote_weight_ptrs_gpu = nullptr;           // [MAX_NVL_DOMAIN_SIZE]
-    void** _remote_grad_ptrs_gpu = nullptr;             // [MAX_NVL_DOMAIN_SIZE]
-    uint64_t** _remote_ready_flag_ptrs_gpu = nullptr;   // [MAX_NVL_DOMAIN_SIZE]
-    int64_t* _local_master_ptrs_staging_gpu = nullptr;  // [2 * num_local_master_experts]
-    // Pre-computed upper bounds for GPU-path grid sizing
+    // Device task-build support: config + remote pointer tables.
+    kernels::TaskBuildConfig* _task_build_config = nullptr;
+    void** _remote_weight_ptrs = nullptr;         // [kMaxNvlDomainSize]
+    void** _remote_grad_ptrs = nullptr;           // [kMaxNvlDomainSize]
+    uint64_t** _remote_ready_flag_ptrs = nullptr; // [kMaxNvlDomainSize]
+    // Pre-computed upper bounds for device-path grid sizing
     int _max_ws_total_tiles = 0;
     int _max_gr_total_tasks = 0;
     int _max_gr_total_tiles = 0;
 
     // Sparse reroute: per-expert round-robin counters [num_global_logical_experts]
-    int* _reroute_sparse_counters_gpu = nullptr;
+    int* _reroute_sparse_counters = nullptr;
 
     // Early-stop balance threshold for replica allocation
     float balance_threshold_ = 1.0f;
 
-    // Solvers
-    std::unique_ptr<solver::PlacementSolver> placement_solver_;
-    std::unique_ptr<solver::PlacementSolverGPU> placement_solver_gpu_;
-    std::unique_ptr<solver::PlacementSolverQuota> placement_solver_quota_;
-    std::unique_ptr<solver::RerouteSolver> reroute_solver_;
-    bool use_gpu_solver_ = false;
-    bool use_quota_solver_ = false;
+    bool legacy_placement_ = false;
     bool quota_locality_aware_ = true;
     int32_t quota_min_tokens_per_replica_ = 1;
     bool quota_allow_zero_master_quota_ = true;
@@ -281,13 +212,10 @@ class Manager {
     int weight_sync_relay_min_fanout_gain_ = 2;
     std::vector<bool> placement_cpu_dirty_;
     // Shape: [num_global_logical_experts]
-    int* global_logical_expert_loads_cpu = nullptr;  // pinned memory for CPU-side placement solver
-    int* global_logical_expert_loads_gpu = nullptr;  // alloc by nvshmem for allreduce
-    int32_t* local_expert_loads_gpu = nullptr;       // [L] — symmetric source buffer for allgather
-    int32_t* expert_loads_per_rank_gpu = nullptr;    // [num_ranks, L] — symmetric allgather output
-
-    // Reroute output buffer management
-    std::unique_ptr<RerouteOutputBuffer> reroute_output_buffer_;
+    int* global_logical_expert_loads = nullptr;      // alloc by nvshmem for allreduce
+    int* global_logical_expert_loads_cpu = nullptr;  // host scratch for legacy placement
+    int32_t* local_expert_loads = nullptr;           // [L] — symmetric source buffer for allgather
+    int32_t* expert_loads_per_rank = nullptr;        // [num_ranks, L] — symmetric allgather output
 
     int placement_sync_slot(const int layer_id) const { return is_train ? layer_id : 0; }
     void record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream);
@@ -301,9 +229,8 @@ public:
             const int64_t& expert_fc2_numel,
             const bool& is_train,
             const bool& explicitly_destroy,
-            const bool& use_gpu_solver = false,
+            const bool& legacy_placement = false,
             const float& balance_threshold = 1.0f,
-            const bool& use_quota_solver = false,
             const bool& quota_locality_aware = true,
             const int32_t& quota_min_tokens_per_replica = 1,
             const bool& quota_allow_zero_master_quota = true,
@@ -342,7 +269,7 @@ public:
 
     // Update expert placement for a single layer based on real-time load statistics.
     // routing_map: [num_tokens, num_global_logical_experts], bool, logical routing map.
-    // Runs on CPU or GPU depending on use_gpu_solver_. Deterministic across all ranks.
+    // Uses the default device placement path unless legacy placement is enabled.
     void update_placement(const int& layer_id, torch::Tensor& routing_map);
 
     // Sparse variant: compute expert loads from topk_ids [T, K] int64 instead of dense routing_map.
@@ -352,28 +279,15 @@ public:
     // topk_ids: [T, K] int64, modified in-place on GPU.
     void reroute_sparse(const int& layer_id, torch::Tensor& topk_ids);
 
-    // Expand logical routing map to physical routing map (CPU path).
-    // routing_map: [num_tokens, num_logical_experts], bool, logical routing map.
-    // Returns:
-    // - token_indices: [num_tokens], int64, token indices in the expanded routing map.
-    // - logical_indices: [num_tokens], int64, logical expert indices in the expanded routing map.
-    // - physical_indices: [num_tokens], int64, physical expert indices in the expanded routing map.
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> reroute_cpu(const int& layer_id,
-                                                                        torch::Tensor& routing_map);
+    // Expand logical routing to physical routing in dense [T, L] form.
+    std::tuple<torch::Tensor, torch::Tensor> dense_reroute_forward(const int& layer_id,
+                                                                   torch::Tensor& probs,
+                                                                   torch::Tensor& routing_map);
 
-    // CUDA reroute with pre-allocated output buffers (Manager owns the memory).
-    // Buffers are lazily created on first use and reused across layers.
-    // Each call returns fresh from_blob views (independent version counters).
-    // Forward:  zeros + reroute kernel → (expanded_probs, expanded_routing_map)
-    // Backward: zeros + backward kernel → grad_probs
-    std::tuple<torch::Tensor, torch::Tensor> reroute_cuda_forward(const int& layer_id,
-                                                                  torch::Tensor& probs,
-                                                                  torch::Tensor& routing_map);
-
-    torch::Tensor reroute_cuda_backward(const int& layer_id,
-                                        torch::Tensor& grad_expanded_probs,
-                                        torch::Tensor& routing_map,
-                                        torch::Tensor& expanded_routing_map);
+    torch::Tensor dense_reroute_backward(const int& layer_id,
+                                         torch::Tensor& grad_expanded_probs,
+                                         torch::Tensor& routing_map,
+                                         torch::Tensor& expanded_routing_map);
 
     torch::Stream get_comm_stream() const { return comm_stream; }
 
@@ -387,9 +301,9 @@ public:
     torch::Tensor get_logical_replica_counts_tensor() const { return placement.logical_replica_counts; }
     torch::Tensor get_logical_instance_quota_tensor() const { return placement.logical_instance_quota; }
     torch::Tensor get_logical_instance_quota_prefix_tensor() const { return placement.logical_instance_quota_prefix; }
-    torch::Tensor get_rank_quota_prefix_tensor() const { return placement.rank_quota_prefix_gpu; }
+    torch::Tensor get_rank_quota_prefix_tensor() const { return placement.rank_quota_prefix; }
     torch::Tensor get_global_logical_expert_loads_tensor() const {
-        return make_tensor_from_buffer(global_logical_expert_loads_gpu,
+        return make_tensor_from_buffer(global_logical_expert_loads,
                                        {num_global_logical_experts},
                                        torch::kInt32,
                                        torch::Device(torch::kCUDA, runtime::device_id));
@@ -408,7 +322,6 @@ static void register_apis(pybind11::module_& m) {
                             bool,
                             float,
                             bool,
-                            bool,
                             int32_t,
                             bool,
                             float,
@@ -426,9 +339,8 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("expert_fc2_numel"),
              pybind11::arg("is_train"),
              pybind11::arg("explicitly_destroy"),
-             pybind11::arg("use_gpu_solver") = false,
+             pybind11::arg("legacy_placement") = false,
              pybind11::arg("balance_threshold") = 1.0f,
-             pybind11::arg("use_quota_solver") = false,
              pybind11::arg("quota_locality_aware") = true,
              pybind11::arg("quota_min_tokens_per_replica") = 1,
              pybind11::arg("quota_allow_zero_master_quota") = true,
@@ -446,9 +358,8 @@ static void register_apis(pybind11::module_& m) {
         .def("update_placement", &Manager::update_placement)
         .def("update_placement_sparse", &Manager::update_placement_sparse)
         .def("reroute_sparse", &Manager::reroute_sparse)
-        .def("reroute_cpu", &Manager::reroute_cpu)
-        .def("reroute_cuda_forward", &Manager::reroute_cuda_forward)
-        .def("reroute_cuda_backward", &Manager::reroute_cuda_backward)
+        .def("dense_reroute_forward", &Manager::dense_reroute_forward)
+        .def("dense_reroute_backward", &Manager::dense_reroute_backward)
         .def("grad_reduce",
              &Manager::grad_reduce,
              pybind11::arg("layer_id"),

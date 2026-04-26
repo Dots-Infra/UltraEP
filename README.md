@@ -1,106 +1,39 @@
-# UltraEP: Online Expert Load Balancing for Large-Scale MoE Serving and Training
+# UltraEP
 
-UltraEP is a high-performance, online expert load balancing library specifically designed for Mixture-of-Experts (MoE) training and inference. It provides efficient synchronization of expert weights and gradients across GPUs, enabling flexible expert placement and redundant expert strategies to mitigate load imbalance. It incurs near-zero latency or memory overhead with dedicated kernels and layer-reused replica weight/gradient buffers.
+UltraEP is an online expert load balancing runtime for large-scale MoE training and inference. It keeps expert placement, token reroute, weight synchronization, and gradient reduction on device so placement updates can run once per layer and per microbatch without pulling the hot path back to the CPU.
 
-## 🚀 Roadmap
+## What It Does
 
-- [x] Intra-NVLINK domain master-replica synchronization.
-- [x] High-performance `weight_sync` and `grad_reduce` kernels.
-- [x] Support for SM90 (H100/H800) and SM100 (Blackwell) architectures.
-- [x] Advanced online expert placement and token dispatch algorithms.
-- [x] Deep integration with mainstream training and inference frameworks (e.g., Megatron-LM, SGLang, vLLM).
-- [ ] Support for FP8 training/serving.
-- [ ] C2C expert offloading for reduced NVLink traffic contention.
-- [ ] CUDA graph integration with pure on-device kernels.
-- [ ] Support for cross-RDMA (Inter-node) expert synchronization.
+UltraEP manages four pieces of the MoE runtime:
 
-## 💡 Background & Concepts
+- `update_placement`: updates expert placement from live router load statistics.
+- `reroute`: expands logical routing to physical routing for dense `[T, L]` routing maps.
+- `reroute_sparse`: rewrites sparse `topk_ids` in place from logical IDs to physical IDs.
+- `weight_sync` / `grad_reduce`: synchronize replica weights and gradients inside an NVLink domain.
 
-In MoE models, token distribution across experts can be highly skewed, leading to computational bottlenecks on certain "hot" experts. UltraEP addresses this by allowing experts to be replicated across different GPUs.
+The current codebase has two placement modes:
 
-### Key Concepts
+- Default placement: quota-aware on-device placement.
+- Legacy placement: CPU placement behind `Manager(..., legacy_placement=True)`.
 
-- **Logical Experts**: The experts as defined in the model architecture (e.g., E0, E1, ..., E7).
-- **Physical Experts**: The actual expert instances stored on physical GPUs.
-- **Master Expert**: The primary physical instance of a logical expert, responsible for maintaining the authoritative weights and optimizer states.
-- **Redundant (Replica) Expert**: Additional physical instances of a logical expert, used to share the computation load. They only store weights and gradients shared by layers without optimizer states.
+Everything outside the legacy placement implementation stays on device.
 
-![EPLB Modeling](images/eplb_modeling.png)
+## Current Runtime Model
 
-### Data Structures
+### Placement
 
-UltraEP uses layer-wise mappings to delineate the state of expert placement:
-- `physical_to_logical_map`: Maps each physical expert on a GPU to its corresponding logical expert ID.
-- `logical_to_physical_map`: Maps each logical expert to its master and replica physical locations.
-- `logical_replica_counts`: Tracks the total number of physical instances (master + replicas) for each logical expert.
+By default, `update_placement()` uses the quota-aware device placement kernel. It consumes live expert loads, computes replica placement, and materializes:
 
-## 🛠️ Setup
+- `physical_to_logical_map`
+- `logical_to_physical_map`
+- `logical_replica_counts`
+- `logical_instance_quota`
+- `logical_instance_quota_prefix`
+- `rank_quota_prefix`
 
-### Prerequisites
-- Hardware: Only support SM90 and SM100 GPUs.
-- Dependencies:
-  - `nvshmem`: High-performance communication library for NVIDIA GPUs.
-  ```bash
-  # For CUDA 12.x
-  pip install nvidia-nvshmem-cu12
-  # For CUDA 13.x
-  pip install nvdia-nvshmem-cu13==3.4.5
-  ```
-
-### Build and Install
-```bash
-# Clone the repository
-git clone https://github.com/your-repo/UltraEP.git
-cd UltraEP
-
-# Build the project
-# CUDA 12.x
-./build.sh
-# For CUDA 13.x, you need to compile NVSHMEM v3.4.5 from source first,
-# then set the installation path
-NVSHMEM_DIR=/path/to/nvshmem/install python setup.py bdist_wheel
-
-# Install the generated wheel
-pip install dist/*.whl
-```
-
-## 📖 Usage
-
-UltraEP currently provides two primary operators for managing master-replica synchronization. Both sync and async modes are supported for flexible overlapping control:
-
-### 1. `weight_sync` (CUDA)
-Used during **inference** or the **forward** pass of training. It broadcasts the weights from the master expert to all its redundant experts across the NVLINK domain. This should be finished before the MoE computation starts in each layer.
-
-### 2. `grad_reduce` (CUDA)
-Used during the **backward** pass of training. It aggregates (reduces) gradients from all redundant experts back to their respective master experts, then zeros replica gradient buffers. Since the replica grad buffer is cross-layer shared, `grad_reduce` must complete before the next layer starts computing expert gradients.
-`grad_reduce` now always uses the tile-parallel persistent kernel. Its overlap / occupancy budget is controlled by the `ULTRA_EP_GRAD_REDUCE_NUM_SMS` environment variable, which defaults to `24`.
-
-### 3. `update_placement` (CPU)
-Dynamically adjusts expert placement based on real-time load statistics. It runs an EPLB-style greedy replication and bin-packing algorithm on the CPU. The algorithm is deterministic, ensuring all ranks compute identical placements without additional communication.
-
-### GPU Placement Solver
-UltraEP now also supports a GPU placement path via `Manager(..., use_gpu_solver=True)`.
-The manager pre-creates `PlacementSolverGPU` and keeps the hot-path buffers resident on device, so `update_placement()` can stay on GPU after the NVSHMEM allreduce instead of paying the usual D2H sync, CPU solve, and H2D copy cost.
-
-The current GPU solver targets the common EPLB workloads where `num_ranks` is 32 or 64, the global expert count is 128/192/256, and each rank has 1 or 2 redundant experts. The solver keeps the same placement invariants as the CPU implementation and is exercised by:
-
-```bash
-python3 tests/bench_placement_solver_standalone.py --solver both
-torchrun --nproc_per_node=4 tests/test_gpu_vs_cpu_benchmark.py --benchmark all
-```
-
-`balance_threshold` is an optional early-stop knob for replica allocation. When it is greater than `0`, the solver stops adding more replicas once each expert's per-replica load is within `balance_threshold x average_per_slot_load`. In practice, a slightly larger threshold trades a bit of placement optimality for less `weight_sync` / `grad_reduce` traffic and lower EPLB overhead.
-
-### 4. `reroute` (CUDA)
-A high-performance CUDA kernel that expands token routing from logical experts to physical experts. It uses deterministic round-robin dispatch to distribute tokens among master and replica instances, effectively balancing the computation load across the NVLINK domain.
-
-### Example Code Snippet
+If you need the old CPU placement path for compatibility, create the manager with:
 
 ```python
-import torch
-import ultra_ep
-
-# Initialize Manager
 manager = ultra_ep.Manager(
     group=dist.group.WORLD,
     num_layers=48,
@@ -108,54 +41,178 @@ manager = ultra_ep.Manager(
     num_local_redundant_experts=2,
     expert_fc1_numel=3072 * 4096,
     expert_fc2_numel=1536 * 4096,
+    legacy_placement=True,
 )
-
-# ... (Register master weight/grad buffers) ...
-
-# --- Token Dispatch & Placement ---
-# Update placement based on routing map
-manager.update_placement(layer_id=layer_x, routing_map=routing_map)
-
-# Reroute tokens to physical experts (master + replicas)
-expanded_probs, expanded_routing_map = manager.reroute(
-    layer_id=layer_x, probs=probs, routing_map=routing_map
-)
-
-# --- Forward Pass ---
-# Sync master weights to replicas before MoE calculation
-manager.weight_sync(layer_id=layer_x, async_finish=False)
-# Run MoE forward using expanded_probs and expanded_routing_map...
-
-# --- Backward Pass ---
-# Run MoE backward to get gradients...
-# Reduce replica gradients back to masters
-manager.grad_reduce(layer_id=layer_x, async_finish=False)
 ```
 
-## 🔍 Hardware Support & Constraints
+That legacy path keeps the public interface identical to the default path: inputs and outputs are still device tensors, and the extra D2H/H2D traffic is contained inside the legacy placement implementation.
 
-- NVLINK Domain: Supports automatic detection of NVLINK domain size.
-- Architectures: Optimized for SM90 (max NVL size 8) and SM100 (super nodes like NVL72).
-- Current Constraint: Synchronization is currently limited to within a single NVLINK domain. Expert placement must ensure that a logical expert's master and all its replicas reside within the same NVLINK domain.
+### Dense Reroute
 
-## 🧪 Testing
+Dense reroute always runs on device:
 
-You can run the provided tests to verify correctness and benchmark performance:
+- default placement uses quota-aware dense reroute
+- legacy placement uses round-robin dense reroute
+
+Autograd is handled by a thin Python wrapper over the C++ runtime:
+
+- forward builds `expanded_probs` and `expanded_routing_map`
+- backward gathers gradients from physical space back to logical space
+
+### Sparse Reroute
+
+Sparse reroute rewrites `topk_ids` in place:
+
+- default placement uses quota-aware sparse reroute
+- legacy placement uses round-robin sparse reroute
+
+### Weight Sync And Grad Reduce
+
+Both kernels always use the device task-build path. The task planner reads the current placement directly from device memory and launches the persistent kernels without any CPU-side task construction.
+
+## Build
+
+### Requirements
+
+- SM90 or SM100 GPUs
+- NVSHMEM
+- CUDA 12.x or 13.x
+
+Install NVSHMEM:
 
 ```bash
-# Test Weight Synchronization
-torchrun --nproc_per_node=4 ..... tests/test_weight_sync.py
+# CUDA 12.x
+pip install nvidia-nvshmem-cu12
 
-# Test Gradient Reduction
-torchrun --nproc_per_node=4 ..... tests/test_grad_reduce.py
-
-# Test Expert Placement
-python3 tests/test_placement.py --num-ranks 32 --nvl-domain-size 8 \
-    --num-local-master 4 --num-local-redundant 2
-
-# Test Reroute Kernel
-torchrun --nproc_per_node=4 ..... tests/test_reroute.py \
-    --num-local-master 4 --num-local-redundant 2 --T 8192 --topk 8
+# CUDA 13.x
+pip install nvidia-nvshmem-cu13==3.4.5
 ```
 
-These tests verify numerical correctness against a golden reference and report end-to-end latency and achieved bandwidth, under either uniform or skewed expert placement (the latter might be more common in practice, with hot/cold experts unevenly distributed).
+Build the extension:
+
+```bash
+# Editable / local build
+python setup.py build_ext --inplace
+
+# Or build a wheel
+python setup.py bdist_wheel
+```
+
+If you built NVSHMEM from source, set `NVSHMEM_DIR=/path/to/nvshmem/install`.
+
+## Python API
+
+```python
+import torch
+import torch.distributed as dist
+import ultra_ep
+
+manager = ultra_ep.Manager(
+    group=dist.group.WORLD,
+    num_layers=48,
+    num_local_master_experts=4,
+    num_local_redundant_experts=2,
+    expert_fc1_numel=3072 * 4096,
+    expert_fc2_numel=1536 * 4096,
+    is_train=True,
+    max_microbatches=1,
+)
+
+manager.update_placement(layer_id, routing_map)
+expanded_probs, expanded_routing_map = manager.reroute(layer_id, probs, routing_map)
+manager.reroute_sparse(layer_id, topk_ids)
+manager.weight_sync(layer_id, async_finish=False)
+manager.grad_reduce(layer_id, async_finish=False)
+```
+
+Notes:
+
+- `Manager.reroute(..., backend="cuda")` is kept for compatibility, but only `"cuda"` is supported.
+- CPU placement mirrors are still exposed as properties. Callers that read `physical_to_logical_map`, `logical_to_physical_map`, `logical_replica_counts`, `logical_instance_quota`, or `logical_instance_quota_prefix` get the synchronized host mirror.
+
+## Configuration
+
+Algorithm and kernel tuning now live entirely on the Python side and are read from `ULTRA_EP_*` environment variables when the manager is created.
+
+### Placement And Reroute
+
+- `ULTRA_EP_BALANCE_THRESHOLD`  
+  Default: `1.0`  
+  Early-stop threshold for placement replication.
+
+- `ULTRA_EP_QUOTA_LOCALITY_AWARE`  
+  Default: `1`  
+  Enables locality-aware per-rank quota decomposition.
+
+- `ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA`  
+  Default: `1024`  
+  Lower bound used by the quota placement kernel when allocating replicas.
+
+- `ULTRA_EP_QUOTA_ALLOW_ZERO_MASTER_QUOTA`  
+  Default: `0`  
+  Allows the master instance of a logical expert to receive zero quota.
+
+- `ULTRA_EP_QUOTA_ORACLE_EPS`  
+  Default: `0.01`  
+  Numerical tolerance for the quota placement oracle.
+
+- `ULTRA_EP_QUOTA_KERNEL_STAGE`  
+  Default: `1`  
+  Selects the supported quota placement kernel stage.
+
+- `ULTRA_EP_QUOTA_REROUTE_INTERLEAVE`  
+  Default: `1`  
+  Enables deterministic quota interleaving inside quota-aware dense reroute.
+
+### Communication Planning
+
+- `ULTRA_EP_GRAD_REDUCE_NUM_SMS`  
+  Default: `24`  
+  Number of SMs reserved for the persistent grad-reduce kernel. Must be positive and even.
+
+- `ULTRA_EP_WEIGHT_SYNC_PLAN_MODE`  
+  Default: `adaptive`  
+  Supported values: `direct`, `adaptive`, `force_relay`.
+
+- `ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_REPLICAS`  
+  Default: `6`  
+  Minimum replica count before adaptive relay becomes eligible.
+
+- `ULTRA_EP_WEIGHT_SYNC_RELAY_MAX_RELAYS`  
+  Default: `8`  
+  Maximum number of relays used by staged weight sync.
+
+- `ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_FANOUT_GAIN`  
+  Default: `2`  
+  Minimum expected fanout improvement required before adaptive relay is used.
+
+### Logging
+
+- `ULTRA_EP_LOG_EXPERT_LOADS`  
+  Default: `0`  
+  Enables per-layer load-balance logging.
+
+- `ULTRA_EP_LOADS_SAVE_DIR`  
+  Default: `/var/log/ultra_ep_loads`  
+  Output directory for load-balance logs.
+
+## Tests
+
+The remaining tests focus on the current runtime surface instead of the removed standalone solver classes:
+
+```bash
+# Reroute
+torchrun --nproc_per_node=4 tests/test_reroute.py
+
+# Weight sync
+torchrun --nproc_per_node=4 tests/test_weight_sync.py
+
+# Grad reduce
+torchrun --nproc_per_node=4 tests/test_grad_reduce.py
+```
+
+## Notes
+
+- Dense and sparse reroute are explicitly separated.
+- Device placement is the default behavior; only CPU code carries an explicit legacy marker.
+- The `.cu` translation units avoid including Torch headers directly to keep compile time under control.

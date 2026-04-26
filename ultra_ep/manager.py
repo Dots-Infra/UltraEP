@@ -5,9 +5,10 @@ from typing import List, Optional
 from datetime import datetime
 
 import ultra_ep._C as _C
+from .config import load_tuning_from_env
 from .runtime import init_runtime
 from .event import EventHandle
-from .reroute import _RerouteProbsFunction, _RerouteCUDAFunction
+from .reroute import _DenseRerouteFunction
 from .util import get_max_by_mean
 
 
@@ -23,20 +24,7 @@ class Manager:
         is_train: bool = True,
         explicitly_destroy: bool = False,
         max_microbatches: int = 1,
-        use_gpu_solver: bool = False,
-        balance_threshold: float = 1.0,
-        use_quota_eplb_solver: bool = True,
-        quota_locality_aware: bool = True,
-        quota_min_tokens_per_replica: int = 1024,
-        quota_allow_zero_master_quota: bool = False,
-        grad_reduce_num_sms: int = 24,
-        quota_oracle_eps: float = 0.01,
-        quota_kernel_stage: int = 1,
-        quota_reroute_interleave: bool = True,
-        weight_sync_plan_mode: str = "adaptive",
-        weight_sync_relay_min_replicas: int = 6,
-        weight_sync_relay_max_relays: int = 8,
-        weight_sync_relay_min_fanout_gain: int = 2,
+        legacy_placement: bool = False,
     ):
         # Initialize global nvshmem runtime (if not initialized)
         self.nvl_domain_size = init_runtime(group)
@@ -70,39 +58,22 @@ class Manager:
         self.real_num_alloc_layers = num_layers + 3  # padding for 1-indexed layer IDs
         self.num_alloc_layers = self.real_num_alloc_layers * self.max_microbatches
 
-        # Master weight/grad pointer pools, indexed by REAL layer_id.
-        # These don't depend on micro-batch because the physical memory is the same.
-        self.local_master_fc1_weight_pool = [None] * self.real_num_alloc_layers
-        self.local_master_fc2_weight_pool = [None] * self.real_num_alloc_layers
-        self.local_master_fc1_weight_pool_gpu = [None] * self.real_num_alloc_layers
-        self.local_master_fc2_weight_pool_gpu = [None] * self.real_num_alloc_layers
-        self.local_master_fc1_grad_pool = [None] * self.real_num_alloc_layers
-        self.local_master_fc2_grad_pool = [None] * self.real_num_alloc_layers
-        self.local_master_fc1_grad_pool_gpu = [None] * self.real_num_alloc_layers
-        self.local_master_fc2_grad_pool_gpu = [None] * self.real_num_alloc_layers
+        # Master weight/grad pointer pools, indexed by real layer.
+        self.local_master_fc1_weight_ptr_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc2_weight_ptr_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc1_grad_ptr_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc2_grad_ptr_pool = [None] * self.real_num_alloc_layers
 
         # Per-real-layer micro-batch slot counters (wraps modulo max_microbatches)
         self._mb_counters = [0] * self.real_num_alloc_layers
 
-        # Env var overrides
-        env_quota_min = os.environ.get("ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA")
-        if env_quota_min is not None:
-            quota_min_tokens_per_replica = int(env_quota_min)
-        env_grad_reduce_num_sms = os.environ.get("ULTRA_EP_GRAD_REDUCE_NUM_SMS")
-        if env_grad_reduce_num_sms is not None:
-            grad_reduce_num_sms = int(env_grad_reduce_num_sms)
-        if grad_reduce_num_sms <= 0:
-            raise ValueError("grad_reduce_num_sms must be positive")
-        if grad_reduce_num_sms % 2 != 0:
-            raise ValueError("grad_reduce_num_sms must be even")
-        self.grad_reduce_num_sms = grad_reduce_num_sms
+        tuning = load_tuning_from_env()
+        self.grad_reduce_num_sms = tuning.grad_reduce_num_sms
 
         # Expert loads logging
-        self.log_expert_loads = os.environ.get("ULTRA_EP_LOG_EXPERT_LOADS", "0") == "1"
+        self.log_expert_loads = tuning.log_expert_loads
         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.ep_loads_save_dir = os.environ.get(
-            "ULTRA_EP_LOADS_SAVE_DIR", "/var/log/ultra_ep_loads"
-        )
+        self.ep_loads_save_dir = tuning.loads_save_dir
         os.makedirs(self.ep_loads_save_dir, exist_ok=True)
         self.ep_log_path = os.path.join(
             self.ep_loads_save_dir, f"ep_loads_{now_str}_group{self.id}.log"
@@ -110,33 +81,14 @@ class Manager:
 
         # Create cpp handle
         self.explicitly_destroy = explicitly_destroy
-        self.use_gpu_solver = use_gpu_solver
-        if quota_kernel_stage not in (0, 1):
-            raise ValueError(
-                "quota_kernel_stage supports only {0, 1}; stage 2/3 has been removed"
-            )
-        normalized_weight_sync_plan_mode = weight_sync_plan_mode.lower().replace(
-            "_", ""
-        )
-        weight_sync_plan_mode_map = {
-            "direct": 0,
-            "adaptive": 1,
-            "forcerelay": 2,
-        }
-        if normalized_weight_sync_plan_mode not in weight_sync_plan_mode_map:
-            raise ValueError(
-                "weight_sync_plan_mode must be one of: 'direct', 'adaptive', 'force_relay'"
-            )
-        self.use_quota_eplb_solver = use_quota_eplb_solver
-        # Quota solver keeps placement/reroute data on GPU, so grad/weight task build
-        # should also use the GPU path to avoid hot-path D2H placement sync.
-        self.use_gpu_task_build = self.use_gpu_solver or self.use_quota_eplb_solver
-        self.quota_kernel_stage = quota_kernel_stage
-        self.quota_reroute_interleave = quota_reroute_interleave
-        self.weight_sync_plan_mode = normalized_weight_sync_plan_mode
-        self.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas
-        self.weight_sync_relay_max_relays = weight_sync_relay_max_relays
-        self.weight_sync_relay_min_fanout_gain = weight_sync_relay_min_fanout_gain
+        self.legacy_placement = legacy_placement
+        self.quota_kernel_stage = tuning.quota_kernel_stage
+        self.quota_reroute_interleave = tuning.quota_reroute_interleave
+        self.weight_sync_plan_mode = tuning.weight_sync_plan_mode
+        self.weight_sync_relay_min_replicas = tuning.weight_sync_relay_min_replicas
+        self.weight_sync_relay_max_relays = tuning.weight_sync_relay_max_relays
+        self.weight_sync_relay_min_fanout_gain = tuning.weight_sync_relay_min_fanout_gain
+        self.reroute_mode = "round_robin" if legacy_placement else "quota"
         self.runtime = _C.Manager(
             self.num_alloc_layers,
             num_local_master_experts,
@@ -145,20 +97,19 @@ class Manager:
             expert_fc2_numel,
             is_train,
             explicitly_destroy,
-            use_gpu_solver,
-            balance_threshold,
-            use_quota_eplb_solver,
-            quota_locality_aware,
-            quota_min_tokens_per_replica,
-            quota_allow_zero_master_quota,
-            quota_oracle_eps,
-            quota_kernel_stage,
-            quota_reroute_interleave,
+            legacy_placement,
+            tuning.balance_threshold,
+            tuning.quota_locality_aware,
+            tuning.quota_min_tokens_per_replica,
+            tuning.quota_allow_zero_master_quota,
+            tuning.quota_oracle_eps,
+            tuning.quota_kernel_stage,
+            tuning.quota_reroute_interleave,
             self.grad_reduce_num_sms,
-            weight_sync_plan_mode_map[normalized_weight_sync_plan_mode],
-            weight_sync_relay_min_replicas,
-            weight_sync_relay_max_relays,
-            weight_sync_relay_min_fanout_gain,
+            tuning.weight_sync_plan_mode_id,
+            tuning.weight_sync_relay_min_replicas,
+            tuning.weight_sync_relay_max_relays,
+            tuning.weight_sync_relay_min_fanout_gain,
         )
         assert self.runtime.is_available()
 
@@ -297,20 +248,13 @@ class Manager:
                 [t.data_ptr() for t in tensors], dtype=torch.int64, device=device
             ).contiguous()
 
-        gpu_ptr_device = torch.device("cuda", self.device)
-        self.local_master_fc1_weight_pool[layer_id] = _to_dataptr_tensor(
-            fc1_weights, device="cpu"
+        weight_or_grad_device = torch.device("cuda", self.device)
+        self.local_master_fc1_weight_ptr_pool[layer_id] = _to_dataptr_tensor(
+            fc1_weights, device=weight_or_grad_device
         )
-        self.local_master_fc2_weight_pool[layer_id] = _to_dataptr_tensor(
-            fc2_weights, device="cpu"
+        self.local_master_fc2_weight_ptr_pool[layer_id] = _to_dataptr_tensor(
+            fc2_weights, device=weight_or_grad_device
         )
-        if self.use_gpu_task_build:
-            self.local_master_fc1_weight_pool_gpu[layer_id] = _to_dataptr_tensor(
-                fc1_weights, device=gpu_ptr_device
-            )
-            self.local_master_fc2_weight_pool_gpu[layer_id] = _to_dataptr_tensor(
-                fc2_weights, device=gpu_ptr_device
-            )
 
         if self.is_train:
             assert (
@@ -320,19 +264,12 @@ class Manager:
             assert len(fc2_grads) == self.num_local_master_experts
             check_tensors_dtype(fc1_grads, torch.float32)
             check_tensors_dtype(fc2_grads, torch.float32)
-            self.local_master_fc1_grad_pool[layer_id] = _to_dataptr_tensor(
-                fc1_grads, device="cpu"
+            self.local_master_fc1_grad_ptr_pool[layer_id] = _to_dataptr_tensor(
+                fc1_grads, device=weight_or_grad_device
             )
-            self.local_master_fc2_grad_pool[layer_id] = _to_dataptr_tensor(
-                fc2_grads, device="cpu"
+            self.local_master_fc2_grad_ptr_pool[layer_id] = _to_dataptr_tensor(
+                fc2_grads, device=weight_or_grad_device
             )
-            if self.use_gpu_task_build:
-                self.local_master_fc1_grad_pool_gpu[layer_id] = _to_dataptr_tensor(
-                    fc1_grads, device=gpu_ptr_device
-                )
-                self.local_master_fc2_grad_pool_gpu[layer_id] = _to_dataptr_tensor(
-                    fc2_grads, device=gpu_ptr_device
-                )
 
     def grad_reduce(
         self,
@@ -354,28 +291,13 @@ class Manager:
         assert layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
         assert (
-            self.local_master_fc1_grad_pool[real_lid] is not None
-            and self.local_master_fc2_grad_pool[real_lid] is not None
-        )
-        if self.use_gpu_task_build:
-            assert (
-                self.local_master_fc1_grad_pool_gpu[real_lid] is not None
-                and self.local_master_fc2_grad_pool_gpu[real_lid] is not None
-            )
-        fc1_grad_ptr_pool = (
-            self.local_master_fc1_grad_pool_gpu[real_lid]
-            if self.use_gpu_task_build
-            else self.local_master_fc1_grad_pool[real_lid]
-        )
-        fc2_grad_ptr_pool = (
-            self.local_master_fc2_grad_pool_gpu[real_lid]
-            if self.use_gpu_task_build
-            else self.local_master_fc2_grad_pool[real_lid]
+            self.local_master_fc1_grad_ptr_pool[real_lid] is not None
+            and self.local_master_fc2_grad_ptr_pool[real_lid] is not None
         )
         event = self.runtime.grad_reduce(
             layer_id,
-            fc1_grad_ptr_pool,
-            fc2_grad_ptr_pool,
+            self.local_master_fc1_grad_ptr_pool[real_lid],
+            self.local_master_fc2_grad_ptr_pool[real_lid],
             getattr(previous_event, "event", None),
             async_finish,
         )
@@ -406,29 +328,14 @@ class Manager:
         assert layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
         assert (
-            self.local_master_fc1_weight_pool[real_lid] is not None
-            and self.local_master_fc2_weight_pool[real_lid] is not None
-        )
-        if self.use_gpu_task_build:
-            assert (
-                self.local_master_fc1_weight_pool_gpu[real_lid] is not None
-                and self.local_master_fc2_weight_pool_gpu[real_lid] is not None
-            )
-        fc1_weight_ptr_pool = (
-            self.local_master_fc1_weight_pool_gpu[real_lid]
-            if self.use_gpu_task_build
-            else self.local_master_fc1_weight_pool[real_lid]
-        )
-        fc2_weight_ptr_pool = (
-            self.local_master_fc2_weight_pool_gpu[real_lid]
-            if self.use_gpu_task_build
-            else self.local_master_fc2_weight_pool[real_lid]
+            self.local_master_fc1_weight_ptr_pool[real_lid] is not None
+            and self.local_master_fc2_weight_ptr_pool[real_lid] is not None
         )
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
             event = self.runtime.weight_sync(
                 layer_id,
-                fc1_weight_ptr_pool,
-                fc2_weight_ptr_pool,
+                self.local_master_fc1_weight_ptr_pool[real_lid],
+                self.local_master_fc2_weight_ptr_pool[real_lid],
                 getattr(previous_event, "event", None),
                 async_finish,
             )
@@ -443,8 +350,8 @@ class Manager:
         """
         Update expert placement for a single layer based on real-time load statistics.
 
-        Runs the EPLB-style placement algorithm on CPU or GPU depending on the
-        selected placement path:
+        Runs the default device placement algorithm and only falls back to the
+        legacy CPU implementation when ``legacy_placement=True``:
           1. Masters remain fixed at their pre-assigned positions.
           2. Per NVL domain, greedily replicates the most loaded experts.
           3. Per NVL domain, packs replicas to GPU slots via LPT bin-packing,
@@ -490,10 +397,6 @@ class Manager:
         the k-th token (by global token index) routed to l is dispatched to
         physical expert l2p[l, k % C_l].
 
-        Two paths are available (selected by backend):
-          - CPU path: C++ RerouteSolver computes index arrays, Python scatters.
-          - CUDA path: fused GPU kernel avoids all H2D/D2H transfers.
-
         Args:
             layer_id: The MoE layer index to reroute.
             probs: [num_tokens, num_logical_experts] float tensor, routing probabilities.
@@ -509,20 +412,12 @@ class Manager:
             self.sync_placement_to_cpu(layer_id)
             max_replica_cnt = self._logical_replica_counts[layer_id].cpu().max().item()
 
-        if backend == "cuda":
-            expanded_probs, expanded_routing_map = self._reroute_cuda(
-                layer_id, probs, routing_map
-            )
-        elif backend == "cpu":
-            if self.use_quota_eplb_solver:
-                raise ValueError(
-                    "CPU reroute is not supported when use_quota_eplb_solver=True"
-                )
-            expanded_probs, expanded_routing_map = self._reroute_cpu(
-                layer_id, probs, routing_map
-            )
-        else:
-            raise ValueError(f"Invalid backend: {backend}")
+        if backend != "cuda":
+            raise ValueError("Only backend='cuda' is supported; CPU reroute has been removed")
+
+        expanded_probs, expanded_routing_map = self._dense_reroute(
+            layer_id, probs, routing_map
+        )
 
         if self.log_expert_loads:
             balanced_phys_expert_loads = expanded_routing_map.sum(
@@ -550,69 +445,24 @@ class Manager:
 
         return expanded_probs, expanded_routing_map
 
-    def _reroute_cpu(
+    def _dense_reroute(
         self,
         layer_id: int,
         probs: torch.Tensor,
         routing_map: torch.Tensor,
     ):
-        """CPU path: C++ RerouteSolver + Python index scatter/gather."""
-        num_tokens = routing_map.size(0)
-        num_global_physical = self.num_global_physical_experts
-        token_indices, logical_indices, physical_indices = self.runtime.reroute_cpu(
-            layer_id, routing_map
-        )
-
-        # Construct expanded_routing_map on the same device as routing_map
-        expanded_routing_map = torch.zeros(
-            num_tokens, num_global_physical, dtype=torch.bool, device=routing_map.device
-        )
-        if token_indices.numel() > 0:
-            expanded_routing_map[token_indices, physical_indices] = True
-
-        # Construct expanded_probs with appropriate gradient handling
+        """Dense reroute through the fused device kernel."""
         if self.is_train and probs.requires_grad:
-            expanded_probs = _RerouteProbsFunction.apply(
-                probs,
-                token_indices,
-                logical_indices,
-                physical_indices,
-                num_global_physical,
-            )
-        else:
-            # Inference path: no autograd overhead
-            expanded_probs = torch.zeros(
-                num_tokens,
-                num_global_physical,
-                dtype=probs.dtype,
-                device=routing_map.device,
-            )
-            if token_indices.numel() > 0:
-                expanded_probs[token_indices, physical_indices] = probs[
-                    token_indices, logical_indices
-                ]
-
-        return expanded_probs, expanded_routing_map
-
-    def _reroute_cuda(
-        self,
-        layer_id: int,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
-    ):
-        """CUDA path: fused GPU kernel for reroute with pre-allocated buffers."""
-        if self.is_train and probs.requires_grad:
-            expanded_probs, expanded_routing_map = _RerouteCUDAFunction.apply(
+            expanded_probs, expanded_routing_map = _DenseRerouteFunction.apply(
                 probs,
                 routing_map,
                 self.runtime,
                 layer_id,
             )
         else:
-            # Inference path: direct Manager call, no autograd overhead
-            with torch.cuda.nvtx.range(f"Reroute CUDA forward (layer {layer_id})"):
+            with torch.cuda.nvtx.range(f"Dense reroute forward (layer {layer_id})"):
                 expanded_probs, expanded_routing_map = (
-                    self.runtime.reroute_cuda_forward(layer_id, probs, routing_map)
+                    self.runtime.dense_reroute_forward(layer_id, probs, routing_map)
                 )
 
         return expanded_probs, expanded_routing_map
@@ -626,7 +476,7 @@ class Manager:
 
         if self.log_expert_loads:
             # Compute original logical expert loads before rerouting.
-            # global_logical_expert_loads_gpu is already populated by the preceding
+            # global logical expert loads are already populated by the preceding
             # update_placement_sparse call via nvshmem allreduce, so we reuse it
             # directly instead of recomputing from topk_ids.
             orig_log_expert_loads = (

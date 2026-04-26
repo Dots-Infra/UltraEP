@@ -1,10 +1,111 @@
-#include <vector>
-
 #include "api.cuh"
 #include "config.cuh"
 #include "launch.cuh"
+#include "ptx.cuh"
 
 namespace ultra_ep::kernels {
+
+// ---------------------------------------------------------------------------
+// Grad Reduce Task Build
+// ---------------------------------------------------------------------------
+
+__global__ __launch_bounds__(32) void build_grad_reduce_tasks_kernel(
+    const TaskBuildConfig* __restrict__ config,
+    const int32_t* __restrict__ p2l,
+    const int32_t* __restrict__ l2p,
+    const int32_t* __restrict__ lcnts,
+    void* const* __restrict__ remote_grad_ptrs,
+    const int64_t* __restrict__ local_master_fc1_ptrs,
+    const int64_t* __restrict__ local_master_fc2_ptrs,
+    GradReduceTask* __restrict__ tasks,
+    int* __restrict__ tile_offsets,
+    int* __restrict__ task_metadata) {
+    if (threadIdx.x != 0)
+        return;
+
+    const int rank_idx = config->rank_idx;
+    const int num_nvl_ranks = config->num_nvl_ranks;
+    const int num_local_master = config->num_local_master_experts;
+    const int num_local_physical = config->num_local_physical_experts;
+    const int64_t fc1_numel = config->expert_fc1_numel;
+    const int64_t fc2_numel = config->expert_fc2_numel;
+    const int64_t total_numel = config->expert_total_numel;
+    const int max_rep_dim = config->max_replicas_dim;
+
+    int num_tasks = 0;
+
+    for (int i = 0; i < num_local_master; ++i) {
+        int master_phy = rank_idx * num_local_physical + i;
+        int master_log = p2l[master_phy];
+        int num_replicas = lcnts[master_log];
+
+        float* local_fc1 = reinterpret_cast<float*>(local_master_fc1_ptrs[i]);
+        float* local_fc2 = reinterpret_cast<float*>(local_master_fc2_ptrs[i]);
+
+        for (int j = 1; j < num_replicas; ++j) {  // skip the master itself (index 0)
+            int replica_phy = l2p[master_log * max_rep_dim + j];
+            int replica_rank = replica_phy / num_local_physical;
+            int replica_nvl_rank = replica_rank % num_nvl_ranks;
+            int replica_local_offset = replica_phy % num_local_physical - num_local_master;
+
+            float* remote_buf = reinterpret_cast<float*>(remote_grad_ptrs[replica_nvl_rank]);
+            float* remote_expert_base = remote_buf + replica_local_offset * total_numel;
+
+            // FC1 task
+            tasks[num_tasks].master_local_addr = local_fc1;
+            tasks[num_tasks].replica_remote_addr = remote_expert_base;
+            tasks[num_tasks].numel = static_cast<size_t>(fc1_numel);
+            num_tasks++;
+
+            // FC2 task
+            tasks[num_tasks].master_local_addr = local_fc2;
+            tasks[num_tasks].replica_remote_addr = remote_expert_base + fc1_numel;
+            tasks[num_tasks].numel = static_cast<size_t>(fc2_numel);
+            num_tasks++;
+        }
+    }
+
+    // Compute tile offsets (prefix sum) for tile-level grad_reduce scheduling
+    tile_offsets[0] = 0;
+    for (int t = 0; t < num_tasks; ++t) {
+        int tiles = ceil_div(static_cast<int64_t>(tasks[t].numel), static_cast<int64_t>(kGradReduceTileElements));
+        tile_offsets[t + 1] = tile_offsets[t] + tiles;
+    }
+    int total_tiles = (num_tasks > 0) ? tile_offsets[num_tasks] : 0;
+
+    task_metadata[0] = num_tasks;
+    task_metadata[1] = total_tiles;
+}
+
+void build_grad_reduce_tasks(const TaskBuildConfig* config,
+                             const int32_t* physical_to_logical_map,
+                             const int32_t* logical_to_physical_map,
+                             const int32_t* logical_replica_counts,
+                             void* const* remote_grad_ptrs,
+                             const int64_t* local_master_fc1_ptrs,
+                             const int64_t* local_master_fc2_ptrs,
+                             GradReduceTask* tasks,
+                             int* task_tile_offsets,
+                             int* task_metadata,
+                             int* global_task_or_tile_counter,
+                             cudaStream_t stream) {
+    const auto launch_config = make_launch_config(dim3(1), dim3(32), stream);
+    launch_kernel(build_grad_reduce_tasks_kernel,
+                  launch_config,
+                  config,
+                  physical_to_logical_map,
+                  logical_to_physical_map,
+                  logical_replica_counts,
+                  remote_grad_ptrs,
+                  local_master_fc1_ptrs,
+                  local_master_fc2_ptrs,
+                  tasks,
+                  task_tile_offsets,
+                  task_metadata);
+
+    // Reset task/tile counter for the subsequent main kernel
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_task_or_tile_counter, 0, sizeof(int), stream));
+}
 
 // Vectorized memset for remote memory zeroing (supports up to GRAD_REDUCE_TILE_SIZE_BYTES)
 __device__ __forceinline__ void memset_zero_tile(float* __restrict__ ptr, int num_elements) {
@@ -40,7 +141,7 @@ struct TileInfo {
     int task_idx;          // Which task this tile belongs to
     int tile_idx_in_task;  // Tile index within the task
     size_t global_offset;  // Offset in elements from task start
-    int num_elements;      // Number of elements in this tile (may be < GRAD_REDUCE_TILE_ELEMENTS for last tile)
+    int num_elements;      // Number of elements in this tile (may be < kGradReduceTileElements for last tile)
 };
 
 // Map a global tile index to task and tile within task
@@ -63,18 +164,18 @@ __device__ __forceinline__ TileInfo get_tile_info(const GradReduceTask* tasks,
 
     info.task_idx = lo;
     info.tile_idx_in_task = global_tile_idx - task_tile_offsets[lo];
-    info.global_offset = (size_t)info.tile_idx_in_task * GRAD_REDUCE_TILE_ELEMENTS;
+    info.global_offset = static_cast<size_t>(info.tile_idx_in_task) * kGradReduceTileElements;
 
     // Compute number of elements in this tile
     size_t task_numel = tasks[info.task_idx].numel;
     size_t remaining = task_numel - info.global_offset;
-    info.num_elements = min((size_t)GRAD_REDUCE_TILE_ELEMENTS, remaining);
+    info.num_elements = min(static_cast<size_t>(kGradReduceTileElements), remaining);
 
     return info;
 }
 
 // task_metadata: device pointer to [total_tasks, total_tiles]
-__global__ __launch_bounds__(GRAD_REDUCE_THREADS_PER_BLOCK) void grad_reduce_kernel(
+__global__ __launch_bounds__(kGradReduceThreadsPerBlock) void grad_reduce_kernel(
     const GradReduceTask* grad_reduce_tasks,
     const int* task_tile_offsets,
     const int* task_metadata,
@@ -162,67 +263,15 @@ __global__ __launch_bounds__(GRAD_REDUCE_THREADS_PER_BLOCK) void grad_reduce_ker
     }
 }
 
-// ============================================================================
-// CPU task-build path
-// ============================================================================
-
-void run_grad_reduce(const GradReduceTask* grad_reduce_tasks_cpu,
-                     GradReduceTask* grad_reduce_tasks_gpu,
-                     int* global_tile_counter_gpu,
-                     int* task_tile_offsets_gpu,
-                     int* task_metadata_gpu,
-                     const int total_tasks,
+void run_grad_reduce(GradReduceTask* tasks,
+                     int* task_tile_offsets,
+                     int* task_metadata,
+                     int* global_tile_counter,
                      cudaStream_t stream,
                      int num_sms) {
-    if (total_tasks == 0)
-        return;
-
-    // Compute tile offsets on CPU (prefix sum of tile counts per task)
-    std::vector<int> task_tile_offsets(total_tasks + 1);
-    task_tile_offsets[0] = 0;
-    for (int i = 0; i < total_tasks; ++i) {
-        int num_tiles = (grad_reduce_tasks_cpu[i].numel + GRAD_REDUCE_TILE_ELEMENTS - 1) / GRAD_REDUCE_TILE_ELEMENTS;
-        task_tile_offsets[i + 1] = task_tile_offsets[i] + num_tiles;
-    }
-    int total_tiles = task_tile_offsets[total_tasks];
-
-    // Write task metadata
-    int metadata[2] = {total_tasks, total_tiles};
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(task_metadata_gpu, metadata, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
-
-    // Copy tasks and tile offsets from CPU to GPU
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(grad_reduce_tasks_gpu,
-                                       grad_reduce_tasks_cpu,
-                                       total_tasks * sizeof(GradReduceTask),
-                                       cudaMemcpyHostToDevice,
-                                       stream));
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(task_tile_offsets_gpu,
-                                       task_tile_offsets.data(),
-                                       (total_tasks + 1) * sizeof(int),
-                                       cudaMemcpyHostToDevice,
-                                       stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(global_tile_counter_gpu, 0, sizeof(int), stream));
-
     const auto config = make_launch_config(
-        dim3(num_sms), dim3(GRAD_REDUCE_THREADS_PER_BLOCK), stream, GRAD_REDUCE_TILE_SIZE_BYTES);
-    launch_kernel(
-        grad_reduce_kernel, config, grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu);
-}
-
-// ============================================================================
-// GPU task-build path (tasks already on GPU from build kernel)
-// ============================================================================
-
-void run_grad_reduce_from_gpu(GradReduceTask* grad_reduce_tasks_gpu,
-                              int* task_tile_offsets_gpu,
-                              int* task_metadata_gpu,
-                              int* global_tile_counter_gpu,
-                              cudaStream_t stream,
-                              int num_sms) {
-    const auto config = make_launch_config(
-        dim3(num_sms), dim3(GRAD_REDUCE_THREADS_PER_BLOCK), stream, GRAD_REDUCE_TILE_SIZE_BYTES);
-    launch_kernel(
-        grad_reduce_kernel, config, grad_reduce_tasks_gpu, task_tile_offsets_gpu, task_metadata_gpu, global_tile_counter_gpu);
+        dim3(num_sms), dim3(kGradReduceThreadsPerBlock), stream, kGradReduceTileSizeBytes);
+    launch_kernel(grad_reduce_kernel, config, tasks, task_tile_offsets, task_metadata, global_tile_counter);
 }
 
 }  // namespace ultra_ep::kernels

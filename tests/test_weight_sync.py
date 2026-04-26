@@ -162,6 +162,16 @@ def should_use_relay(
 
 
 def create_manager(args, plan_mode: str):
+    os.environ["ULTRA_EP_WEIGHT_SYNC_PLAN_MODE"] = plan_mode
+    os.environ["ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_REPLICAS"] = str(
+        args.weight_sync_relay_min_replicas
+    )
+    os.environ["ULTRA_EP_WEIGHT_SYNC_RELAY_MAX_RELAYS"] = str(
+        args.weight_sync_relay_max_relays
+    )
+    os.environ["ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_FANOUT_GAIN"] = str(
+        args.weight_sync_relay_min_fanout_gain
+    )
     return ultra_ep.Manager(
         group=dist.group.WORLD,
         num_layers=NUM_LAYERS,
@@ -170,12 +180,6 @@ def create_manager(args, plan_mode: str):
         expert_fc1_numel=args.expert_fc1_numel,
         expert_fc2_numel=args.expert_fc2_numel,
         explicitly_destroy=True,
-        use_gpu_solver=args.gpu_solver,
-        use_quota_eplb_solver=False,
-        weight_sync_plan_mode=plan_mode,
-        weight_sync_relay_min_replicas=args.weight_sync_relay_min_replicas,
-        weight_sync_relay_max_relays=args.weight_sync_relay_max_relays,
-        weight_sync_relay_min_fanout_gain=args.weight_sync_relay_min_fanout_gain,
     )
 
 
@@ -393,7 +397,6 @@ def main():
     parser.add_argument("--num-local-redundant-experts", type=int, default=2)
     parser.add_argument("--expert-fc1-numel", type=int, default=3072 * 4096)
     parser.add_argument("--expert-fc2-numel", type=int, default=1536 * 4096)
-    parser.add_argument("--gpu-solver", action="store_true")
     parser.add_argument("--num-tokens", type=int, default=4096)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--warmup-iters", type=int, default=50)
@@ -462,7 +465,7 @@ def main():
                 f"Numel: FC1={args.expert_fc1_numel}, FC2={args.expert_fc2_numel}"
             )
             print_on_leader_ranks(
-                f"Placement source: Manager.update_placement(use_gpu_solver={args.gpu_solver})"
+                "Placement source: Manager.update_placement()"
             )
 
         print_on_leader_ranks("=" * 80)

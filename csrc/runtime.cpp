@@ -32,7 +32,7 @@ void init_runtime(const int& rank_idx_,
     // Support both nvl and rdma ranks
     num_ranks = num_ranks_;
     num_nvl_ranks = max_nvl_peers_;
-    EP_HOST_ASSERT(num_nvl_ranks <= MAX_NVL_DOMAIN_SIZE);
+    EP_HOST_ASSERT(num_nvl_ranks <= kernels::kMaxNvlDomainSize);
     EP_HOST_ASSERT(num_ranks % num_nvl_ranks == 0);
     num_rdma_ranks = num_ranks / num_nvl_ranks;
     rank_idx = rank_idx_;

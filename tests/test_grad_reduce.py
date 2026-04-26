@@ -3,7 +3,6 @@ import torch.distributed as dist
 import os, sys
 import argparse
 import ultra_ep
-from ultra_ep.util import setup_placement_random
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import bench, bench_kineto, generate_routing_map_from_distribution
@@ -12,38 +11,22 @@ NUM_LAYERS = 48
 
 
 def apply_test_placement(manager, args, layer_id: int, placement_mode: str):
-    if args.gpu_solver:
-        num_global_logical_experts = manager.num_global_logical_experts
-        assert (
-            args.topk <= num_global_logical_experts
-        ), f"topk={args.topk} exceeds num_global_logical_experts={num_global_logical_experts}"
-        routing_map = generate_routing_map_from_distribution(
-            num_tokens=args.num_tokens,
-            num_global_logical_experts=num_global_logical_experts,
-            topk=args.topk,
-            distribution=placement_mode,
-            seed=args.seed + dist.get_rank(),
-            num_ranks=dist.get_world_size(),
-            num_local_master=args.num_local_master_experts,
-            num_nvl_ranks=manager.nvl_domain_size,
-            hot_expert_ratio_per_nvl_domain=args.hot_expert_ratio_per_nvl_domain,
-        )
-        manager.update_placement(layer_id, routing_map, verify_reduced_loads=True)
-        return
-
-    world_size = dist.get_world_size()
-    setup_placement_random(
-        world_size,
-        args.num_local_master_experts,
-        args.num_local_redundant_experts,
-        manager.physical_to_logical_map,
-        manager.logical_to_physical_map,
-        manager.logical_replica_counts,
-        replica_distribution=placement_mode,
+    num_global_logical_experts = manager.num_global_logical_experts
+    assert (
+        args.topk <= num_global_logical_experts
+    ), f"topk={args.topk} exceeds num_global_logical_experts={num_global_logical_experts}"
+    routing_map = generate_routing_map_from_distribution(
+        num_tokens=args.num_tokens,
+        num_global_logical_experts=num_global_logical_experts,
+        topk=args.topk,
+        distribution=placement_mode,
+        seed=args.seed + dist.get_rank(),
+        num_ranks=dist.get_world_size(),
+        num_local_master=args.num_local_master_experts,
         num_nvl_ranks=manager.nvl_domain_size,
-        hot_expert_ratio_per_nvl_domain=0.03,
-        seed=args.seed,
+        hot_expert_ratio_per_nvl_domain=args.hot_expert_ratio_per_nvl_domain,
     )
+    manager.update_placement(layer_id, routing_map, verify_reduced_loads=True)
 
 
 def main():
@@ -52,7 +35,6 @@ def main():
     parser.add_argument("--num-local-redundant-experts", type=int, default=2)
     parser.add_argument("--expert-fc1-numel", type=int, default=3072 * 4096)
     parser.add_argument("--expert-fc2-numel", type=int, default=1536 * 4096)
-    parser.add_argument("--gpu-solver", action="store_true")
     parser.add_argument("--num-tokens", type=int, default=4096)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--warmup-iters", type=int, default=20)
@@ -79,8 +61,6 @@ def main():
         expert_fc1_numel=args.expert_fc1_numel,
         expert_fc2_numel=args.expert_fc2_numel,
         explicitly_destroy=True,
-        use_gpu_solver=args.gpu_solver,
-        use_quota_eplb_solver=False,
     )
 
     num_nvl_ranks = manager.nvl_domain_size
@@ -101,9 +81,7 @@ def main():
     print_on_leader_ranks(
         f"Numel: FC1={args.expert_fc1_numel}, FC2={args.expert_fc2_numel}"
     )
-    print_on_leader_ranks(
-        f"Placement source: {'Manager.update_placement(use_gpu_solver=True)' if args.gpu_solver else 'setup_placement_random()'}"
-    )
+    print_on_leader_ranks("Placement source: Manager.update_placement()")
 
     for placement_mode in ["uniform", "skewed"]:
         print_on_leader_ranks(f"=" * 80)

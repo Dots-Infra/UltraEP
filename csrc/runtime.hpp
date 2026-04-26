@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-#include "config.hpp"
+#include "kernels/config.cuh"
 #include "utils/exception.cuh"
 #include "utils/nvshmem.cuh"
 
