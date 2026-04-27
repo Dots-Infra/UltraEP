@@ -16,7 +16,9 @@ The current codebase has two placement modes:
 - Default placement: quota-aware on-device placement.
 - Legacy placement: CPU placement behind `Manager(..., legacy_placement=True)`.
 
-Everything outside the legacy placement implementation stays on device.
+Everything outside the legacy placement implementation stays on device. Placement
+maps exposed by the Python manager are CUDA tensors; there is no host mirror or
+implicit D2H/H2D synchronization in the quota path.
 
 ## Current Runtime Model
 
@@ -128,7 +130,26 @@ manager.grad_reduce(layer_id, async_finish=False)
 Notes:
 
 - `Manager.reroute(..., backend="cuda")` is kept for compatibility, but only `"cuda"` is supported.
-- CPU placement mirrors are still exposed as properties. Callers that read `physical_to_logical_map`, `logical_to_physical_map`, `logical_replica_counts`, `logical_instance_quota`, or `logical_instance_quota_prefix` get the synchronized host mirror.
+- `physical_to_logical_map`, `logical_to_physical_map`, `logical_replica_counts`,
+  `logical_instance_quota`, and `logical_instance_quota_prefix` are device tensors.
+  Reduce diagnostics on GPU and only materialize final scalar summaries for logging.
+
+## Tests
+
+There are two test entrypoints:
+
+```bash
+# Single-GPU solver and metric test. Defaults: 64 simulated ranks, 128 experts,
+# NVL domain size 64, zipf imbalance ratios 0/1.5/2/2.5/3.
+python tests/test_solving.py
+
+# Distributed end-to-end test. Defaults to the launched world size; on the dev
+# node use 4 ranks.
+torchrun --standalone --nproc_per_node=4 tests/test_e2e.py
+
+# Include HybridEP token dispatch/combine in the e2e report.
+torchrun --standalone --nproc_per_node=4 tests/test_e2e.py --include-token-a2a
+```
 
 ## Configuration
 

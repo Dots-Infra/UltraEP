@@ -60,118 +60,6 @@ class empty_suppress:
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.profiler")
 
 
-def build_logical_expert_weights(
-    distribution: str,
-    num_global_logical_experts: int,
-    seed: int,
-    num_ranks: Optional[int] = None,
-    num_local_master: Optional[int] = None,
-    num_nvl_ranks: Optional[int] = None,
-    hot_expert_ratio_per_nvl_domain: float = 0.03,
-    zipf_alpha: float = 1.2,
-    single_hot_ratio: float = 0.8,
-):
-    if distribution == "uniform":
-        weights = torch.ones(num_global_logical_experts, dtype=torch.float32)
-    elif distribution == "zipf":
-        ranks = torch.arange(1, num_global_logical_experts + 1, dtype=torch.float32)
-        weights = 1.0 / ranks.pow(zipf_alpha)
-    elif distribution == "single_hot":
-        weights = torch.full(
-            (num_global_logical_experts,),
-            (1.0 - single_hot_ratio) / max(num_global_logical_experts - 1, 1),
-            dtype=torch.float32,
-        )
-        weights[0] = single_hot_ratio
-    elif distribution == "skewed":
-        assert num_ranks is not None
-        assert num_local_master is not None
-        if num_nvl_ranks is None:
-            num_nvl_ranks = num_ranks
-
-        weights = torch.zeros(num_global_logical_experts, dtype=torch.float32)
-        rng = random.Random(seed)
-        num_nvl_domains = (num_ranks + num_nvl_ranks - 1) // num_nvl_ranks
-
-        for nvl_domain in range(num_nvl_domains):
-            domain_start_rank = nvl_domain * num_nvl_ranks
-            domain_end_rank = min((nvl_domain + 1) * num_nvl_ranks, num_ranks)
-            logical_experts = []
-            for rank in range(domain_start_rank, domain_end_rank):
-                logical_experts.extend(
-                    range(rank * num_local_master, (rank + 1) * num_local_master)
-                )
-
-            if not logical_experts:
-                continue
-
-            num_hot = max(
-                1,
-                int(len(logical_experts) * hot_expert_ratio_per_nvl_domain),
-            )
-            hot_experts = set(rng.sample(logical_experts, num_hot))
-            cold_experts = [idx for idx in logical_experts if idx not in hot_experts]
-
-            hot_weight = 0.9 / len(hot_experts) if hot_experts else 0.0
-            cold_weight = 0.1 / len(cold_experts) if cold_experts else 0.0
-
-            for logical_idx in hot_experts:
-                weights[logical_idx] = hot_weight
-            for logical_idx in cold_experts:
-                weights[logical_idx] = cold_weight
-    else:
-        raise ValueError(f"Unsupported distribution: {distribution}")
-
-    return weights / weights.sum()
-
-
-def generate_routing_map_from_distribution(
-    num_tokens: int,
-    num_global_logical_experts: int,
-    topk: int,
-    distribution: str,
-    seed: int,
-    device: str = "cuda",
-    num_ranks: Optional[int] = None,
-    num_local_master: Optional[int] = None,
-    num_nvl_ranks: Optional[int] = None,
-    hot_expert_ratio_per_nvl_domain: float = 0.03,
-    zipf_alpha: float = 1.2,
-    single_hot_ratio: float = 0.8,
-):
-    weights = build_logical_expert_weights(
-        distribution=distribution,
-        num_global_logical_experts=num_global_logical_experts,
-        seed=seed,
-        num_ranks=num_ranks,
-        num_local_master=num_local_master,
-        num_nvl_ranks=num_nvl_ranks,
-        hot_expert_ratio_per_nvl_domain=hot_expert_ratio_per_nvl_domain,
-        zipf_alpha=zipf_alpha,
-        single_hot_ratio=single_hot_ratio,
-    )
-
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    weight_matrix = weights.unsqueeze(0).repeat(num_tokens, 1)
-    topk_ids = torch.multinomial(
-        weight_matrix,
-        num_samples=topk,
-        replacement=False,
-        generator=generator,
-    )
-
-    routing_map = torch.zeros(
-        num_tokens,
-        num_global_logical_experts,
-        dtype=torch.bool,
-        device=device,
-    )
-    token_ids = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, topk)
-    routing_map[token_ids, topk_ids.to(device)] = True
-    return routing_map
-
-
 def bench(
     fn,
     num_warmups: int = 50,
@@ -227,9 +115,9 @@ def bench_stats(
             post_fn()
     torch.cuda.synchronize()
 
-    times = np.array(
-        [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
-    )[1:]
+    times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])
+    if times.size > 1:
+        times = times[1:]
     if times.size >= 3:
         times = times[np.argsort(times)][1:-1]
 
@@ -355,3 +243,206 @@ def bench_kineto(
 
     # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]
+
+
+def bench_cuda_event_groups(
+    fn,
+    groups: dict[str, tuple[str, ...]],
+    num_tests: int = 10,
+    use_barrier: bool = True,
+) -> dict[str, float]:
+    """Profile CUDA events and sum durations by substring groups."""
+    fn()
+    torch.cuda.synchronize()
+    if use_barrier and dist.is_initialized():
+        dist.barrier()
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
+        for _ in range(num_tests):
+            fn()
+        torch.cuda.synchronize()
+
+    out = {name: 0.0 for name in groups}
+    for event in profiler.key_averages():
+        key = event.key.lower()
+        device_time_us = getattr(
+            event, "cuda_time_total", getattr(event, "device_time_total", 0.0)
+        )
+        duration_s = float(device_time_us) / 1e6
+        for group_name, needles in groups.items():
+            if any(needle.lower() in key for needle in needles):
+                out[group_name] += duration_s
+
+    denom = max(num_tests, 1)
+    return {name: value / denom for name, value in out.items()}
+
+
+def parse_csv_strings(value: str):
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.dtype == b.dtype and a.shape == b.shape and torch.equal(
+        a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+    )
+
+
+def rank_token_count(rank: int, max_tokens: int, variable: bool, seed: int) -> int:
+    if not variable:
+        return max_tokens
+    rng = random.Random(seed + 7919 * rank)
+    bucket = rng.random()
+    if bucket < 0.15:
+        return 0
+    if bucket < 0.30:
+        return max_tokens
+    return rng.randint(1, max_tokens - 1) if max_tokens > 1 else max_tokens
+
+
+def zipf_alpha_for_rank_ratio(
+    num_experts: int, num_ranks: int, num_local_master: int, target_ratio: float
+) -> float:
+    if target_ratio <= 1.0:
+        return 0.0
+
+    def ratio_for_alpha(alpha: float) -> float:
+        ranks = torch.arange(1, num_experts + 1, dtype=torch.float64)
+        weights = 1.0 / ranks.pow(alpha)
+        rank_weights = weights.view(num_ranks, num_local_master).sum(dim=1)
+        return (rank_weights.max() / rank_weights.mean()).item()
+
+    lo, hi = 0.0, 8.0
+    for _ in range(32):
+        mid = (lo + hi) * 0.5
+        if ratio_for_alpha(mid) < target_ratio:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def zipf_weights_for_ratio(
+    num_experts: int, num_ranks: int, num_local_master: int, imbalance_ratio: float
+) -> torch.Tensor:
+    if imbalance_ratio <= 0:
+        return torch.ones(num_experts, dtype=torch.float32) / num_experts
+    alpha = zipf_alpha_for_rank_ratio(
+        num_experts, num_ranks, num_local_master, imbalance_ratio
+    )
+    ranks = torch.arange(1, num_experts + 1, dtype=torch.float32)
+    weights = 1.0 / ranks.pow(alpha)
+    return weights / weights.sum()
+
+
+def generate_topk_ids_zipf(
+    num_tokens: int,
+    num_experts: int,
+    num_ranks: int,
+    num_local_master: int,
+    topk: int,
+    imbalance_ratio: float,
+    seed: int,
+    rank: int = 0,
+    device: str = "cuda",
+) -> torch.Tensor:
+    if num_tokens == 0:
+        return torch.empty((0, topk), dtype=torch.int64, device=device)
+    if imbalance_ratio <= 0:
+        token_ids = torch.arange(num_tokens, device=device).unsqueeze(1)
+        offsets = torch.arange(topk, device=device).unsqueeze(0)
+        return ((token_ids * topk + offsets + rank * topk) % num_experts).to(torch.int64)
+
+    weights = zipf_weights_for_ratio(
+        num_experts, num_ranks, num_local_master, imbalance_ratio
+    )
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed + rank * 104729)
+    topk_ids = torch.multinomial(
+        weights.repeat(num_tokens, 1),
+        num_samples=topk,
+        replacement=False,
+        generator=generator,
+    )
+    return topk_ids.to(device=device, dtype=torch.int64)
+
+
+def topk_ids_to_routing_map(topk_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    routing_map = torch.zeros(
+        (topk_ids.size(0), num_experts), dtype=torch.bool, device=topk_ids.device
+    )
+    if topk_ids.numel() > 0:
+        token_ids = torch.arange(topk_ids.size(0), device=topk_ids.device).unsqueeze(1)
+        routing_map[token_ids, topk_ids] = True
+    return routing_map
+
+
+def generate_routing_map_zipf(
+    num_tokens: int,
+    num_experts: int,
+    num_ranks: int,
+    num_local_master: int,
+    topk: int,
+    imbalance_ratio: float,
+    seed: int,
+    rank: int = 0,
+    device: str = "cuda",
+) -> torch.Tensor:
+    topk_ids = generate_topk_ids_zipf(
+        num_tokens,
+        num_experts,
+        num_ranks,
+        num_local_master,
+        topk,
+        imbalance_ratio,
+        seed,
+        rank=rank,
+        device=device,
+    )
+    return topk_ids_to_routing_map(topk_ids, num_experts)
+
+
+def generate_loads_per_rank_zipf(
+    num_ranks: int,
+    num_experts: int,
+    num_local_master: int,
+    topk: int,
+    tokens_per_rank: int,
+    variable_num_tokens: bool,
+    imbalance_ratio: float,
+    seed: int,
+    device: str = "cuda",
+) -> torch.Tensor:
+    rows = []
+    for rank in range(num_ranks):
+        ntokens = rank_token_count(rank, tokens_per_rank, variable_num_tokens, seed)
+        topk_ids = generate_topk_ids_zipf(
+            ntokens,
+            num_experts,
+            num_ranks,
+            num_local_master,
+            topk,
+            imbalance_ratio,
+            seed,
+            rank=rank,
+            device=device,
+        )
+        rows.append(torch.bincount(topk_ids.flatten(), minlength=num_experts).to(torch.int32))
+    return torch.stack(rows, dim=0)
+
+
+def max_mean(t: torch.Tensor) -> torch.Tensor:
+    values = t.float()
+    mean = values.mean()
+    return torch.where(mean > 0, values.max() / mean, torch.ones_like(mean))
+
+
+def summarize_vector(t: torch.Tensor) -> dict:
+    values = t.float()
+    if values.numel() == 0:
+        return {"min": 0.0, "median": 0.0, "mean": 0.0, "max": 0.0}
+    return {
+        "min": values.min().item(),
+        "median": values.median().item(),
+        "mean": values.mean().item(),
+        "max": values.max().item(),
+    }

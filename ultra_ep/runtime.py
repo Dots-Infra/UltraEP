@@ -6,13 +6,14 @@ from .util import print_rank_0
 import ultra_ep._C as _C
 
 _group = None
+_nvl_domain_size = None
 
 
 def init_runtime(group: dist.ProcessGroup):
-    global _group
+    global _group, _nvl_domain_size
     if _C.is_runtime_initialized():
         assert group == _group, f"All EP buffers should share the same process group"
-        return
+        return _nvl_domain_size
 
     # * IMPORTANT: NVSHMEM environment variables
     # Disable NVLink SHArP to avoid cuMemMap failure
@@ -54,5 +55,6 @@ def init_runtime(group: dist.ProcessGroup):
 
     # Remember the EP group, which can not be changed anymore
     _group = group
+    _nvl_domain_size = max_nvl_peers
 
     return max_nvl_peers

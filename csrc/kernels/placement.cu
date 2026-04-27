@@ -1838,6 +1838,81 @@ __global__ __launch_bounds__(QUOTA_SOLVER_THREADS) void quota_placement_solve_ke
 
 }  // namespace
 
+__global__ __launch_bounds__(256) void init_master_placement_kernel(int32_t* physical_to_logical_map,
+                                                                    int32_t* logical_to_physical_map,
+                                                                    int32_t* logical_replica_counts,
+                                                                    int num_global_logical_experts,
+                                                                    int num_local_master_experts,
+                                                                    int num_local_physical_experts,
+                                                                    int max_replicas_dim) {
+    for (int logical_id = blockIdx.x * blockDim.x + threadIdx.x; logical_id < num_global_logical_experts;
+         logical_id += blockDim.x * gridDim.x) {
+        const int rank = logical_id / num_local_master_experts;
+        const int local_idx = logical_id % num_local_master_experts;
+        const int physical_id = rank * num_local_physical_experts + local_idx;
+        physical_to_logical_map[physical_id] = logical_id;
+        logical_to_physical_map[logical_id * max_replicas_dim] = physical_id;
+        logical_replica_counts[logical_id] = 1;
+    }
+}
+
+void init_master_placement(int32_t* physical_to_logical_map,
+                           int32_t* logical_to_physical_map,
+                           int32_t* logical_replica_counts,
+                           int32_t* logical_instance_quota,
+                           int32_t* logical_instance_quota_prefix,
+                           int32_t* rank_quota_prefix,
+                           cudaStream_t stream,
+                           int num_global_physical_experts,
+                           int num_global_logical_experts,
+                           int num_ranks,
+                           int num_local_master_experts,
+                           int num_local_redundant_experts,
+                           int max_replicas_dim) {
+    const int num_local_physical_experts = num_local_master_experts + num_local_redundant_experts;
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(
+        physical_to_logical_map, 0xFF, static_cast<size_t>(num_global_physical_experts) * sizeof(int32_t), stream));
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_to_physical_map,
+                                       0xFF,
+                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
+                                           sizeof(int32_t),
+                                       stream));
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(
+        logical_replica_counts, 0, static_cast<size_t>(num_global_logical_experts) * sizeof(int32_t), stream));
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_instance_quota,
+                                       0,
+                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
+                                           sizeof(int32_t),
+                                       stream));
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_instance_quota_prefix,
+                                       0,
+                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
+                                           sizeof(int32_t),
+                                       stream));
+    CUDA_RUNTIME_CHECK(cudaMemsetAsync(rank_quota_prefix,
+                                       0,
+                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
+                                           sizeof(int32_t),
+                                       stream));
+
+    if (num_global_logical_experts > 0) {
+        constexpr int BLOCK = 256;
+        const int grid = min(1024, (num_global_logical_experts + BLOCK - 1) / BLOCK);
+        const auto config = make_launch_config(dim3(grid), dim3(BLOCK), stream);
+        launch_kernel(init_master_placement_kernel,
+                      config,
+                      physical_to_logical_map,
+                      logical_to_physical_map,
+                      logical_replica_counts,
+                      num_global_logical_experts,
+                      num_local_master_experts,
+                      num_local_physical_experts,
+                      max_replicas_dim);
+    }
+    CUDA_RUNTIME_CHECK(cudaGetLastError());
+    (void)num_ranks;
+}
+
 void solve_placement(const int32_t* expert_loads,
                    const int32_t* expert_loads_per_rank,
                    int32_t* physical_to_logical_map,

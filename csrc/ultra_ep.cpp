@@ -31,61 +31,25 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
     per_layer_stride_numel = per_layer_stride_bytes / static_cast<int>(sizeof(int32_t));
     total_bytes = num_layers * per_layer_stride_bytes;
 
-    // Allocate CPU pinned buffer
-    CUDA_RUNTIME_CHECK(cudaMallocHost(&cpu_buffer, total_bytes));
-    quota_buf_cpu = cpu_buffer + p2l_numel + l2p_numel + lcnts_numel;
-
-    // Initialize: p2l/l2p -> -1, lcnts/quota/quota_prefix -> 0, padding -> 0
-    std::memset(cpu_buffer, 0xFF, total_bytes);
-    for (int i = 0; i < num_layers; ++i) {
-        int32_t* layer_base = cpu_buffer + i * per_layer_stride_numel;
-        // Zero out lcnts
-        std::memset(layer_base + p2l_numel + l2p_numel, 0, lcnts_numel * sizeof(int32_t));
-        // Zero out quota arrays
-        std::memset(layer_base + p2l_numel + l2p_numel + lcnts_numel, 0, quota_numel * sizeof(int32_t));
-        std::memset(
-            layer_base + p2l_numel + l2p_numel + lcnts_numel + quota_numel, 0, quota_prefix_numel * sizeof(int32_t));
-        // Zero out padding
-        int pad_numel = per_layer_stride_numel - per_layer_data_numel;
-        if (pad_numel > 0) {
-            std::memset(layer_base + per_layer_data_numel, 0, pad_numel * sizeof(int32_t));
-        }
-    }
-
-    // Allocate GPU buffer (zero-initialized)
+    // Allocate GPU buffer. Individual placement initializers set active fields.
     CUDA_RUNTIME_CHECK(cudaMalloc(&device_buffer, total_bytes));
     CUDA_RUNTIME_CHECK(cudaMemset(device_buffer, 0, total_bytes));
     quota_buf_device = device_buffer + p2l_numel + l2p_numel + lcnts_numel;
 
-    // Create CPU tensor views with strides
-    // Shape [num_layers, X] with stride[0] = per_layer_stride_numel
-    auto cpu_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-    physical_to_logical_map = torch::from_blob(cpu_buffer, {num_layers, P}, {per_layer_stride_numel, 1}, cpu_opts);
-    logical_to_physical_map =
-        torch::from_blob(cpu_buffer + p2l_numel, {num_layers, L, R}, {per_layer_stride_numel, R, 1}, cpu_opts);
-    logical_replica_counts =
-        torch::from_blob(cpu_buffer + p2l_numel + l2p_numel, {num_layers, L}, {per_layer_stride_numel, 1}, cpu_opts);
-    logical_instance_quota = torch::from_blob(
-        cpu_buffer + p2l_numel + l2p_numel + lcnts_numel, {num_layers, L, R}, {per_layer_stride_numel, R, 1}, cpu_opts);
-    logical_instance_quota_prefix = torch::from_blob(cpu_buffer + p2l_numel + l2p_numel + lcnts_numel + quota_numel,
-                                                     {num_layers, L, R},
-                                                     {per_layer_stride_numel, R, 1},
-                                                     cpu_opts);
-
     // Create GPU tensor views with strides
     auto device_opts =
         torch::TensorOptions().dtype(torch::kInt32).device(torch::Device(torch::kCUDA, device_id));
-    physical_to_logical_map_device =
+    physical_to_logical_map =
         torch::from_blob(device_buffer, {num_layers, P}, {per_layer_stride_numel, 1}, device_opts);
-    logical_to_physical_map_device =
+    logical_to_physical_map =
         torch::from_blob(device_buffer + p2l_numel, {num_layers, L, R}, {per_layer_stride_numel, R, 1}, device_opts);
-    logical_replica_counts_device = torch::from_blob(
+    logical_replica_counts = torch::from_blob(
         device_buffer + p2l_numel + l2p_numel, {num_layers, L}, {per_layer_stride_numel, 1}, device_opts);
-    logical_instance_quota_device = torch::from_blob(device_buffer + p2l_numel + l2p_numel + lcnts_numel,
-                                                     {num_layers, L, R},
-                                                     {per_layer_stride_numel, R, 1},
-                                                     device_opts);
-    logical_instance_quota_prefix_device = torch::from_blob(
+    logical_instance_quota = torch::from_blob(device_buffer + p2l_numel + l2p_numel + lcnts_numel,
+                                              {num_layers, L, R},
+                                              {per_layer_stride_numel, R, 1},
+                                              device_opts);
+    logical_instance_quota_prefix = torch::from_blob(
         device_buffer + p2l_numel + l2p_numel + lcnts_numel + quota_numel,
         {num_layers, L, R},
         {per_layer_stride_numel, R, 1},
@@ -94,76 +58,23 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
 }
 
 void GlobalExpertPlacement::cleanup() {
-    if (cpu_buffer != nullptr) {
-        cudaFreeHost(cpu_buffer);
-        cpu_buffer = nullptr;
-        quota_buf_cpu = nullptr;
-    }
     if (device_buffer != nullptr) {
         cudaFree(device_buffer);
         device_buffer = nullptr;
         quota_buf_device = nullptr;
     }
+    physical_to_logical_map = torch::Tensor();
+    logical_to_physical_map = torch::Tensor();
+    logical_replica_counts = torch::Tensor();
+    logical_instance_quota = torch::Tensor();
+    logical_instance_quota_prefix = torch::Tensor();
     rank_quota_prefix = torch::Tensor();
-}
-
-void GlobalExpertPlacement::to_device(const int layer_id, const bool async, std::optional<at::cuda::CUDAStream> s) const {
-    EP_HOST_ASSERT(cpu_buffer != nullptr && device_buffer != nullptr);
-    auto stream = s.value_or(at::cuda::getCurrentCUDAStream());
-    if (layer_id >= 0) {
-        EP_HOST_ASSERT(layer_id < num_layers_);
-        int32_t* src = cpu_buffer + layer_id * per_layer_stride_numel;
-        int32_t* dst = device_buffer + layer_id * per_layer_stride_numel;
-        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, per_layer_data_bytes, cudaMemcpyHostToDevice, stream));
-    } else {
-        // Sync all layers
-        int32_t* src = cpu_buffer;
-        int32_t* dst = device_buffer;
-        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, total_bytes, cudaMemcpyHostToDevice, stream));
-    }
-
-    if (!async) {
-        CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
-    }
-}
-
-void GlobalExpertPlacement::to_cpu(const int layer_id, const bool async, std::optional<at::cuda::CUDAStream> s) const {
-    EP_HOST_ASSERT(cpu_buffer != nullptr && device_buffer != nullptr);
-    auto stream = s.value_or(at::cuda::getCurrentCUDAStream());
-    if (layer_id >= 0) {
-        EP_HOST_ASSERT(layer_id < num_layers_);
-        int32_t* src = device_buffer + layer_id * per_layer_stride_numel;
-        int32_t* dst = cpu_buffer + layer_id * per_layer_stride_numel;
-        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, per_layer_data_bytes, cudaMemcpyDeviceToHost, stream));
-    } else {
-        // Sync all layers
-        int32_t* src = device_buffer;
-        int32_t* dst = cpu_buffer;
-        CUDA_RUNTIME_CHECK(cudaMemcpyAsync(dst, src, total_bytes, cudaMemcpyDeviceToHost, stream));
-    }
-
-    if (!async) {
-        CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
-    }
-}
-
-std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_cpu_ptrs(int layer_id) const {
-    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
-    int32_t* base = cpu_buffer + layer_id * per_layer_stride_numel;
-    return std::make_tuple(base, base + p2l_numel, base + p2l_numel + l2p_numel);
 }
 
 std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_device_ptrs(int layer_id) const {
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
     int32_t* base = device_buffer + layer_id * per_layer_stride_numel;
     return std::make_tuple(base, base + p2l_numel, base + p2l_numel + l2p_numel);
-}
-
-std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_quota_cpu_ptrs(int layer_id) const {
-    EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers_);
-    int32_t* base = cpu_buffer + layer_id * per_layer_stride_numel;
-    return std::make_tuple(
-        base + p2l_numel + l2p_numel + lcnts_numel, base + p2l_numel + l2p_numel + lcnts_numel + quota_numel, nullptr);
 }
 
 std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_quota_ptrs(int layer_id) const {
@@ -222,7 +133,6 @@ Manager::Manager(const int& num_layers,
       weight_sync_relay_max_relays_(weight_sync_relay_max_relays),
       weight_sync_relay_min_fanout_gain_(weight_sync_relay_min_fanout_gain),
       balance_threshold_(balance_threshold),
-      placement_cpu_dirty_(num_layers, false),
       comm_stream(at::cuda::getStreamFromPool(true)),
       relay_stream(at::cuda::getStreamFromPool(true)),
       placement_ready_events_(is_train ? num_layers : 1),
@@ -247,8 +157,7 @@ Manager::Manager(const int& num_layers,
         (kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc1_numel)) +
          kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc2_numel)));
 
-    // Allocate global placement tensors using contiguous per-layer buffers on CPU and GPU.
-    // This reduces number of H2D/D2H memory copies.
+    // Allocate global placement tensors using contiguous per-layer device buffers.
     int num_ranks = runtime::num_ranks;
     int device_id = runtime::device_id;
     placement.init(num_layers,
@@ -402,17 +311,23 @@ Manager::Manager(const int& num_layers,
     // Initialize default placement (master-only) for all layers so sparse reroute
     // remains valid before the first placement update.
     for (int lid = 0; lid < num_layers; ++lid) {
-        auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_cpu_ptrs(lid);
-        for (int logical_id = 0; logical_id < num_global_logical_experts; ++logical_id) {
-            const int rank = logical_id / num_local_master_experts;
-            const int local_idx = logical_id % num_local_master_experts;
-            const int physical_id = rank * num_local_physical_experts + local_idx;
-            p2l_ptr[physical_id] = logical_id;
-            l2p_ptr[logical_id * runtime::num_ranks] = physical_id;
-            lcnts_ptr[logical_id] = 1;
-        }
+        auto [p2l_ptr, l2p_ptr, lcnts_ptr] = placement.get_device_ptrs(lid);
+        auto [quota_ptr, quota_prefix_ptr, rank_quota_prefix_ptr] = placement.get_quota_ptrs(lid);
+        kernels::init_master_placement(p2l_ptr,
+                                       l2p_ptr,
+                                       lcnts_ptr,
+                                       quota_ptr,
+                                       quota_prefix_ptr,
+                                       rank_quota_prefix_ptr,
+                                       at::cuda::getCurrentCUDAStream().stream(),
+                                       num_global_physical_experts,
+                                       num_global_logical_experts,
+                                       runtime::num_ranks,
+                                       num_local_master_experts,
+                                       num_local_redundant_experts,
+                                       runtime::num_ranks);
     }
-    placement.to_device(-1, false);  // sync copy all layers
+    CUDA_RUNTIME_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream().stream()));
 
     // Ready to use (no IPC handle exchange needed with NVSHMEM)
     _available = true;
@@ -530,38 +445,6 @@ void Manager::destroy() {
     _available = false;
 }
 
-void Manager::sync_placement_to_cpu(const int layer_id) {
-    EP_HOST_ASSERT(is_available());
-    EP_HOST_ASSERT(layer_id >= -1 && layer_id < num_layers);
-
-    bool need_sync = false;
-    if (layer_id >= 0) {
-        need_sync = placement_cpu_dirty_[layer_id];
-    } else {
-        for (bool dirty : placement_cpu_dirty_) {
-            if (dirty) {
-                need_sync = true;
-                break;
-            }
-        }
-    }
-    if (!need_sync) {
-        return;
-    }
-
-    // Placement writes may have been enqueued on either the caller's current stream
-    // or comm_stream. For CPU consumers we can take the slow path and fully
-    // synchronize the device before refreshing the host mirror.
-    CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
-    placement.to_cpu(layer_id, /*async=*/false);
-
-    if (layer_id >= 0) {
-        placement_cpu_dirty_[layer_id] = false;
-    } else {
-        std::fill(placement_cpu_dirty_.begin(), placement_cpu_dirty_.end(), false);
-    }
-}
-
 void Manager::record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream) {
     EP_HOST_ASSERT(layer_id >= 0 && layer_id < num_layers);
     const int slot = placement_sync_slot(layer_id);
@@ -657,7 +540,6 @@ void Manager::update_placement(const int& layer_id, torch::Tensor& routing_map) 
                                quota_oracle_eps_,
                                quota_kernel_stage_);
     }
-    placement_cpu_dirty_[layer_id] = true;
     record_placement_ready(layer_id, curr_stream);
 }
 
@@ -743,7 +625,6 @@ void Manager::update_placement_sparse(const int& layer_id, torch::Tensor& topk_i
                                quota_oracle_eps_,
                                quota_kernel_stage_);
     }
-    placement_cpu_dirty_[layer_id] = true;
     record_placement_ready(layer_id, comm_stream);
 }
 
@@ -896,6 +777,45 @@ torch::Tensor Manager::dense_reroute_backward(const int& layer_id,
     }
 
     return grad_probs;
+}
+
+void Manager::set_weight_sync_plan_mode(const int& plan_mode) {
+    EP_HOST_ASSERT(plan_mode >= static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
+                   plan_mode <= static_cast<int>(kernels::WeightSyncPlanMode::kForceRelay));
+    CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
+    weight_sync_plan_mode_ = plan_mode;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (local_weight_sync_ready_flags != nullptr) {
+        const int max_relay_chunks_per_shard =
+            kernels::weight_sync_num_chunks(static_cast<size_t>(std::max(expert_fc1_numel, expert_fc2_numel)));
+        const int64_t local_ready_flag_count =
+            static_cast<int64_t>(num_local_redundant_experts) * 2 * max_relay_chunks_per_shard;
+        CUDA_RUNTIME_CHECK(cudaMemsetAsync(local_weight_sync_ready_flags,
+                                           0,
+                                           local_ready_flag_count * sizeof(uint64_t),
+                                           stream.stream()));
+    }
+    kernels::TaskBuildConfig config_cpu = {};
+    config_cpu.rank_idx = runtime::rank_idx;
+    config_cpu.nvl_rank_idx = runtime::nvl_rank_idx;
+    config_cpu.num_nvl_ranks = runtime::num_nvl_ranks;
+    config_cpu.num_local_master_experts = num_local_master_experts;
+    config_cpu.num_local_physical_experts = num_local_physical_experts;
+    config_cpu.num_local_redundant_experts = num_local_redundant_experts;
+    config_cpu.expert_fc1_numel = expert_fc1_numel;
+    config_cpu.expert_fc2_numel = expert_fc2_numel;
+    config_cpu.expert_total_numel = expert_total_numel;
+    config_cpu.max_replicas_dim = runtime::num_ranks;
+    config_cpu.weight_sync_plan_mode = weight_sync_plan_mode_;
+    config_cpu.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas_;
+    config_cpu.weight_sync_relay_max_relays = weight_sync_relay_max_relays_;
+    config_cpu.weight_sync_relay_min_fanout_gain = weight_sync_relay_min_fanout_gain_;
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(_task_build_config,
+                                       &config_cpu,
+                                       sizeof(kernels::TaskBuildConfig),
+                                       cudaMemcpyHostToDevice,
+                                       stream.stream()));
+    CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream.stream()));
 }
 
 std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,

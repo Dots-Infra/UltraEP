@@ -113,8 +113,8 @@ class Manager:
         )
         assert self.runtime.is_available()
 
-        # Host-visible placement mirror. GPU-resident placement paths refresh this
-        # CPU mirror only on demand.
+        # Placement maps are device-resident. Tests and diagnostics should reduce
+        # metrics on GPU and only materialize small scalar summaries for printing.
         self._physical_to_logical_map: torch.Tensor = (
             self.runtime.get_physical_to_logical_map_tensor()
         )
@@ -147,34 +147,24 @@ class Manager:
 
         self.check_tensors_blob_from_cpp()
 
-    def sync_placement_to_cpu(self, layer_id: Optional[int] = None):
-        if layer_id is not None:
-            assert layer_id < self.num_alloc_layers
-        self.runtime.sync_placement_to_cpu(-1 if layer_id is None else layer_id)
-
     @property
     def physical_to_logical_map(self) -> torch.Tensor:
-        self.sync_placement_to_cpu()
         return self._physical_to_logical_map
 
     @property
     def logical_to_physical_map(self) -> torch.Tensor:
-        self.sync_placement_to_cpu()
         return self._logical_to_physical_map
 
     @property
     def logical_replica_counts(self) -> torch.Tensor:
-        self.sync_placement_to_cpu()
         return self._logical_replica_counts
 
     @property
     def logical_instance_quota(self) -> torch.Tensor:
-        self.sync_placement_to_cpu()
         return self._logical_instance_quota
 
     @property
     def logical_instance_quota_prefix(self) -> torch.Tensor:
-        self.sync_placement_to_cpu()
         return self._logical_instance_quota_prefix
 
     @property
@@ -182,11 +172,9 @@ class Manager:
         return self._rank_quota_prefix
 
     def get_quota_tensor(self, layer_id: int) -> torch.Tensor:
-        self.sync_placement_to_cpu(layer_id)
         return self._logical_instance_quota[layer_id]
 
     def get_quota_prefix_tensor(self, layer_id: int) -> torch.Tensor:
-        self.sync_placement_to_cpu(layer_id)
         return self._logical_instance_quota_prefix[layer_id]
 
     def get_rank_quota_prefix_tensor(self, layer_id: int) -> torch.Tensor:
@@ -341,6 +329,14 @@ class Manager:
             )
             return EventHandle(event)
 
+    def set_weight_sync_plan_mode(self, plan_mode: str):
+        normalized = plan_mode.lower().replace("_", "")
+        mode_ids = {"direct": 0, "adaptive": 1, "adaptiverelay": 1, "forcerelay": 2}
+        if normalized not in mode_ids:
+            raise ValueError("plan_mode must be one of: direct, adaptive_relay, force_relay")
+        self.weight_sync_plan_mode = normalized
+        self.runtime.set_weight_sync_plan_mode(mode_ids[normalized])
+
     def update_placement(
         self,
         layer_id: int,
@@ -409,8 +405,7 @@ class Manager:
             orig_log_expert_loads, balanced_phys_expert_loads = None, None
             orig_log_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
             dist.all_reduce(orig_log_expert_loads, group=self.group)
-            self.sync_placement_to_cpu(layer_id)
-            max_replica_cnt = self._logical_replica_counts[layer_id].cpu().max().item()
+            max_replica_cnt = self._logical_replica_counts[layer_id].max().item()
 
         if backend != "cuda":
             raise ValueError("Only backend='cuda' is supported; CPU reroute has been removed")
@@ -432,9 +427,9 @@ class Manager:
                 balanced_phys_expert_loads_by_rank = balanced_phys_expert_loads.view(
                     self.num_ranks, self.num_local_physical_experts
                 ).sum(dim=1)
-                orig_imbalance = get_max_by_mean(orig_log_expert_loads_by_rank.cpu())
+                orig_imbalance = get_max_by_mean(orig_log_expert_loads_by_rank)
                 balanced_imbalance = get_max_by_mean(
-                    balanced_phys_expert_loads_by_rank.cpu()
+                    balanced_phys_expert_loads_by_rank
                 )
                 with open(self.ep_log_path, "a") as f:
                     f.write(
@@ -480,10 +475,9 @@ class Manager:
             # update_placement_sparse call via nvshmem allreduce, so we reuse it
             # directly instead of recomputing from topk_ids.
             orig_log_expert_loads = (
-                self.runtime.get_global_logical_expert_loads_tensor().cpu().clone()
+                self.runtime.get_global_logical_expert_loads_tensor().clone()
             )
-            self.sync_placement_to_cpu(layer_id)
-            max_replica_cnt = self._logical_replica_counts[layer_id].cpu().max().item()
+            max_replica_cnt = self._logical_replica_counts[layer_id].max().item()
 
         self.runtime.reroute_sparse(layer_id, topk_ids)
 
@@ -516,11 +510,11 @@ class Manager:
 
     def check_tensors_blob_from_cpp(self):
         assert (
-            self._physical_to_logical_map.device == torch.device("cpu")
-            and self._logical_to_physical_map.device == torch.device("cpu")
-            and self._logical_replica_counts.device == torch.device("cpu")
-            and self._logical_instance_quota.device == torch.device("cpu")
-            and self._logical_instance_quota_prefix.device == torch.device("cpu")
+            self._physical_to_logical_map.device == torch.device("cuda", self.device)
+            and self._logical_to_physical_map.device == torch.device("cuda", self.device)
+            and self._logical_replica_counts.device == torch.device("cuda", self.device)
+            and self._logical_instance_quota.device == torch.device("cuda", self.device)
+            and self._logical_instance_quota_prefix.device == torch.device("cuda", self.device)
         )
         assert (
             self._physical_to_logical_map.dtype == torch.int32

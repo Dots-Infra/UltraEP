@@ -38,6 +38,20 @@ void solve_placement(const int32_t* expert_loads,
     float oracle_eps = 0.01f,
     int kernel_stage = 1);
 
+void init_master_placement(int32_t* physical_to_logical_map,
+                           int32_t* logical_to_physical_map,
+                           int32_t* logical_replica_counts,
+                           int32_t* logical_instance_quota,
+                           int32_t* logical_instance_quota_prefix,
+                           int32_t* rank_quota_prefix,
+                           cudaStream_t stream,
+                           int num_global_physical_experts,
+                           int num_global_logical_experts,
+                           int num_ranks,
+                           int num_local_master_experts,
+                           int num_local_redundant_experts,
+                           int max_replicas_dim);
+
 namespace legacy {
 
 void solve_placement(const int32_t* expert_loads,

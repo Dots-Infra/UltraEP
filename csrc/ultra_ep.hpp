@@ -47,20 +47,12 @@ Example:
     - logical_replica_counts: [1, 2, 1, 2]
 */
 struct GlobalExpertPlacement {
-    // CPU tensor views (strided views into cpu_buffer)
+    // Device tensor views (strided views into device_buffer)
     torch::Tensor physical_to_logical_map;
     torch::Tensor logical_to_physical_map;
     torch::Tensor logical_replica_counts;
     torch::Tensor logical_instance_quota;
     torch::Tensor logical_instance_quota_prefix;
-
-    // Device tensor views (strided views into device_buffer)
-    torch::Tensor physical_to_logical_map_device;
-    torch::Tensor logical_to_physical_map_device;
-    torch::Tensor logical_replica_counts_device;
-    torch::Tensor logical_instance_quota_device;
-    torch::Tensor logical_instance_quota_prefix_device;
-    // Per-rank quota prefix only needs a device copy.
     torch::Tensor rank_quota_prefix;
 
     // Contiguous per-layer buffer management.
@@ -68,9 +60,7 @@ struct GlobalExpertPlacement {
     //   [p2l (P) | l2p (L*R) | lcnts (L) | quota (L*R) | quota_prefix (L*R)]
     // with padding to alignment.
     // Cross-layer stride is per_layer_stride_numel (may be > per_layer_data_numel for alignment).
-    int32_t* cpu_buffer = nullptr;  // pinned host memory
     int32_t* device_buffer = nullptr;
-    int32_t* quota_buf_cpu = nullptr;
     int32_t* quota_buf_device = nullptr;
 
     int num_layers_ = 0;
@@ -86,7 +76,7 @@ struct GlobalExpertPlacement {
     int per_layer_stride_bytes = 0;
     int total_bytes = 0;
 
-    // Alignment for DMA transfers (256 bytes works well for PCIe/NVLink)
+    // Alignment keeps per-layer device slices cacheline-friendly.
     static constexpr int ALIGNMENT_BYTES = 256;
 
     // Initialize contiguous buffers and create tensor views.
@@ -99,22 +89,8 @@ struct GlobalExpertPlacement {
     // Free contiguous buffers. Safe to call multiple times.
     void cleanup();
 
-    // Copy placement data from CPU to device for one layer (layer_id >= 0) or all layers (layer_id == -1).
-    // Uses the given CUDA stream (or current stream if not specified).
-    void to_device(const int layer_id = -1,
-                   const bool async = true,
-                   std::optional<at::cuda::CUDAStream> stream = std::nullopt) const;
-
-    // Copy placement data from device to CPU for one layer (layer_id >= 0) or all layers (layer_id == -1).
-    // Used to refresh the host-visible mirror on demand for CPU fallbacks and debugging.
-    void to_cpu(const int layer_id = -1,
-                const bool async = true,
-                std::optional<at::cuda::CUDAStream> stream = std::nullopt) const;
-
     // Raw pointer access for a specific layer.
-    std::tuple<int32_t*, int32_t*, int32_t*> get_cpu_ptrs(int layer_id) const;
     std::tuple<int32_t*, int32_t*, int32_t*> get_device_ptrs(int layer_id) const;
-    std::tuple<int32_t*, int32_t*, int32_t*> get_quota_cpu_ptrs(int layer_id) const;
     std::tuple<int32_t*, int32_t*, int32_t*> get_quota_ptrs(int layer_id) const;
 };
 
@@ -130,7 +106,7 @@ class Manager {
     int num_global_logical_experts;
     bool is_train;
 
-    // Placement buffers. CPU views are a host-visible mirror of the GPU state.
+    // Placement buffers are device-resident; legacy placement owns any CPU staging internally.
     GlobalExpertPlacement placement;
 
     // After NVSHMEM synchronization, this flag will be true
@@ -210,7 +186,6 @@ class Manager {
     int weight_sync_relay_min_replicas_ = 6;
     int weight_sync_relay_max_relays_ = 8;
     int weight_sync_relay_min_fanout_gain_ = 2;
-    std::vector<bool> placement_cpu_dirty_;
     // Shape: [num_global_logical_experts]
     int* global_logical_expert_loads = nullptr;      // alloc by nvshmem for allreduce
     int* global_logical_expert_loads_cpu = nullptr;  // host scratch for legacy placement
@@ -245,7 +220,6 @@ public:
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
-    void sync_placement_to_cpu(const int layer_id = -1);
 
     // Aggregate grad from remote replicas to local master
     // then zero-out replica grad buffers
@@ -290,6 +264,7 @@ public:
                                          torch::Tensor& expanded_routing_map);
 
     torch::Stream get_comm_stream() const { return comm_stream; }
+    void set_weight_sync_plan_mode(const int& plan_mode);
 
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
     torch::Tensor get_local_replica_grad_buffer_tensor() const {
@@ -354,7 +329,6 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("weight_sync_relay_min_fanout_gain") = 2)
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
-        .def("sync_placement_to_cpu", &Manager::sync_placement_to_cpu, pybind11::arg("layer_id") = -1)
         .def("update_placement", &Manager::update_placement)
         .def("update_placement_sparse", &Manager::update_placement_sparse)
         .def("reroute_sparse", &Manager::reroute_sparse)
@@ -368,6 +342,7 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("previous_event"),
              pybind11::arg("async_finish"))
         .def("weight_sync", &Manager::weight_sync)
+        .def("set_weight_sync_plan_mode", &Manager::set_weight_sync_plan_mode)
         .def("get_comm_stream", &Manager::get_comm_stream)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
         .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)
@@ -378,6 +353,110 @@ static void register_apis(pybind11::module_& m) {
         .def("get_logical_instance_quota_prefix_tensor", &Manager::get_logical_instance_quota_prefix_tensor)
         .def("get_rank_quota_prefix_tensor", &Manager::get_rank_quota_prefix_tensor)
         .def("get_global_logical_expert_loads_tensor", &Manager::get_global_logical_expert_loads_tensor);
+
+    m.def("solve_placement_for_test",
+          [](torch::Tensor expert_loads,
+             torch::Tensor expert_loads_per_rank,
+             int num_ranks,
+             int num_local_master_experts,
+             int num_local_redundant_experts,
+             int num_nvl_ranks,
+             bool legacy_placement,
+             float balance_threshold,
+             int32_t min_tokens_per_replica,
+             bool allow_zero_master_quota,
+             bool locality_aware,
+             float oracle_eps,
+             int kernel_stage) {
+              EP_HOST_ASSERT(expert_loads.is_cuda() && expert_loads.dtype() == torch::kInt32);
+              EP_HOST_ASSERT(expert_loads.dim() == 1);
+              EP_HOST_ASSERT(num_ranks > 0 && num_nvl_ranks > 0 && num_ranks % num_nvl_ranks == 0);
+              EP_HOST_ASSERT(num_local_master_experts > 0 && num_local_redundant_experts >= 0);
+              const int num_global_logical_experts = expert_loads.size(0);
+              EP_HOST_ASSERT(num_global_logical_experts == num_ranks * num_local_master_experts);
+              const int num_local_physical_experts = num_local_master_experts + num_local_redundant_experts;
+              const int num_global_physical_experts = num_ranks * num_local_physical_experts;
+              auto opts = torch::TensorOptions().dtype(torch::kInt32).device(expert_loads.device());
+              auto physical_to_logical_map = torch::empty({num_global_physical_experts}, opts);
+              auto logical_to_physical_map = torch::empty({num_global_logical_experts, num_ranks}, opts);
+              auto logical_replica_counts = torch::empty({num_global_logical_experts}, opts);
+              auto logical_instance_quota = torch::empty({num_global_logical_experts, num_ranks}, opts);
+              auto logical_instance_quota_prefix = torch::empty({num_global_logical_experts, num_ranks}, opts);
+              auto rank_quota_prefix = torch::empty({num_global_logical_experts, num_ranks}, opts);
+              auto stream = at::cuda::getCurrentCUDAStream();
+              const int32_t* loads_per_rank_ptr = nullptr;
+              if (expert_loads_per_rank.defined()) {
+                  EP_HOST_ASSERT(expert_loads_per_rank.is_cuda() && expert_loads_per_rank.dtype() == torch::kInt32);
+                  EP_HOST_ASSERT(expert_loads_per_rank.dim() == 2 && expert_loads_per_rank.size(0) == num_ranks &&
+                                 expert_loads_per_rank.size(1) == num_global_logical_experts);
+                  loads_per_rank_ptr = expert_loads_per_rank.data_ptr<int32_t>();
+              }
+              if (legacy_placement) {
+                  kernels::legacy::solve_placement(expert_loads.data_ptr<int32_t>(),
+                                                   loads_per_rank_ptr,
+                                                   physical_to_logical_map.data_ptr<int32_t>(),
+                                                   logical_to_physical_map.data_ptr<int32_t>(),
+                                                   logical_replica_counts.data_ptr<int32_t>(),
+                                                   logical_instance_quota.data_ptr<int32_t>(),
+                                                   logical_instance_quota_prefix.data_ptr<int32_t>(),
+                                                   rank_quota_prefix.data_ptr<int32_t>(),
+                                                   stream.stream(),
+                                                   num_global_logical_experts,
+                                                   num_ranks,
+                                                   num_local_master_experts,
+                                                   num_local_redundant_experts,
+                                                   num_nvl_ranks,
+                                                   num_ranks,
+                                                   balance_threshold,
+                                                   min_tokens_per_replica,
+                                                   allow_zero_master_quota,
+                                                   locality_aware,
+                                                   oracle_eps,
+                                                   kernel_stage);
+              } else {
+                  EP_HOST_ASSERT(loads_per_rank_ptr != nullptr && "quota placement requires per-rank loads");
+                  kernels::solve_placement(expert_loads.data_ptr<int32_t>(),
+                                           loads_per_rank_ptr,
+                                           physical_to_logical_map.data_ptr<int32_t>(),
+                                           logical_to_physical_map.data_ptr<int32_t>(),
+                                           logical_replica_counts.data_ptr<int32_t>(),
+                                           logical_instance_quota.data_ptr<int32_t>(),
+                                           logical_instance_quota_prefix.data_ptr<int32_t>(),
+                                           rank_quota_prefix.data_ptr<int32_t>(),
+                                           stream.stream(),
+                                           num_global_logical_experts,
+                                           num_ranks,
+                                           num_local_master_experts,
+                                           num_local_redundant_experts,
+                                           num_nvl_ranks,
+                                           num_ranks,
+                                           balance_threshold,
+                                           min_tokens_per_replica,
+                                           allow_zero_master_quota,
+                                           locality_aware,
+                                           oracle_eps,
+                                           kernel_stage);
+              }
+              return std::make_tuple(physical_to_logical_map,
+                                     logical_to_physical_map,
+                                     logical_replica_counts,
+                                     logical_instance_quota,
+                                     logical_instance_quota_prefix,
+                                     rank_quota_prefix);
+          },
+          pybind11::arg("expert_loads"),
+          pybind11::arg("expert_loads_per_rank"),
+          pybind11::arg("num_ranks"),
+          pybind11::arg("num_local_master_experts"),
+          pybind11::arg("num_local_redundant_experts"),
+          pybind11::arg("num_nvl_ranks"),
+          pybind11::arg("legacy_placement") = false,
+          pybind11::arg("balance_threshold") = 1.0f,
+          pybind11::arg("min_tokens_per_replica") = 1,
+          pybind11::arg("allow_zero_master_quota") = true,
+          pybind11::arg("locality_aware") = true,
+          pybind11::arg("oracle_eps") = 0.01f,
+          pybind11::arg("kernel_stage") = 1);
 }
 
 }  // namespace ultra_ep
