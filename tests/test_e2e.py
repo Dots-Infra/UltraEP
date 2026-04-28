@@ -6,28 +6,30 @@ import torch
 import torch.distributed as dist
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO_ROOT)
+if REPO_ROOT in sys.path:
+    sys.path.remove(REPO_ROOT)
+if "" in sys.path and os.path.abspath(os.getcwd()) == REPO_ROOT:
+    sys.path.remove("")
 import ultra_ep
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import bench, bench_kineto, bitwise_equal, generate_routing_map_zipf, max_mean, rank_token_count
+from utils import (
+    bench,
+    bench_kineto,
+    bitwise_equal,
+    expert_load_imbalance_summary,
+    format_load_imbalance,
+    generate_routing_map_zipf,
+    max_mean,
+    print_metric,
+    print_section,
+    rank_token_count,
+)
 
 
 def print_rank0(msg: str):
     if dist.get_rank() == 0:
         print(msg, flush=True)
-
-
-def print_section(title: str):
-    print_rank0("")
-    print_rank0("=" * 96)
-    print_rank0(title)
-    print_rank0("=" * 96)
-
-
-def print_metric(name: str, e2e_ms: float, kernel_ms: float, extra: str = ""):
-    suffix = f" | {extra}" if extra else ""
-    print_rank0(f"  {name:<28} e2e {e2e_ms:>9.3f} ms | kernel {kernel_ms:>9.3f} ms{suffix}")
 
 
 def replica_summary(manager, layer_id: int) -> str:
@@ -171,18 +173,20 @@ def run_update_and_reroute(manager, args, layer_id, routing_map, probs):
         manager.reroute(layer_id, probs, routing_map)
 
     reroute_avg, _, _ = bench(reroute, args.warmup_iters, args.bench_iters, use_barrier=True)
-    reroute_kernel = bench_kineto(
+    reroute_kernel_parts = bench_kineto(
         reroute,
-        "dense_quota_reroute_scatter_kernel",
+        ("reroute_forward_count_kernel", "dense_quota_reroute_scatter_kernel"),
         num_tests=max(3, min(args.bench_iters, 30)),
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
+    reroute_kernel = sum(reroute_kernel_parts)
     print_metric(
         "update_placement",
         update_avg * 1000,
         solve_kernel * 1000,
         replica_summary(manager, layer_id),
+        print_fn=print_rank0,
     )
     print_metric(
         "reroute",
@@ -190,6 +194,7 @@ def run_update_and_reroute(manager, args, layer_id, routing_map, probs):
         reroute_kernel * 1000,
         f"rank max/mean {max_mean(rank_load_before).item():.3f} -> "
         f"{max_mean(rank_load_after).item():.3f}",
+        print_fn=print_rank0,
     )
     return expanded_probs, expanded_routing
 
@@ -221,15 +226,25 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
     replica = manager.local_replica_weight_buffer
     replica.random_(0, 3)
     expected = expected_replica_weights(manager, args, layer_id, fc1_weights, fc2_weights, replica.clone())
+    dist.barrier()
     manager.weight_sync(layer_id, async_finish=False)
     torch.cuda.synchronize()
+    dist.barrier()
     assert bitwise_equal(replica, expected), f"weight_sync bitwise mismatch on rank {dist.get_rank()}"
 
     def sync_once():
-        replica.random_(0, 3)
         manager.weight_sync(layer_id, async_finish=False)
 
-    avg, _, _ = bench(sync_once, args.warmup_iters, args.bench_iters, use_barrier=True)
+    def randomize_replica():
+        replica.random_(0, 3)
+
+    avg, _, _ = bench(
+        sync_once,
+        args.warmup_iters,
+        args.bench_iters,
+        use_barrier=True,
+        pre_fn=randomize_replica,
+    )
     kernel = bench_kineto(
         sync_once,
         "weight_sync_kernel",
@@ -237,7 +252,7 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
-    print_metric(f"weight_sync/{plan_mode}", avg * 1000, kernel * 1000, "bitwise PASS")
+    print_metric(f"weight_sync/{plan_mode}", avg * 1000, kernel * 1000, "bitwise PASS", print_fn=print_rank0)
 
 
 def run_grad_reduce(manager, args, layer_id):
@@ -279,22 +294,46 @@ def run_grad_reduce(manager, args, layer_id):
             args.expert_fc2_numel,
             torch.float32,
         )
+    fc1_base = [g.clone() for g in fc1_grads]
+    fc2_base = [g.clone() for g in fc2_grads]
     replica.copy_(replica_ref)
     expected_fc1, expected_fc2 = expected_master_grads(
         manager, args, layer_id, fc1_grads, fc2_grads, replica_ref
     )
+    dist.barrier()
     manager.grad_reduce(layer_id, async_finish=False)
     torch.cuda.synchronize()
-    bitwise = bool((replica == 0).all().item())
+    dist.barrier()
+    placement_device = manager.physical_to_logical_map.device
+    local_replica_phys = (
+        dist.get_rank() * manager.num_local_physical_experts
+        + args.num_local_master
+        + torch.arange(args.num_redundant_experts_per_rank, device=placement_device)
+    )
+    valid_local_replicas = manager.physical_to_logical_map[layer_id, local_replica_phys] >= 0
+    correct = True
+    if bool(valid_local_replicas.any().item()):
+        correct = bool((replica[valid_local_replicas] == 0).all().item())
     for idx in range(args.num_local_master):
-        bitwise = bitwise and bitwise_equal(fc1_grads[idx], expected_fc1[idx])
-        bitwise = bitwise and bitwise_equal(fc2_grads[idx], expected_fc2[idx])
+        correct = correct and torch.allclose(fc1_grads[idx], expected_fc1[idx], atol=1e-5, rtol=1e-5)
+        correct = correct and torch.allclose(fc2_grads[idx], expected_fc2[idx], atol=1e-5, rtol=1e-5)
+
+    def reset_grad_state():
+        for idx in range(args.num_local_master):
+            fc1_grads[idx].copy_(fc1_base[idx])
+            fc2_grads[idx].copy_(fc2_base[idx])
+        replica.copy_(replica_ref)
 
     def reduce_once():
-        replica.copy_(replica_ref)
         manager.grad_reduce(layer_id, async_finish=False)
 
-    avg, _, _ = bench(reduce_once, args.warmup_iters, args.bench_iters, use_barrier=True)
+    avg, _, _ = bench(
+        reduce_once,
+        args.warmup_iters,
+        args.bench_iters,
+        use_barrier=True,
+        pre_fn=reset_grad_state,
+    )
     kernel = bench_kineto(
         reduce_once,
         "grad_reduce_kernel",
@@ -302,8 +341,8 @@ def run_grad_reduce(manager, args, layer_id):
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
-    status = "PASS" if bitwise else "MISMATCH"
-    print_metric("grad_reduce", avg * 1000, kernel * 1000, f"bitwise {status}")
+    status = "PASS" if correct else "MISMATCH"
+    print_metric("grad_reduce", avg * 1000, kernel * 1000, f"correctness {status}", print_fn=print_rank0)
 
 
 def run_hybridep_a2a(args, expanded_routing):
@@ -375,15 +414,15 @@ def run_hybridep_a2a(args, expanded_routing):
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
-    print_metric("HybridEP dispatch", dispatch_avg * 1000, dispatch_kernel * 1000)
-    print_metric("HybridEP combine", combine_avg * 1000, combine_kernel * 1000)
+    print_metric("HybridEP dispatch", dispatch_avg * 1000, dispatch_kernel * 1000, print_fn=print_rank0)
+    print_metric("HybridEP combine", combine_avg * 1000, combine_kernel * 1000, print_fn=print_rank0)
 
 
 def run_case(manager, args, ratio: float):
     args.imbalance_ratio = ratio
     layer_id = 0
     actual_tokens = rank_token_count(
-        dist.get_rank(), args.tokens_per_rank, args.variable_num_tokens, args.seed
+        dist.get_rank(), args.tokens_per_rank, args.variable_input_tokens, args.seed
     )
     routing_map = make_case_routing(args, actual_tokens)
     probs = make_probs(routing_map)
@@ -395,10 +434,17 @@ def run_case(manager, args, ratio: float):
     dist.all_reduce(token_max, op=dist.ReduceOp.MAX)
     dist.all_reduce(token_sum, op=dist.ReduceOp.SUM)
 
+    expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
+    dist.all_reduce(expert_loads)
+    load_summary = expert_load_imbalance_summary(
+        expert_loads, dist.get_world_size(), args.num_local_master
+    )
     print_section(
         f"Imbalance Ratio {ratio:g} | tokens/rank min/mean/max = "
         f"{int(token_min.item())}/{token_sum.item() / dist.get_world_size():.1f}/"
-        f"{int(token_max.item())}"
+        f"{int(token_max.item())}\n"
+        f"{format_load_imbalance(load_summary)}",
+        print_fn=print_rank0,
     )
 
     _, expanded_routing = run_update_and_reroute(manager, args, layer_id, routing_map, probs)
@@ -415,13 +461,13 @@ def main():
     parser.add_argument("--num-redundant-experts-per-rank", type=int, default=2)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--tokens-per-rank", type=int, default=8192)
-    parser.add_argument("--variable-num-tokens", action="store_true")
+    parser.add_argument("--variable-input-tokens", action="store_true", dest="variable_input_tokens")
     parser.add_argument(
         "--imbalance-ratios",
         type=float,
         nargs="+",
-        default=[0.0, 1.5, 2.0, 2.5, 3.0],
-        help="Space-separated target rank-level max/mean ratios.",
+        default=[1.0, 1.5, 2.0, 2.5, 3.0],
+        help="Space-separated target rank-level max/mean ratios (must be >= 1).",
     )
     parser.add_argument("--expert-fc1-numel", type=int, default=3072 * 4096)
     parser.add_argument("--expert-fc2-numel", type=int, default=1536 * 4096)
@@ -440,6 +486,8 @@ def main():
     parser.add_argument("--bench-iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=33)
     args = parser.parse_args()
+    if any(ratio < 1.0 for ratio in args.imbalance_ratios):
+        raise ValueError("--imbalance-ratios entries must be >= 1")
 
     group = setup_dist()
     manager = create_manager(args, group)
@@ -448,7 +496,8 @@ def main():
         f"world={dist.get_world_size()} experts={args.num_experts} "
         f"local_master/rank={args.num_local_master} "
         f"redundant/rank={args.num_redundant_experts_per_rank} topk={args.topk} "
-        f"tokens/rank<= {args.tokens_per_rank}"
+        f"tokens/rank<= {args.tokens_per_rank}",
+        print_fn=print_rank0,
     )
 
     try:

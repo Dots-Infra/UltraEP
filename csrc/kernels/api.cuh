@@ -36,7 +36,8 @@ void solve_placement(const int32_t* expert_loads,
     bool allow_zero_master_quota = true,
     bool locality_aware = true,
     float oracle_eps = 0.01f,
-    int kernel_stage = 1);
+    int kernel_stage = 1,
+    int rank_quota_source_rank = -1);
 
 void init_master_placement(int32_t* physical_to_logical_map,
                            int32_t* logical_to_physical_map,

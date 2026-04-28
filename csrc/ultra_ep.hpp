@@ -367,7 +367,8 @@ static void register_apis(pybind11::module_& m) {
              bool allow_zero_master_quota,
              bool locality_aware,
              float oracle_eps,
-             int kernel_stage) {
+             int kernel_stage,
+             int rank_quota_source_rank) {
               EP_HOST_ASSERT(expert_loads.is_cuda() && expert_loads.dtype() == torch::kInt32);
               EP_HOST_ASSERT(expert_loads.dim() == 1);
               EP_HOST_ASSERT(num_ranks > 0 && num_nvl_ranks > 0 && num_ranks % num_nvl_ranks == 0);
@@ -435,7 +436,8 @@ static void register_apis(pybind11::module_& m) {
                                            allow_zero_master_quota,
                                            locality_aware,
                                            oracle_eps,
-                                           kernel_stage);
+                                           kernel_stage,
+                                           rank_quota_source_rank);
               }
               return std::make_tuple(physical_to_logical_map,
                                      logical_to_physical_map,
@@ -456,7 +458,86 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("allow_zero_master_quota") = true,
           pybind11::arg("locality_aware") = true,
           pybind11::arg("oracle_eps") = 0.01f,
-          pybind11::arg("kernel_stage") = 1);
+          pybind11::arg("kernel_stage") = 1,
+          pybind11::arg("rank_quota_source_rank") = -1);
+
+    m.def("dense_reroute_for_test",
+          [](torch::Tensor routing_map,
+             torch::Tensor probs,
+             torch::Tensor logical_to_physical_map,
+             torch::Tensor logical_replica_counts,
+             torch::Tensor rank_quota_prefix,
+             int num_global_physical_experts,
+             bool quota_reroute,
+             bool interleave_by_rank_quota) {
+              EP_HOST_ASSERT(routing_map.is_cuda() && routing_map.dtype() == torch::kBool);
+              EP_HOST_ASSERT(probs.is_cuda() && probs.dtype() == torch::kFloat32);
+              EP_HOST_ASSERT(logical_to_physical_map.is_cuda() && logical_to_physical_map.dtype() == torch::kInt32);
+              EP_HOST_ASSERT(logical_replica_counts.is_cuda() && logical_replica_counts.dtype() == torch::kInt32);
+              EP_HOST_ASSERT(rank_quota_prefix.is_cuda() && rank_quota_prefix.dtype() == torch::kInt32);
+              EP_HOST_ASSERT(routing_map.dim() == 2 && probs.dim() == 2);
+              EP_HOST_ASSERT(routing_map.size(0) == probs.size(0) && routing_map.size(1) == probs.size(1));
+              EP_HOST_ASSERT(logical_to_physical_map.dim() == 2);
+              EP_HOST_ASSERT(logical_replica_counts.dim() == 1);
+              EP_HOST_ASSERT(rank_quota_prefix.dim() == 2);
+              const int T = routing_map.size(0);
+              const int L = routing_map.size(1);
+              const int max_replicas = logical_to_physical_map.size(1);
+              EP_HOST_ASSERT(logical_to_physical_map.size(0) == L);
+              EP_HOST_ASSERT(logical_replica_counts.size(0) == L);
+              EP_HOST_ASSERT(rank_quota_prefix.size(0) == L && rank_quota_prefix.size(1) == max_replicas);
+              auto routing_contig = routing_map.contiguous();
+              auto probs_contig = probs.contiguous();
+              auto l2p_contig = logical_to_physical_map.contiguous();
+              auto lcnts_contig = logical_replica_counts.contiguous();
+              auto rank_quota_contig = rank_quota_prefix.contiguous();
+              auto expanded_probs = torch::zeros(
+                  {T, num_global_physical_experts}, torch::TensorOptions().dtype(torch::kFloat32).device(probs.device()));
+              auto expanded_routing_map = torch::zeros({T, num_global_physical_experts},
+                                                       torch::TensorOptions().dtype(torch::kBool).device(probs.device()));
+              const int num_tiles = (T + kernels::kDenseRerouteTileTokens - 1) / kernels::kDenseRerouteTileTokens;
+              auto tile_counts = torch::empty({static_cast<int64_t>(L) * num_tiles},
+                                             torch::TensorOptions().dtype(torch::kInt32).device(probs.device()));
+              auto stream = at::cuda::getCurrentCUDAStream();
+              if (quota_reroute) {
+                  kernels::run_dense_reroute_forward_quota(routing_contig.data_ptr<bool>(),
+                                                           probs_contig.data_ptr<float>(),
+                                                           l2p_contig.data_ptr<int32_t>(),
+                                                           lcnts_contig.data_ptr<int32_t>(),
+                                                           rank_quota_contig.data_ptr<int32_t>(),
+                                                           expanded_routing_map.data_ptr<bool>(),
+                                                           expanded_probs.data_ptr<float>(),
+                                                           tile_counts.data_ptr<int32_t>(),
+                                                           T,
+                                                           L,
+                                                           num_global_physical_experts,
+                                                           max_replicas,
+                                                           interleave_by_rank_quota,
+                                                           stream.stream());
+              } else {
+                  kernels::run_dense_reroute_forward_round_robin(routing_contig.data_ptr<bool>(),
+                                                                 probs_contig.data_ptr<float>(),
+                                                                 l2p_contig.data_ptr<int32_t>(),
+                                                                 lcnts_contig.data_ptr<int32_t>(),
+                                                                 expanded_routing_map.data_ptr<bool>(),
+                                                                 expanded_probs.data_ptr<float>(),
+                                                                 tile_counts.data_ptr<int32_t>(),
+                                                                 T,
+                                                                 L,
+                                                                 num_global_physical_experts,
+                                                                 max_replicas,
+                                                                 stream.stream());
+              }
+              return std::make_tuple(expanded_probs, expanded_routing_map);
+          },
+          pybind11::arg("routing_map"),
+          pybind11::arg("probs"),
+          pybind11::arg("logical_to_physical_map"),
+          pybind11::arg("logical_replica_counts"),
+          pybind11::arg("rank_quota_prefix"),
+          pybind11::arg("num_global_physical_experts"),
+          pybind11::arg("quota_reroute") = true,
+          pybind11::arg("interleave_by_rank_quota") = true);
 }
 
 }  // namespace ultra_ep

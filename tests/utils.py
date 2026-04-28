@@ -11,6 +11,35 @@ import numpy as np
 import random
 
 
+SECTION_WIDTH = 96
+
+
+def emit_line(msg: str = "", print_fn=None):
+    if print_fn is None:
+        print(msg, flush=True)
+    else:
+        print_fn(msg)
+
+
+def print_section(title: str, sep: str = "=", print_fn=None):
+    emit_line("", print_fn)
+    emit_line(sep * SECTION_WIDTH, print_fn)
+    emit_line(title, print_fn)
+    emit_line(sep * SECTION_WIDTH, print_fn)
+
+
+def print_metric(name: str, e2e_ms: float, kernel_ms: float, extra: str = "", print_fn=None):
+    suffix = f" | {extra}" if extra else ""
+    emit_line(f"  {name:<28} e2e {e2e_ms:>9.3f} ms | kernel {kernel_ms:>9.3f} ms{suffix}", print_fn)
+
+
+def format_load_imbalance(summary: dict) -> str:
+    return (
+        f"(Constructed: rank max/mean = {summary['rank']:.3f} | "
+        f"expert max/mean = {summary['expert']:.3f})"
+    )
+
+
 class suppress_stdout_stderr:
 
     def __enter__(self):
@@ -184,41 +213,28 @@ def bench_kineto(
                 torch.cuda.synchronize()
                 profiler.step()
 
-    # Parse the profiling table
-    prof_lines = (
-        profiler.key_averages()
-        .table(sort_by="cuda_time_total", max_name_column_width=100)
-        .split("\n")
-    )
     kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
-    for name in kernel_names:
-        assert (
-            sum([name in line for line in prof_lines]) <= 1
-        ), f"Errors of the kernel {name} in the profiling table: {prof_lines}"
 
     # Save chrome traces
     if trace_path is not None:
         profiler.export_chrome_trace(trace_path)
 
-    # Return average kernel durations
-    units = {"ms": 1e3, "us": 1e6}
+    # Return per-call total kernel durations. A logical operation may launch the
+    # same kernel multiple times (e.g. relay weight sync stage 1 + stage 2), so
+    # divide by fn invocations rather than by kernel launch count.
     kernel_durations = []
+    events = profiler.key_averages()
     for name in kernel_names:
-        total_time = 0
-        total_num = 0
-        for line in prof_lines:
-            if name in line:
-                time_str = line.split()[-2]
-                num_str = line.split()[-1]
-                for unit, scale in units.items():
-                    if unit in time_str:
-                        total_time += (
-                            float(time_str.replace(unit, "")) / scale * int(num_str)
-                        )
-                        total_num += int(num_str)
-                        break
-        kernel_durations.append(total_time / total_num if total_num > 0 else 0)
+        total_time_us = 0.0
+        for event in events:
+            if name not in str(event.key):
+                continue
+            device_time_us = getattr(
+                event, "cuda_time_total", getattr(event, "device_time_total", 0.0)
+            )
+            total_time_us += float(device_time_us)
+        kernel_durations.append(total_time_us / 1e6 / max(num_tests, 1))
 
     # Expand the kernels by periods
     if num_kernels_per_period > 1:
@@ -291,25 +307,70 @@ def rank_token_count(rank: int, max_tokens: int, variable: bool, seed: int) -> i
     if not variable:
         return max_tokens
     rng = random.Random(seed + 7919 * rank)
-    bucket = rng.random()
-    if bucket < 0.15:
-        return 0
-    if bucket < 0.30:
-        return max_tokens
-    return rng.randint(1, max_tokens - 1) if max_tokens > 1 else max_tokens
+    sample = rng.gauss(0.5, 0.35)
+    return max(0, min(max_tokens, int(round(sample * max_tokens))))
+
+
+def topk_inclusion_probs_approx(weights: torch.Tensor, topk: int) -> torch.Tensor:
+    """Approximate weighted top-k inclusion probabilities without replacement."""
+    if topk <= 0:
+        return torch.zeros_like(weights)
+    if topk >= weights.numel():
+        return torch.ones_like(weights)
+
+    weights = weights.to(torch.float64)
+    lo, hi = 0.0, 1.0
+    while float((1.0 - torch.exp(-hi * weights)).sum().item()) < topk:
+        hi *= 2.0
+    for _ in range(48):
+        mid = (lo + hi) * 0.5
+        expected = float((1.0 - torch.exp(-mid * weights)).sum().item())
+        if expected < topk:
+            lo = mid
+        else:
+            hi = mid
+    return 1.0 - torch.exp(-hi * weights)
+
+
+def expert_weights_for_rank_alpha(
+    num_experts: int,
+    num_ranks: int,
+    num_local_master: int,
+    rank_alpha: float,
+    local_expert_alpha: float,
+) -> torch.Tensor:
+    rank_ids = torch.arange(1, num_ranks + 1, dtype=torch.float64)
+    rank_weights = 1.0 / rank_ids.pow(rank_alpha)
+    local_ids = torch.arange(1, num_local_master + 1, dtype=torch.float64)
+    local_weights = 1.0 / local_ids.pow(local_expert_alpha)
+    weights = (rank_weights.unsqueeze(1) * local_weights.unsqueeze(0)).reshape(num_experts)
+    return (weights / weights.sum()).to(torch.float32)
 
 
 def zipf_alpha_for_rank_ratio(
-    num_experts: int, num_ranks: int, num_local_master: int, target_ratio: float
+    num_experts: int, num_ranks: int, num_local_master: int, topk: int, target_ratio: float
 ) -> float:
-    if target_ratio <= 1.0:
+    if target_ratio < 1.0:
+        raise ValueError("imbalance_ratio must be >= 1")
+    if target_ratio == 1.0:
         return 0.0
 
+    local_expert_alpha = 4.0 if num_local_master > 1 else 0.0
+
     def ratio_for_alpha(alpha: float) -> float:
-        ranks = torch.arange(1, num_experts + 1, dtype=torch.float64)
-        weights = 1.0 / ranks.pow(alpha)
-        rank_weights = weights.view(num_ranks, num_local_master).sum(dim=1)
-        return (rank_weights.max() / rank_weights.mean()).item()
+        weights = expert_weights_for_rank_alpha(
+            num_experts,
+            num_ranks,
+            num_local_master,
+            alpha,
+            local_expert_alpha,
+        )
+        # The real routing uses top-k without replacement, so raw probability
+        # mass overstates hot-expert load once inclusion probabilities saturate.
+        rank_loads = topk_inclusion_probs_approx(weights, topk=topk).view(
+            num_ranks, num_local_master
+        ).sum(dim=1)
+        return (rank_loads.max() / rank_loads.mean()).item()
 
     lo, hi = 0.0, 8.0
     for _ in range(32):
@@ -322,16 +383,19 @@ def zipf_alpha_for_rank_ratio(
 
 
 def zipf_weights_for_ratio(
-    num_experts: int, num_ranks: int, num_local_master: int, imbalance_ratio: float
+    num_experts: int, num_ranks: int, num_local_master: int, topk: int, imbalance_ratio: float
 ) -> torch.Tensor:
-    if imbalance_ratio <= 0:
+    if imbalance_ratio < 1.0:
+        raise ValueError("imbalance_ratio must be >= 1")
+    if imbalance_ratio == 1.0:
         return torch.ones(num_experts, dtype=torch.float32) / num_experts
     alpha = zipf_alpha_for_rank_ratio(
-        num_experts, num_ranks, num_local_master, imbalance_ratio
+        num_experts, num_ranks, num_local_master, topk, imbalance_ratio
     )
-    ranks = torch.arange(1, num_experts + 1, dtype=torch.float32)
-    weights = 1.0 / ranks.pow(alpha)
-    return weights / weights.sum()
+    local_expert_alpha = 4.0 if num_local_master > 1 else 0.0
+    return expert_weights_for_rank_alpha(
+        num_experts, num_ranks, num_local_master, alpha, local_expert_alpha
+    )
 
 
 def generate_topk_ids_zipf(
@@ -347,13 +411,15 @@ def generate_topk_ids_zipf(
 ) -> torch.Tensor:
     if num_tokens == 0:
         return torch.empty((0, topk), dtype=torch.int64, device=device)
-    if imbalance_ratio <= 0:
+    if imbalance_ratio < 1.0:
+        raise ValueError("imbalance_ratio must be >= 1")
+    if imbalance_ratio == 1.0:
         token_ids = torch.arange(num_tokens, device=device).unsqueeze(1)
         offsets = torch.arange(topk, device=device).unsqueeze(0)
         return ((token_ids * topk + offsets + rank * topk) % num_experts).to(torch.int64)
 
     weights = zipf_weights_for_ratio(
-        num_experts, num_ranks, num_local_master, imbalance_ratio
+        num_experts, num_ranks, num_local_master, topk, imbalance_ratio
     )
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed + rank * 104729)
@@ -407,14 +473,14 @@ def generate_loads_per_rank_zipf(
     num_local_master: int,
     topk: int,
     tokens_per_rank: int,
-    variable_num_tokens: bool,
+    variable_input_tokens: bool,
     imbalance_ratio: float,
     seed: int,
     device: str = "cuda",
 ) -> torch.Tensor:
     rows = []
     for rank in range(num_ranks):
-        ntokens = rank_token_count(rank, tokens_per_rank, variable_num_tokens, seed)
+        ntokens = rank_token_count(rank, tokens_per_rank, variable_input_tokens, seed)
         topk_ids = generate_topk_ids_zipf(
             ntokens,
             num_experts,
@@ -428,6 +494,19 @@ def generate_loads_per_rank_zipf(
         )
         rows.append(torch.bincount(topk_ids.flatten(), minlength=num_experts).to(torch.int32))
     return torch.stack(rows, dim=0)
+
+
+def load_imbalance_summary(loads_per_rank: torch.Tensor, num_ranks: int, num_local_master: int):
+    expert_loads = loads_per_rank.sum(dim=0, dtype=torch.int32)
+    return expert_load_imbalance_summary(expert_loads, num_ranks, num_local_master)
+
+
+def expert_load_imbalance_summary(expert_loads: torch.Tensor, num_ranks: int, num_local_master: int):
+    rank_loads = expert_loads.view(num_ranks, num_local_master).sum(dim=1)
+    return {
+        "rank": max_mean(rank_loads).item(),
+        "expert": max_mean(expert_loads).item(),
+    }
 
 
 def max_mean(t: torch.Tensor) -> torch.Tensor:
