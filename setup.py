@@ -55,11 +55,17 @@ if __name__ == "__main__":
     nvshmem_dir = os.getenv("NVSHMEM_DIR", None)
     nvshmem_host_lib = "libnvshmem_host.so"
     if nvshmem_dir is None:
-        nvshmem_dir = importlib.util.find_spec(
-            "nvidia.nvshmem"
-        ).submodule_search_locations[0]
+        spec = importlib.util.find_spec("nvidia.nvshmem")
+        if spec is None:
+            raise SystemExit(
+                "Unable to locate the nvidia.nvshmem package. "
+                "Install nvidia-nvshmem-cu12/13 or set NVSHMEM_DIR explicitly."
+            )
+        nvshmem_dir = spec.submodule_search_locations[0]
         nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
         import nvidia.nvshmem as nvshmem  # noqa: F401
+    elif not os.path.exists(Path(nvshmem_dir) / "lib" / nvshmem_host_lib):
+        nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
     assert os.path.exists(
         nvshmem_dir
     ), f"The specified NVSHMEM directory does not exist: {nvshmem_dir}"

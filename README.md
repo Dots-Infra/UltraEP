@@ -87,7 +87,7 @@ Install NVSHMEM:
 pip install nvidia-nvshmem-cu12
 
 # CUDA 13.x
-pip install nvidia-nvshmem-cu13==3.4.5
+pip install nvidia-nvshmem-cu13
 ```
 
 Build the extension:
