@@ -26,6 +26,21 @@ from utils import (
     rank_token_count,
 )
 
+HYBRIDEP_DISPATCH_KERNEL_NAMES = (
+    "scan",
+    "permute_preprocessing_kernel",
+    "update_expected_value_kernel",
+    "device_sync_kernel",
+    "dispatch_kernel",
+    "permute_kernel",
+)
+HYBRIDEP_COMBINE_KERNEL_NAMES = (
+    "update_expected_value_kernel",
+    "device_sync_kernel",
+    "combine_kernel",
+    "unpermute_kernel",
+)
+
 
 def print_rank0(msg: str):
     if dist.get_rank() == 0:
@@ -407,13 +422,22 @@ def run_hybridep_a2a(args, expanded_routing):
 
     dispatch_avg, _, _ = bench(dispatch_once, args.warmup_iters, args.bench_iters, use_barrier=True)
     combine_avg, _, _ = bench(combine_once, args.warmup_iters, args.bench_iters, use_barrier=True)
-    dispatch_kernel, combine_kernel = bench_kineto(
-        lambda: (dispatch_once(), combine_once()),
-        ("dispatch_kernel", "combine_kernel"),
+    dispatch_kernel_parts = bench_kineto(
+        dispatch_once,
+        HYBRIDEP_DISPATCH_KERNEL_NAMES,
         num_tests=max(3, min(args.bench_iters, 30)),
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
+    combine_kernel_parts = bench_kineto(
+        combine_once,
+        HYBRIDEP_COMBINE_KERNEL_NAMES,
+        num_tests=max(3, min(args.bench_iters, 30)),
+        barrier_comm_profiling=True,
+        suppress_kineto_output=True,
+    )
+    dispatch_kernel = sum(dispatch_kernel_parts)
+    combine_kernel = sum(combine_kernel_parts)
     print_metric("HybridEP dispatch", dispatch_avg * 1000, dispatch_kernel * 1000, print_fn=print_rank0)
     print_metric("HybridEP combine", combine_avg * 1000, combine_kernel * 1000, print_fn=print_rank0)
 

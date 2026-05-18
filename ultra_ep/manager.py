@@ -470,23 +470,46 @@ class Manager:
         assert layer_id < self.num_alloc_layers
 
         if self.log_expert_loads:
-            # Compute original logical expert loads before rerouting.
-            # global logical expert loads are already populated by the preceding
-            # update_placement_sparse call via nvshmem allreduce, so we reuse it
-            # directly instead of recomputing from topk_ids.
-            orig_log_expert_loads = (
-                self.runtime.get_global_logical_expert_loads_tensor().clone()
-            )
+            # Recompute from the current sparse routing ids. Decode reroute does
+            # not run update_placement_sparse, so the runtime load tensor may be
+            # stale from an earlier layer/prefill batch.
+            flat_log_ids = topk_ids.flatten()
+            valid_log_ids = flat_log_ids[
+                (flat_log_ids >= 0)
+                & (flat_log_ids < self.num_global_logical_experts)
+            ].to(torch.int64)
+            orig_log_expert_loads = torch.bincount(
+                valid_log_ids,
+                minlength=self.num_global_logical_experts,
+            ).to(torch.int32)
+            dist.all_reduce(orig_log_expert_loads, group=self.group)
             max_replica_cnt = self._logical_replica_counts[layer_id].max().item()
+            l2p = self._logical_to_physical_map[layer_id]
+            quota = self._logical_instance_quota[layer_id]
+            valid_placement = l2p >= 0
+            expected_phys_expert_loads = torch.zeros(
+                (self.num_global_physical_experts,),
+                dtype=torch.int32,
+                device=topk_ids.device,
+            )
+            expected_phys_expert_loads.scatter_add_(
+                0,
+                l2p.clamp_min(0).flatten(),
+                quota.masked_fill(~valid_placement, 0).flatten(),
+            )
 
         self.runtime.reroute_sparse(layer_id, topk_ids)
 
         if self.log_expert_loads:
             # After in-place reroute, topk_ids now holds physical expert IDs.
             # Compute per-physical-expert token counts via bincount + all_reduce.
-            flat_phys_ids = topk_ids.flatten().to(torch.int64)
+            flat_phys_ids = topk_ids.flatten()
+            valid_phys_ids = flat_phys_ids[
+                (flat_phys_ids >= 0)
+                & (flat_phys_ids < self.num_global_physical_experts)
+            ].to(torch.int64)
             balanced_phys_expert_loads = torch.bincount(
-                flat_phys_ids, minlength=self.num_global_physical_experts
+                valid_phys_ids, minlength=self.num_global_physical_experts
             ).to(torch.int32)
             dist.all_reduce(balanced_phys_expert_loads, group=self.group)
 
@@ -497,7 +520,16 @@ class Manager:
                 balanced_phys_expert_loads_by_rank = balanced_phys_expert_loads.view(
                     self.num_ranks, self.num_local_physical_experts
                 ).sum(dim=1)
+                expected_phys_expert_loads_by_rank = expected_phys_expert_loads.view(
+                    self.num_ranks, self.num_local_physical_experts
+                ).sum(dim=1)
+                orig_total = int(orig_log_expert_loads.sum().item())
+                expected_total = int(expected_phys_expert_loads.sum().item())
+                balanced_total = int(balanced_phys_expert_loads.sum().item())
                 orig_imbalance = get_max_by_mean(orig_log_expert_loads_by_rank.float())
+                expected_imbalance = get_max_by_mean(
+                    expected_phys_expert_loads_by_rank.float()
+                )
                 balanced_imbalance = get_max_by_mean(
                     balanced_phys_expert_loads_by_rank.float()
                 )
@@ -505,6 +537,8 @@ class Manager:
                     f.write(
                         f"Layer {layer_id}: Imbalance (max/mean load per rank): {orig_imbalance:.2f} -> "
                         f"{balanced_imbalance:.2f} ({orig_imbalance / balanced_imbalance:.2f}x) | "
+                        f"expected {expected_imbalance:.2f} | "
+                        f"tokens {orig_total}/{expected_total}/{balanced_total} | "
                         f"max #replicas: {max_replica_cnt}\n"
                     )
 

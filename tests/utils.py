@@ -173,6 +173,19 @@ def bench_kineto(
     assert isinstance(kernel_names, (str, tuple))
     is_tuple = isinstance(kernel_names, tuple)
 
+    def max_reduce_duration(value):
+        if not dist.is_initialized():
+            return value
+        if isinstance(value, list):
+            if not value:
+                return value
+            tensor = torch.tensor(value, dtype=torch.float64, device="cuda")
+            dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+            return tensor.cpu().tolist()
+        tensor = torch.tensor([float(value)], dtype=torch.float64, device="cuda")
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+        return float(tensor.item())
+
     # Skip profiling
     # Conflict with Nsight Systems, Nsight Compute and Compute Sanitizer
     if int(os.environ.get("EP_USE_NVIDIA_TOOLS", 0)):
@@ -256,6 +269,10 @@ def bench_kineto(
                 sum(durations[j::num_kernels_per_period]) / num_kernel_patterns
                 for j in range(num_kernels_per_period)
             ]
+
+    # Communication tests are limited by the slowest rank. Report that rank's
+    # kernel duration rather than the local rank duration.
+    kernel_durations = [max_reduce_duration(duration) for duration in kernel_durations]
 
     # Return execution durations
     return kernel_durations if is_tuple else kernel_durations[0]
