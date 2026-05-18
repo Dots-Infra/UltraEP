@@ -87,7 +87,9 @@ class Manager:
         self.weight_sync_plan_mode = tuning.weight_sync_plan_mode
         self.weight_sync_relay_min_replicas = tuning.weight_sync_relay_min_replicas
         self.weight_sync_relay_max_relays = tuning.weight_sync_relay_max_relays
-        self.weight_sync_relay_min_fanout_gain = tuning.weight_sync_relay_min_fanout_gain
+        self.weight_sync_relay_min_fanout_gain = (
+            tuning.weight_sync_relay_min_fanout_gain
+        )
         self.reroute_mode = "round_robin" if legacy_placement else "quota"
         self.runtime = _C.Manager(
             self.num_alloc_layers,
@@ -333,7 +335,9 @@ class Manager:
         normalized = plan_mode.lower().replace("_", "")
         mode_ids = {"direct": 0, "adaptive": 1, "adaptiverelay": 1, "forcerelay": 2}
         if normalized not in mode_ids:
-            raise ValueError("plan_mode must be one of: direct, adaptive_relay, force_relay")
+            raise ValueError(
+                "plan_mode must be one of: direct, adaptive_relay, force_relay"
+            )
         self.weight_sync_plan_mode = normalized
         self.runtime.set_weight_sync_plan_mode(mode_ids[normalized])
 
@@ -408,7 +412,9 @@ class Manager:
             max_replica_cnt = self._logical_replica_counts[layer_id].max().item()
 
         if backend != "cuda":
-            raise ValueError("Only backend='cuda' is supported; CPU reroute has been removed")
+            raise ValueError(
+                "Only backend='cuda' is supported; CPU reroute has been removed"
+            )
 
         expanded_probs, expanded_routing_map = self._dense_reroute(
             layer_id, probs, routing_map
@@ -428,9 +434,7 @@ class Manager:
                     self.num_ranks, self.num_local_physical_experts
                 ).sum(dim=1)
                 orig_imbalance = get_max_by_mean(orig_log_expert_loads_by_rank)
-                balanced_imbalance = get_max_by_mean(
-                    balanced_phys_expert_loads_by_rank
-                )
+                balanced_imbalance = get_max_by_mean(balanced_phys_expert_loads_by_rank)
                 with open(self.ep_log_path, "a") as f:
                     f.write(
                         f"Layer {layer_id}: Imbalance (max/mean load per rank): {orig_imbalance:.2f} -> "
@@ -475,8 +479,7 @@ class Manager:
             # stale from an earlier layer/prefill batch.
             flat_log_ids = topk_ids.flatten()
             valid_log_ids = flat_log_ids[
-                (flat_log_ids >= 0)
-                & (flat_log_ids < self.num_global_logical_experts)
+                (flat_log_ids >= 0) & (flat_log_ids < self.num_global_logical_experts)
             ].to(torch.int64)
             orig_log_expert_loads = torch.bincount(
                 valid_log_ids,
@@ -545,10 +548,12 @@ class Manager:
     def check_tensors_blob_from_cpp(self):
         assert (
             self._physical_to_logical_map.device == torch.device("cuda", self.device)
-            and self._logical_to_physical_map.device == torch.device("cuda", self.device)
+            and self._logical_to_physical_map.device
+            == torch.device("cuda", self.device)
             and self._logical_replica_counts.device == torch.device("cuda", self.device)
             and self._logical_instance_quota.device == torch.device("cuda", self.device)
-            and self._logical_instance_quota_prefix.device == torch.device("cuda", self.device)
+            and self._logical_instance_quota_prefix.device
+            == torch.device("cuda", self.device)
         )
         assert (
             self._physical_to_logical_map.dtype == torch.int32

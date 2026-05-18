@@ -9,17 +9,16 @@ namespace ultra_ep::kernels {
 // Grad Reduce Task Build
 // ---------------------------------------------------------------------------
 
-__global__ __launch_bounds__(32) void build_grad_reduce_tasks_kernel(
-    const TaskBuildConfig* __restrict__ config,
-    const int32_t* __restrict__ p2l,
-    const int32_t* __restrict__ l2p,
-    const int32_t* __restrict__ lcnts,
-    void* const* __restrict__ remote_grad_ptrs,
-    const int64_t* __restrict__ local_master_fc1_ptrs,
-    const int64_t* __restrict__ local_master_fc2_ptrs,
-    GradReduceTask* __restrict__ tasks,
-    int* __restrict__ tile_offsets,
-    int* __restrict__ task_metadata) {
+__global__ __launch_bounds__(32) void build_grad_reduce_tasks_kernel(const TaskBuildConfig* __restrict__ config,
+                                                                     const int32_t* __restrict__ p2l,
+                                                                     const int32_t* __restrict__ l2p,
+                                                                     const int32_t* __restrict__ lcnts,
+                                                                     void* const* __restrict__ remote_grad_ptrs,
+                                                                     const int64_t* __restrict__ local_master_fc1_ptrs,
+                                                                     const int64_t* __restrict__ local_master_fc2_ptrs,
+                                                                     GradReduceTask* __restrict__ tasks,
+                                                                     int* __restrict__ tile_offsets,
+                                                                     int* __restrict__ task_metadata) {
     if (threadIdx.x != 0)
         return;
 
@@ -269,8 +268,8 @@ void run_grad_reduce(GradReduceTask* tasks,
                      int* global_tile_counter,
                      cudaStream_t stream,
                      int num_sms) {
-    const auto config = make_launch_config(
-        dim3(num_sms), dim3(kGradReduceThreadsPerBlock), stream, kGradReduceTileSizeBytes);
+    const auto config =
+        make_launch_config(dim3(num_sms), dim3(kGradReduceThreadsPerBlock), stream, kGradReduceTileSizeBytes);
     launch_kernel(grad_reduce_kernel, config, tasks, task_tile_offsets, task_metadata, global_tile_counter);
 }
 

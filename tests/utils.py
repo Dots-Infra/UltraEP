@@ -28,9 +28,14 @@ def print_section(title: str, sep: str = "=", print_fn=None):
     emit_line(sep * SECTION_WIDTH, print_fn)
 
 
-def print_metric(name: str, e2e_ms: float, kernel_ms: float, extra: str = "", print_fn=None):
+def print_metric(
+    name: str, e2e_ms: float, kernel_ms: float, extra: str = "", print_fn=None
+):
     suffix = f" | {extra}" if extra else ""
-    emit_line(f"  {name:<28} e2e {e2e_ms:>9.3f} ms | kernel {kernel_ms:>9.3f} ms{suffix}", print_fn)
+    emit_line(
+        f"  {name:<28} e2e {e2e_ms:>9.3f} ms | kernel {kernel_ms:>9.3f} ms{suffix}",
+        print_fn,
+    )
 
 
 def format_load_imbalance(summary: dict) -> str:
@@ -144,7 +149,9 @@ def bench_stats(
             post_fn()
     torch.cuda.synchronize()
 
-    times = np.array([s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)])
+    times = np.array(
+        [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
+    )
     if times.size > 1:
         times = times[1:]
     if times.size >= 3:
@@ -290,7 +297,9 @@ def bench_cuda_event_groups(
     if use_barrier and dist.is_initialized():
         dist.barrier()
 
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
         for _ in range(num_tests):
             fn()
         torch.cuda.synchronize()
@@ -315,8 +324,12 @@ def parse_csv_strings(value: str):
 
 
 def bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
-    return a.dtype == b.dtype and a.shape == b.shape and torch.equal(
-        a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+    return (
+        a.dtype == b.dtype
+        and a.shape == b.shape
+        and torch.equal(
+            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+        )
     )
 
 
@@ -360,12 +373,18 @@ def expert_weights_for_rank_alpha(
     rank_weights = 1.0 / rank_ids.pow(rank_alpha)
     local_ids = torch.arange(1, num_local_master + 1, dtype=torch.float64)
     local_weights = 1.0 / local_ids.pow(local_expert_alpha)
-    weights = (rank_weights.unsqueeze(1) * local_weights.unsqueeze(0)).reshape(num_experts)
+    weights = (rank_weights.unsqueeze(1) * local_weights.unsqueeze(0)).reshape(
+        num_experts
+    )
     return (weights / weights.sum()).to(torch.float32)
 
 
 def zipf_alpha_for_rank_ratio(
-    num_experts: int, num_ranks: int, num_local_master: int, topk: int, target_ratio: float
+    num_experts: int,
+    num_ranks: int,
+    num_local_master: int,
+    topk: int,
+    target_ratio: float,
 ) -> float:
     if target_ratio < 1.0:
         raise ValueError("imbalance_ratio must be >= 1")
@@ -384,9 +403,11 @@ def zipf_alpha_for_rank_ratio(
         )
         # The real routing uses top-k without replacement, so raw probability
         # mass overstates hot-expert load once inclusion probabilities saturate.
-        rank_loads = topk_inclusion_probs_approx(weights, topk=topk).view(
-            num_ranks, num_local_master
-        ).sum(dim=1)
+        rank_loads = (
+            topk_inclusion_probs_approx(weights, topk=topk)
+            .view(num_ranks, num_local_master)
+            .sum(dim=1)
+        )
         return (rank_loads.max() / rank_loads.mean()).item()
 
     lo, hi = 0.0, 8.0
@@ -400,7 +421,11 @@ def zipf_alpha_for_rank_ratio(
 
 
 def zipf_weights_for_ratio(
-    num_experts: int, num_ranks: int, num_local_master: int, topk: int, imbalance_ratio: float
+    num_experts: int,
+    num_ranks: int,
+    num_local_master: int,
+    topk: int,
+    imbalance_ratio: float,
 ) -> torch.Tensor:
     if imbalance_ratio < 1.0:
         raise ValueError("imbalance_ratio must be >= 1")
@@ -433,7 +458,9 @@ def generate_topk_ids_zipf(
     if imbalance_ratio == 1.0:
         token_ids = torch.arange(num_tokens, device=device).unsqueeze(1)
         offsets = torch.arange(topk, device=device).unsqueeze(0)
-        return ((token_ids * topk + offsets + rank * topk) % num_experts).to(torch.int64)
+        return ((token_ids * topk + offsets + rank * topk) % num_experts).to(
+            torch.int64
+        )
 
     weights = zipf_weights_for_ratio(
         num_experts, num_ranks, num_local_master, topk, imbalance_ratio
@@ -509,16 +536,22 @@ def generate_loads_per_rank_zipf(
             rank=rank,
             device=device,
         )
-        rows.append(torch.bincount(topk_ids.flatten(), minlength=num_experts).to(torch.int32))
+        rows.append(
+            torch.bincount(topk_ids.flatten(), minlength=num_experts).to(torch.int32)
+        )
     return torch.stack(rows, dim=0)
 
 
-def load_imbalance_summary(loads_per_rank: torch.Tensor, num_ranks: int, num_local_master: int):
+def load_imbalance_summary(
+    loads_per_rank: torch.Tensor, num_ranks: int, num_local_master: int
+):
     expert_loads = loads_per_rank.sum(dim=0, dtype=torch.int32)
     return expert_load_imbalance_summary(expert_loads, num_ranks, num_local_master)
 
 
-def expert_load_imbalance_summary(expert_loads: torch.Tensor, num_ranks: int, num_local_master: int):
+def expert_load_imbalance_summary(
+    expert_loads: torch.Tensor, num_ranks: int, num_local_master: int
+):
     rank_loads = expert_loads.view(num_ranks, num_local_master).sum(dim=1)
     return {
         "rank": max_mean(rank_loads).item(),

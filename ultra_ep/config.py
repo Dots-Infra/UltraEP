@@ -115,5 +115,7 @@ def load_tuning_from_env() -> UltraEPTuning:
             "ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_FANOUT_GAIN", 2
         ),
         log_expert_loads=_read_bool_env("ULTRA_EP_LOG_EXPERT_LOADS", False),
-        loads_save_dir=_read_str_env("ULTRA_EP_LOADS_SAVE_DIR", "/var/log/ultra_ep_loads"),
+        loads_save_dir=_read_str_env(
+            "ULTRA_EP_LOADS_SAVE_DIR", "/var/log/ultra_ep_loads"
+        ),
     )

@@ -103,8 +103,12 @@ def make_case_routing(args, actual_tokens: int):
 
 
 def make_probs(routing_map: torch.Tensor):
-    probs = torch.zeros(routing_map.shape, dtype=torch.float32, device=routing_map.device)
-    probs[routing_map] = torch.rand(int(routing_map.sum().item()), device=routing_map.device)
+    probs = torch.zeros(
+        routing_map.shape, dtype=torch.float32, device=routing_map.device
+    )
+    probs[routing_map] = torch.rand(
+        int(routing_map.sum().item()), device=routing_map.device
+    )
     return probs
 
 
@@ -137,7 +141,9 @@ def expected_replica_weights(manager, args, layer_id, fc1_weights, fc2_weights, 
     return expected
 
 
-def expected_master_grads(manager, args, layer_id, fc1_grads, fc2_grads, replica_before):
+def expected_master_grads(
+    manager, args, layer_id, fc1_grads, fc2_grads, replica_before
+):
     rank = dist.get_rank()
     num_local_physical = manager.num_local_physical_experts
     expected_fc1 = [g.clone() for g in fc1_grads]
@@ -164,7 +170,9 @@ def run_update_and_reroute(manager, args, layer_id, routing_map, probs):
         manager.update_placement(layer_id, routing_map, verify_reduced_loads=True)
 
     update()
-    update_avg, _, _ = bench(update, args.warmup_iters, args.bench_iters, use_barrier=True)
+    update_avg, _, _ = bench(
+        update, args.warmup_iters, args.bench_iters, use_barrier=True
+    )
     solve_kernel = bench_kineto(
         update,
         "quota_placement_solve_kernel",
@@ -175,19 +183,25 @@ def run_update_and_reroute(manager, args, layer_id, routing_map, probs):
 
     expanded_probs, expanded_routing = manager.reroute(layer_id, probs, routing_map)
     assert bool((expanded_routing.sum(dim=1) == args.topk).all().item())
-    rank_load_before = routing_map.sum(dim=0, dtype=torch.int32).view(
-        dist.get_world_size(), args.num_local_master
-    ).sum(dim=1)
-    rank_load_after = expanded_routing.sum(dim=0, dtype=torch.int32).view(
-        dist.get_world_size(), manager.num_local_physical_experts
-    ).sum(dim=1)
+    rank_load_before = (
+        routing_map.sum(dim=0, dtype=torch.int32)
+        .view(dist.get_world_size(), args.num_local_master)
+        .sum(dim=1)
+    )
+    rank_load_after = (
+        expanded_routing.sum(dim=0, dtype=torch.int32)
+        .view(dist.get_world_size(), manager.num_local_physical_experts)
+        .sum(dim=1)
+    )
     dist.all_reduce(rank_load_before)
     dist.all_reduce(rank_load_after)
 
     def reroute():
         manager.reroute(layer_id, probs, routing_map)
 
-    reroute_avg, _, _ = bench(reroute, args.warmup_iters, args.bench_iters, use_barrier=True)
+    reroute_avg, _, _ = bench(
+        reroute, args.warmup_iters, args.bench_iters, use_barrier=True
+    )
     reroute_kernel_parts = bench_kineto(
         reroute,
         ("reroute_forward_count_kernel", "dense_quota_reroute_scatter_kernel"),
@@ -235,17 +249,24 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
         for local_idx in range(args.num_local_master)
     ]
     dummy_grads = [
-        torch.empty(0, device="cuda", dtype=torch.float32) for _ in range(args.num_local_master)
+        torch.empty(0, device="cuda", dtype=torch.float32)
+        for _ in range(args.num_local_master)
     ]
-    manager.construct_local_master_ptr_pool(layer_id, fc1_weights, fc2_weights, dummy_grads, dummy_grads)
+    manager.construct_local_master_ptr_pool(
+        layer_id, fc1_weights, fc2_weights, dummy_grads, dummy_grads
+    )
     replica = manager.local_replica_weight_buffer
     replica.random_(0, 3)
-    expected = expected_replica_weights(manager, args, layer_id, fc1_weights, fc2_weights, replica.clone())
+    expected = expected_replica_weights(
+        manager, args, layer_id, fc1_weights, fc2_weights, replica.clone()
+    )
     dist.barrier()
     manager.weight_sync(layer_id, async_finish=False)
     torch.cuda.synchronize()
     dist.barrier()
-    assert bitwise_equal(replica, expected), f"weight_sync bitwise mismatch on rank {dist.get_rank()}"
+    assert bitwise_equal(
+        replica, expected
+    ), f"weight_sync bitwise mismatch on rank {dist.get_rank()}"
 
     def sync_once():
         manager.weight_sync(layer_id, async_finish=False)
@@ -267,15 +288,23 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
-    print_metric(f"weight_sync/{plan_mode}", avg * 1000, kernel * 1000, "bitwise PASS", print_fn=print_rank0)
+    print_metric(
+        f"weight_sync/{plan_mode}",
+        avg * 1000,
+        kernel * 1000,
+        "bitwise PASS",
+        print_fn=print_rank0,
+    )
 
 
 def run_grad_reduce(manager, args, layer_id):
     fc1_weights = [
-        torch.empty(0, device="cuda", dtype=torch.bfloat16) for _ in range(args.num_local_master)
+        torch.empty(0, device="cuda", dtype=torch.bfloat16)
+        for _ in range(args.num_local_master)
     ]
     fc2_weights = [
-        torch.empty(0, device="cuda", dtype=torch.bfloat16) for _ in range(args.num_local_master)
+        torch.empty(0, device="cuda", dtype=torch.bfloat16)
+        for _ in range(args.num_local_master)
     ]
     fc1_grads = [
         deterministic_tensor(
@@ -295,10 +324,14 @@ def run_grad_reduce(manager, args, layer_id):
         )
         for local_idx in range(args.num_local_master)
     ]
-    manager.construct_local_master_ptr_pool(layer_id, fc1_weights, fc2_weights, fc1_grads, fc2_grads)
+    manager.construct_local_master_ptr_pool(
+        layer_id, fc1_weights, fc2_weights, fc1_grads, fc2_grads
+    )
     replica = manager.local_replica_grad_buffer
     replica_ref = torch.empty_like(replica)
-    replica_base = dist.get_rank() * manager.num_local_physical_experts + args.num_local_master
+    replica_base = (
+        dist.get_rank() * manager.num_local_physical_experts + args.num_local_master
+    )
     for local_replica_idx in range(args.num_redundant_experts_per_rank):
         phys = replica_base + local_replica_idx
         replica_ref[local_replica_idx, : args.expert_fc1_numel] = deterministic_tensor(
@@ -325,13 +358,19 @@ def run_grad_reduce(manager, args, layer_id):
         + args.num_local_master
         + torch.arange(args.num_redundant_experts_per_rank, device=placement_device)
     )
-    valid_local_replicas = manager.physical_to_logical_map[layer_id, local_replica_phys] >= 0
+    valid_local_replicas = (
+        manager.physical_to_logical_map[layer_id, local_replica_phys] >= 0
+    )
     correct = True
     if bool(valid_local_replicas.any().item()):
         correct = bool((replica[valid_local_replicas] == 0).all().item())
     for idx in range(args.num_local_master):
-        correct = correct and torch.allclose(fc1_grads[idx], expected_fc1[idx], atol=1e-5, rtol=1e-5)
-        correct = correct and torch.allclose(fc2_grads[idx], expected_fc2[idx], atol=1e-5, rtol=1e-5)
+        correct = correct and torch.allclose(
+            fc1_grads[idx], expected_fc1[idx], atol=1e-5, rtol=1e-5
+        )
+        correct = correct and torch.allclose(
+            fc2_grads[idx], expected_fc2[idx], atol=1e-5, rtol=1e-5
+        )
 
     def reset_grad_state():
         for idx in range(args.num_local_master):
@@ -357,7 +396,13 @@ def run_grad_reduce(manager, args, layer_id):
         suppress_kineto_output=True,
     )
     status = "PASS" if correct else "MISMATCH"
-    print_metric("grad_reduce", avg * 1000, kernel * 1000, f"correctness {status}", print_fn=print_rank0)
+    print_metric(
+        "grad_reduce",
+        avg * 1000,
+        kernel * 1000,
+        f"correctness {status}",
+        print_fn=print_rank0,
+    )
 
 
 def run_hybridep_a2a(args, expanded_routing):
@@ -372,12 +417,16 @@ def run_hybridep_a2a(args, expanded_routing):
     num_local_physical = args.num_local_master + args.num_redundant_experts_per_rank
     routing = expanded_routing
     if routing.size(0) < max_tokens:
-        padded = torch.zeros(max_tokens, routing.size(1), dtype=torch.bool, device="cuda")
+        padded = torch.zeros(
+            max_tokens, routing.size(1), dtype=torch.bool, device="cuda"
+        )
         padded[: routing.size(0)] = routing
         padded[routing.size(0) :, rank * num_local_physical] = True
         routing = padded
     probs = routing.float()
-    hidden = torch.randn(max_tokens, args.hidden_size, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.randn(
+        max_tokens, args.hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
     if expanded_routing.size(0) < max_tokens:
         hidden[expanded_routing.size(0) :] = 0
 
@@ -390,8 +439,14 @@ def run_hybridep_a2a(args, expanded_routing):
         num_sms_dispatch_api=args.hybridep_num_sms,
         num_sms_combine_api=args.hybridep_num_sms,
     )
-    dispatched, dispatched_probs, _, tokens_per_expert, handle = buffer.dispatch_with_permute(
-        hidden=hidden, routing_map=routing, probs=probs, scaling_factor=None, pad_multiple=args.pad_multiple
+    dispatched, dispatched_probs, _, tokens_per_expert, handle = (
+        buffer.dispatch_with_permute(
+            hidden=hidden,
+            routing_map=routing,
+            probs=probs,
+            scaling_factor=None,
+            pad_multiple=args.pad_multiple,
+        )
     )
     num_permuted = int(tokens_per_expert.sum().item())
     combined, _ = buffer.combine_with_unpermute(
@@ -420,8 +475,12 @@ def run_hybridep_a2a(args, expanded_routing):
             pad_multiple=args.pad_multiple,
         )
 
-    dispatch_avg, _, _ = bench(dispatch_once, args.warmup_iters, args.bench_iters, use_barrier=True)
-    combine_avg, _, _ = bench(combine_once, args.warmup_iters, args.bench_iters, use_barrier=True)
+    dispatch_avg, _, _ = bench(
+        dispatch_once, args.warmup_iters, args.bench_iters, use_barrier=True
+    )
+    combine_avg, _, _ = bench(
+        combine_once, args.warmup_iters, args.bench_iters, use_barrier=True
+    )
     dispatch_kernel_parts = bench_kineto(
         dispatch_once,
         HYBRIDEP_DISPATCH_KERNEL_NAMES,
@@ -438,8 +497,18 @@ def run_hybridep_a2a(args, expanded_routing):
     )
     dispatch_kernel = sum(dispatch_kernel_parts)
     combine_kernel = sum(combine_kernel_parts)
-    print_metric("HybridEP dispatch", dispatch_avg * 1000, dispatch_kernel * 1000, print_fn=print_rank0)
-    print_metric("HybridEP combine", combine_avg * 1000, combine_kernel * 1000, print_fn=print_rank0)
+    print_metric(
+        "HybridEP dispatch",
+        dispatch_avg * 1000,
+        dispatch_kernel * 1000,
+        print_fn=print_rank0,
+    )
+    print_metric(
+        "HybridEP combine",
+        combine_avg * 1000,
+        combine_kernel * 1000,
+        print_fn=print_rank0,
+    )
 
 
 def run_case(manager, args, ratio: float):
@@ -471,7 +540,9 @@ def run_case(manager, args, ratio: float):
         print_fn=print_rank0,
     )
 
-    _, expanded_routing = run_update_and_reroute(manager, args, layer_id, routing_map, probs)
+    _, expanded_routing = run_update_and_reroute(
+        manager, args, layer_id, routing_map, probs
+    )
     for plan_mode in args.weight_sync_plan_modes:
         run_weight_sync(manager, args, layer_id, plan_mode)
     run_grad_reduce(manager, args, layer_id)
@@ -485,7 +556,9 @@ def main():
     parser.add_argument("--num-redundant-experts-per-rank", type=int, default=2)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--tokens-per-rank", type=int, default=8192)
-    parser.add_argument("--variable-input-tokens", action="store_true", dest="variable_input_tokens")
+    parser.add_argument(
+        "--variable-input-tokens", action="store_true", dest="variable_input_tokens"
+    )
     parser.add_argument(
         "--imbalance-ratios",
         type=float,

@@ -47,8 +47,12 @@ inline void launch_kernel_impl(Kernel kernel,
                                Tuple& stored_args,
                                std::index_sequence<Indices...>) {
     void* raw_args[] = {static_cast<void*>(&std::get<Indices>(stored_args))...};
-    CUDA_RUNTIME_CHECK(cudaLaunchKernel(
-        reinterpret_cast<const void*>(kernel), config.grid, config.block, raw_args, config.shared_memory_bytes, config.stream));
+    CUDA_RUNTIME_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel),
+                                        config.grid,
+                                        config.block,
+                                        raw_args,
+                                        config.shared_memory_bytes,
+                                        config.stream));
 }
 
 template <typename Kernel, typename... Args>
@@ -56,8 +60,12 @@ inline void launch_kernel(Kernel kernel, const LaunchConfig& config, Args&&... a
     maybe_set_dynamic_shared_memory(kernel, config.shared_memory_bytes);
 
     if constexpr (sizeof...(Args) == 0) {
-        CUDA_RUNTIME_CHECK(cudaLaunchKernel(
-            reinterpret_cast<const void*>(kernel), config.grid, config.block, nullptr, config.shared_memory_bytes, config.stream));
+        CUDA_RUNTIME_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel),
+                                            config.grid,
+                                            config.block,
+                                            nullptr,
+                                            config.shared_memory_bytes,
+                                            config.stream));
     } else {
         auto stored_args = std::tuple<std::decay_t<Args>...>(std::forward<Args>(args)...);
         launch_kernel_impl(kernel, config, stored_args, std::index_sequence_for<Args...>{});

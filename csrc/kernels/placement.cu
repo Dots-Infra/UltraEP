@@ -4,10 +4,10 @@
 #include <cmath>
 #include <cstdint>
 
-#include "launch.cuh"
-#include "api.cuh"
-#include "ptx.cuh"
 #include "../utils/exception.cuh"
+#include "api.cuh"
+#include "launch.cuh"
+#include "ptx.cuh"
 
 // Forward declarations avoid pulling NVSHMEM device headers into this TU.
 namespace ultra_ep::runtime {
@@ -1139,7 +1139,6 @@ __device__ __noinline__ void build_rank_quota_prefix_slow(int expert_local,
     }
 }
 
-
 __global__ __launch_bounds__(QUOTA_SOLVER_THREADS) void quota_placement_solve_kernel(
     const int32_t* __restrict__ expert_loads,
     const int32_t* __restrict__ expert_loads_per_rank,
@@ -1661,8 +1660,8 @@ __global__ __launch_bounds__(QUOTA_SOLVER_THREADS) void quota_placement_solve_ke
             const int slot = smem_expert_slot[expert_local]++;
             const int target_local = entry.target_rank_local;
             const int phys_base = enable_v4a
-                                      ? smem_rank_phys_base[target_local]
-                                      : ((domain_start_rank + target_local) * num_local_physical + num_local_master);
+                ? smem_rank_phys_base[target_local]
+                : ((domain_start_rank + target_local) * num_local_physical + num_local_master);
             const int phys_idx = phys_base + smem_next_slot[target_local]++;
             p2l_map[phys_idx] = l_global;
             l2p_map[row_offset + slot] = phys_idx;
@@ -1872,28 +1871,28 @@ void init_master_placement(int32_t* physical_to_logical_map,
     const int num_local_physical_experts = num_local_master_experts + num_local_redundant_experts;
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(
         physical_to_logical_map, 0xFF, static_cast<size_t>(num_global_physical_experts) * sizeof(int32_t), stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_to_physical_map,
-                                       0xFF,
-                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
-                                           sizeof(int32_t),
-                                       stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemsetAsync(logical_to_physical_map,
+                        0xFF,
+                        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
+                        stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(
         logical_replica_counts, 0, static_cast<size_t>(num_global_logical_experts) * sizeof(int32_t), stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_instance_quota,
-                                       0,
-                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
-                                           sizeof(int32_t),
-                                       stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_instance_quota_prefix,
-                                       0,
-                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
-                                           sizeof(int32_t),
-                                       stream));
-    CUDA_RUNTIME_CHECK(cudaMemsetAsync(rank_quota_prefix,
-                                       0,
-                                       static_cast<size_t>(num_global_logical_experts) * max_replicas_dim *
-                                           sizeof(int32_t),
-                                       stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemsetAsync(logical_instance_quota,
+                        0,
+                        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
+                        stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemsetAsync(logical_instance_quota_prefix,
+                        0,
+                        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
+                        stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemsetAsync(rank_quota_prefix,
+                        0,
+                        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
+                        stream));
 
     if (num_global_logical_experts > 0) {
         constexpr int BLOCK = 256;
@@ -1914,27 +1913,27 @@ void init_master_placement(int32_t* physical_to_logical_map,
 }
 
 void solve_placement(const int32_t* expert_loads,
-                   const int32_t* expert_loads_per_rank,
-                   int32_t* physical_to_logical_map,
-                   int32_t* logical_to_physical_map,
-                   int32_t* logical_replica_counts,
-                   int32_t* logical_instance_quota,
-                   int32_t* logical_instance_quota_prefix,
-                   int32_t* rank_quota_prefix,
-                   cudaStream_t stream,
-                   int num_global_logical_experts,
-                   int num_ranks,
-                   int num_local_master_experts,
-                   int num_local_redundant_experts,
-                   int num_nvl_ranks,
-                   int max_replicas_dim,
-                   float balance_threshold,
-                   int32_t min_tokens_per_replica,
-                   bool allow_zero_master_quota,
-                   bool locality_aware,
-                   float oracle_eps,
-                   int kernel_stage,
-                   int rank_quota_source_rank) {
+                     const int32_t* expert_loads_per_rank,
+                     int32_t* physical_to_logical_map,
+                     int32_t* logical_to_physical_map,
+                     int32_t* logical_replica_counts,
+                     int32_t* logical_instance_quota,
+                     int32_t* logical_instance_quota_prefix,
+                     int32_t* rank_quota_prefix,
+                     cudaStream_t stream,
+                     int num_global_logical_experts,
+                     int num_ranks,
+                     int num_local_master_experts,
+                     int num_local_redundant_experts,
+                     int num_nvl_ranks,
+                     int max_replicas_dim,
+                     float balance_threshold,
+                     int32_t min_tokens_per_replica,
+                     bool allow_zero_master_quota,
+                     bool locality_aware,
+                     float oracle_eps,
+                     int kernel_stage,
+                     int rank_quota_source_rank) {
     const int num_local_physical_experts = num_local_master_experts + num_local_redundant_experts;
     const int num_global_physical_experts = num_local_physical_experts * num_ranks;
     const int num_nvl_domains = num_ranks / num_nvl_ranks;
@@ -1954,20 +1953,20 @@ void solve_placement(const int32_t* expert_loads,
         return;
     }
 
-    CUDA_RUNTIME_CHECK(
-        cudaMemsetAsync(physical_to_logical_map, 0xFF, static_cast<size_t>(num_global_physical_experts) * sizeof(int32_t), stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(
-        logical_to_physical_map,
-        0xFF,
-        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
-        stream));
+        physical_to_logical_map, 0xFF, static_cast<size_t>(num_global_physical_experts) * sizeof(int32_t), stream));
     CUDA_RUNTIME_CHECK(
-        cudaMemsetAsync(logical_replica_counts, 0, static_cast<size_t>(num_global_logical_experts) * sizeof(int32_t), stream));
+        cudaMemsetAsync(logical_to_physical_map,
+                        0xFF,
+                        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
+                        stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(
-        logical_instance_quota,
-        0,
-        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
-        stream));
+        logical_replica_counts, 0, static_cast<size_t>(num_global_logical_experts) * sizeof(int32_t), stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemsetAsync(logical_instance_quota,
+                        0,
+                        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t),
+                        stream));
     CUDA_RUNTIME_CHECK(
         cudaMemsetAsync(logical_instance_quota_prefix,
                         0,
@@ -1982,8 +1981,8 @@ void solve_placement(const int32_t* expert_loads,
     const int stride_elems = ((num_logical_per_nvl + 3) / 4) * 4;
     const size_t domain_loads_bytes = static_cast<size_t>(num_nvl_ranks) * stride_elems * sizeof(int32_t);
     const size_t occ_offset = (domain_loads_bytes + 7u) & ~size_t(7);
-    const int my_rank =
-        rank_quota_source_rank >= 0 ? rank_quota_source_rank : (runtime::is_runtime_initialized ? runtime::rank_idx : 0);
+    const int my_rank = rank_quota_source_rank >= 0 ? rank_quota_source_rank
+                                                    : (runtime::is_runtime_initialized ? runtime::rank_idx : 0);
     const dim3 grid(num_nvl_domains);
 
     const size_t occ_bytes = 2 * static_cast<size_t>(QUOTA_SOLVER_WARPS) * num_logical_per_nvl * sizeof(uint64_t);

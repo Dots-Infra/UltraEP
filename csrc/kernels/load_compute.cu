@@ -5,9 +5,9 @@
 namespace ultra_ep::kernels {
 
 __global__ __launch_bounds__(1024) void rmap_local_sum_kernel(const bool* __restrict__ routing_map,
-                                                                   int32_t* __restrict__ expert_loads,
-                                                                   int T,
-                                                                   int L) {
+                                                              int32_t* __restrict__ expert_loads,
+                                                              int T,
+                                                              int L) {
     // index for global_logical_expert (dimension 1), in range [0, L-1]
     int tx = threadIdx.x;
     // row group index within current Block (dimension 0), in range [0, blockDim.y-1]
@@ -83,9 +83,9 @@ void rmap_local_sum(int T,
 static constexpr int HIST_BLOCK_SIZE = 256;
 
 __global__ __launch_bounds__(HIST_BLOCK_SIZE) void sparse_topk_histogram_kernel(const int64_t* __restrict__ topk_ids,
-                                                                                      int32_t* __restrict__ expert_loads,
-                                                                                      const int num_entries,
-                                                                                      const int num_experts) {
+                                                                                int32_t* __restrict__ expert_loads,
+                                                                                const int num_entries,
+                                                                                const int num_experts) {
     extern __shared__ int32_t smem_hist[];
 
     for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
@@ -128,11 +128,10 @@ void topk_local_sum(const int64_t* topk_ids_ptr,
     }
 }
 
-
 __global__ __launch_bounds__(256) void reduce_per_rank_loads_kernel(const int32_t* __restrict__ loads_per_rank,
-                                                                          int32_t* __restrict__ global_loads,
-                                                                          int G,
-                                                                          int L) {
+                                                                    int32_t* __restrict__ global_loads,
+                                                                    int G,
+                                                                    int L) {
     for (int l = blockIdx.x * blockDim.x + threadIdx.x; l < L; l += blockDim.x * gridDim.x) {
         int32_t total = 0;
         for (int r = 0; r < G; ++r) {
@@ -150,6 +149,5 @@ void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads,
     const auto config = make_launch_config(dim3(grid), dim3(BLOCK), stream);
     launch_kernel(reduce_per_rank_loads_kernel, config, loads_per_rank, global_loads, G, L);
 }
-
 
 }  // namespace ultra_ep::kernels

@@ -50,7 +50,6 @@ static __host__ __device__ __forceinline__ int choose_weight_sync_relay_count(co
     return relay_count;
 }
 
-
 static __host__ __device__ __forceinline__ int max_weight_sync_relay_chunks_per_shard(const TaskBuildConfig& config) {
     const size_t max_numel = static_cast<size_t>(
         config.expert_fc1_numel > config.expert_fc2_numel ? config.expert_fc1_numel : config.expert_fc2_numel);
@@ -729,10 +728,8 @@ void run_weight_sync(WeightSyncTask* tasks,
                      int cta_multiplier) {
     // Use conservative upper bound for grid size; persistent kernel handles over-launch
     const int num_ctas = clamp_num_ctas(num_device_sms * cta_multiplier, max_possible_tiles);
-    const auto config = make_launch_config(dim3(num_ctas),
-                                           dim3(kWeightSyncThreadsPerBlock),
-                                           stream,
-                                           kWeightSyncTileSizeBytes * kWeightSyncPipelineStages);
+    const auto config = make_launch_config(
+        dim3(num_ctas), dim3(kWeightSyncThreadsPerBlock), stream, kWeightSyncTileSizeBytes * kWeightSyncPipelineStages);
 
     launch_kernel(weight_sync_kernel,
                   config,

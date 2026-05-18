@@ -160,9 +160,9 @@ class Manager {
 
     // Device task-build support: config + remote pointer tables.
     kernels::TaskBuildConfig* _task_build_config = nullptr;
-    void** _remote_weight_ptrs = nullptr;         // [kMaxNvlDomainSize]
-    void** _remote_grad_ptrs = nullptr;           // [kMaxNvlDomainSize]
-    uint64_t** _remote_ready_flag_ptrs = nullptr; // [kMaxNvlDomainSize]
+    void** _remote_weight_ptrs = nullptr;          // [kMaxNvlDomainSize]
+    void** _remote_grad_ptrs = nullptr;            // [kMaxNvlDomainSize]
+    uint64_t** _remote_ready_flag_ptrs = nullptr;  // [kMaxNvlDomainSize]
     // Pre-computed upper bounds for device-path grid sizing
     int _max_ws_total_tiles = 0;
     int _max_gr_total_tasks = 0;
@@ -354,190 +354,192 @@ static void register_apis(pybind11::module_& m) {
         .def("get_rank_quota_prefix_tensor", &Manager::get_rank_quota_prefix_tensor)
         .def("get_global_logical_expert_loads_tensor", &Manager::get_global_logical_expert_loads_tensor);
 
-    m.def("solve_placement_for_test",
-          [](torch::Tensor expert_loads,
-             torch::Tensor expert_loads_per_rank,
-             int num_ranks,
-             int num_local_master_experts,
-             int num_local_redundant_experts,
-             int num_nvl_ranks,
-             bool legacy_placement,
-             float balance_threshold,
-             int32_t min_tokens_per_replica,
-             bool allow_zero_master_quota,
-             bool locality_aware,
-             float oracle_eps,
-             int kernel_stage,
-             int rank_quota_source_rank) {
-              EP_HOST_ASSERT(expert_loads.is_cuda() && expert_loads.dtype() == torch::kInt32);
-              EP_HOST_ASSERT(expert_loads.dim() == 1);
-              EP_HOST_ASSERT(num_ranks > 0 && num_nvl_ranks > 0 && num_ranks % num_nvl_ranks == 0);
-              EP_HOST_ASSERT(num_local_master_experts > 0 && num_local_redundant_experts >= 0);
-              const int num_global_logical_experts = expert_loads.size(0);
-              EP_HOST_ASSERT(num_global_logical_experts == num_ranks * num_local_master_experts);
-              const int num_local_physical_experts = num_local_master_experts + num_local_redundant_experts;
-              const int num_global_physical_experts = num_ranks * num_local_physical_experts;
-              auto opts = torch::TensorOptions().dtype(torch::kInt32).device(expert_loads.device());
-              auto physical_to_logical_map = torch::empty({num_global_physical_experts}, opts);
-              auto logical_to_physical_map = torch::empty({num_global_logical_experts, num_ranks}, opts);
-              auto logical_replica_counts = torch::empty({num_global_logical_experts}, opts);
-              auto logical_instance_quota = torch::empty({num_global_logical_experts, num_ranks}, opts);
-              auto logical_instance_quota_prefix = torch::empty({num_global_logical_experts, num_ranks}, opts);
-              auto rank_quota_prefix = torch::empty({num_global_logical_experts, num_ranks}, opts);
-              auto stream = at::cuda::getCurrentCUDAStream();
-              const int32_t* loads_per_rank_ptr = nullptr;
-              if (expert_loads_per_rank.defined()) {
-                  EP_HOST_ASSERT(expert_loads_per_rank.is_cuda() && expert_loads_per_rank.dtype() == torch::kInt32);
-                  EP_HOST_ASSERT(expert_loads_per_rank.dim() == 2 && expert_loads_per_rank.size(0) == num_ranks &&
-                                 expert_loads_per_rank.size(1) == num_global_logical_experts);
-                  loads_per_rank_ptr = expert_loads_per_rank.data_ptr<int32_t>();
-              }
-              if (legacy_placement) {
-                  kernels::legacy::solve_placement(expert_loads.data_ptr<int32_t>(),
-                                                   loads_per_rank_ptr,
-                                                   physical_to_logical_map.data_ptr<int32_t>(),
-                                                   logical_to_physical_map.data_ptr<int32_t>(),
-                                                   logical_replica_counts.data_ptr<int32_t>(),
-                                                   logical_instance_quota.data_ptr<int32_t>(),
-                                                   logical_instance_quota_prefix.data_ptr<int32_t>(),
-                                                   rank_quota_prefix.data_ptr<int32_t>(),
-                                                   stream.stream(),
-                                                   num_global_logical_experts,
-                                                   num_ranks,
-                                                   num_local_master_experts,
-                                                   num_local_redundant_experts,
-                                                   num_nvl_ranks,
-                                                   num_ranks,
-                                                   balance_threshold,
-                                                   min_tokens_per_replica,
-                                                   allow_zero_master_quota,
-                                                   locality_aware,
-                                                   oracle_eps,
-                                                   kernel_stage);
-              } else {
-                  EP_HOST_ASSERT(loads_per_rank_ptr != nullptr && "quota placement requires per-rank loads");
-                  kernels::solve_placement(expert_loads.data_ptr<int32_t>(),
-                                           loads_per_rank_ptr,
-                                           physical_to_logical_map.data_ptr<int32_t>(),
-                                           logical_to_physical_map.data_ptr<int32_t>(),
-                                           logical_replica_counts.data_ptr<int32_t>(),
-                                           logical_instance_quota.data_ptr<int32_t>(),
-                                           logical_instance_quota_prefix.data_ptr<int32_t>(),
-                                           rank_quota_prefix.data_ptr<int32_t>(),
-                                           stream.stream(),
-                                           num_global_logical_experts,
-                                           num_ranks,
-                                           num_local_master_experts,
-                                           num_local_redundant_experts,
-                                           num_nvl_ranks,
-                                           num_ranks,
-                                           balance_threshold,
-                                           min_tokens_per_replica,
-                                           allow_zero_master_quota,
-                                           locality_aware,
-                                           oracle_eps,
-                                           kernel_stage,
-                                           rank_quota_source_rank);
-              }
-              return std::make_tuple(physical_to_logical_map,
-                                     logical_to_physical_map,
-                                     logical_replica_counts,
-                                     logical_instance_quota,
-                                     logical_instance_quota_prefix,
-                                     rank_quota_prefix);
-          },
-          pybind11::arg("expert_loads"),
-          pybind11::arg("expert_loads_per_rank"),
-          pybind11::arg("num_ranks"),
-          pybind11::arg("num_local_master_experts"),
-          pybind11::arg("num_local_redundant_experts"),
-          pybind11::arg("num_nvl_ranks"),
-          pybind11::arg("legacy_placement") = false,
-          pybind11::arg("balance_threshold") = 1.0f,
-          pybind11::arg("min_tokens_per_replica") = 1,
-          pybind11::arg("allow_zero_master_quota") = true,
-          pybind11::arg("locality_aware") = true,
-          pybind11::arg("oracle_eps") = 0.01f,
-          pybind11::arg("kernel_stage") = 1,
-          pybind11::arg("rank_quota_source_rank") = -1);
+    m.def(
+        "solve_placement_for_test",
+        [](torch::Tensor expert_loads,
+           torch::Tensor expert_loads_per_rank,
+           int num_ranks,
+           int num_local_master_experts,
+           int num_local_redundant_experts,
+           int num_nvl_ranks,
+           bool legacy_placement,
+           float balance_threshold,
+           int32_t min_tokens_per_replica,
+           bool allow_zero_master_quota,
+           bool locality_aware,
+           float oracle_eps,
+           int kernel_stage,
+           int rank_quota_source_rank) {
+            EP_HOST_ASSERT(expert_loads.is_cuda() && expert_loads.dtype() == torch::kInt32);
+            EP_HOST_ASSERT(expert_loads.dim() == 1);
+            EP_HOST_ASSERT(num_ranks > 0 && num_nvl_ranks > 0 && num_ranks % num_nvl_ranks == 0);
+            EP_HOST_ASSERT(num_local_master_experts > 0 && num_local_redundant_experts >= 0);
+            const int num_global_logical_experts = expert_loads.size(0);
+            EP_HOST_ASSERT(num_global_logical_experts == num_ranks * num_local_master_experts);
+            const int num_local_physical_experts = num_local_master_experts + num_local_redundant_experts;
+            const int num_global_physical_experts = num_ranks * num_local_physical_experts;
+            auto opts = torch::TensorOptions().dtype(torch::kInt32).device(expert_loads.device());
+            auto physical_to_logical_map = torch::empty({num_global_physical_experts}, opts);
+            auto logical_to_physical_map = torch::empty({num_global_logical_experts, num_ranks}, opts);
+            auto logical_replica_counts = torch::empty({num_global_logical_experts}, opts);
+            auto logical_instance_quota = torch::empty({num_global_logical_experts, num_ranks}, opts);
+            auto logical_instance_quota_prefix = torch::empty({num_global_logical_experts, num_ranks}, opts);
+            auto rank_quota_prefix = torch::empty({num_global_logical_experts, num_ranks}, opts);
+            auto stream = at::cuda::getCurrentCUDAStream();
+            const int32_t* loads_per_rank_ptr = nullptr;
+            if (expert_loads_per_rank.defined()) {
+                EP_HOST_ASSERT(expert_loads_per_rank.is_cuda() && expert_loads_per_rank.dtype() == torch::kInt32);
+                EP_HOST_ASSERT(expert_loads_per_rank.dim() == 2 && expert_loads_per_rank.size(0) == num_ranks &&
+                               expert_loads_per_rank.size(1) == num_global_logical_experts);
+                loads_per_rank_ptr = expert_loads_per_rank.data_ptr<int32_t>();
+            }
+            if (legacy_placement) {
+                kernels::legacy::solve_placement(expert_loads.data_ptr<int32_t>(),
+                                                 loads_per_rank_ptr,
+                                                 physical_to_logical_map.data_ptr<int32_t>(),
+                                                 logical_to_physical_map.data_ptr<int32_t>(),
+                                                 logical_replica_counts.data_ptr<int32_t>(),
+                                                 logical_instance_quota.data_ptr<int32_t>(),
+                                                 logical_instance_quota_prefix.data_ptr<int32_t>(),
+                                                 rank_quota_prefix.data_ptr<int32_t>(),
+                                                 stream.stream(),
+                                                 num_global_logical_experts,
+                                                 num_ranks,
+                                                 num_local_master_experts,
+                                                 num_local_redundant_experts,
+                                                 num_nvl_ranks,
+                                                 num_ranks,
+                                                 balance_threshold,
+                                                 min_tokens_per_replica,
+                                                 allow_zero_master_quota,
+                                                 locality_aware,
+                                                 oracle_eps,
+                                                 kernel_stage);
+            } else {
+                EP_HOST_ASSERT(loads_per_rank_ptr != nullptr && "quota placement requires per-rank loads");
+                kernels::solve_placement(expert_loads.data_ptr<int32_t>(),
+                                         loads_per_rank_ptr,
+                                         physical_to_logical_map.data_ptr<int32_t>(),
+                                         logical_to_physical_map.data_ptr<int32_t>(),
+                                         logical_replica_counts.data_ptr<int32_t>(),
+                                         logical_instance_quota.data_ptr<int32_t>(),
+                                         logical_instance_quota_prefix.data_ptr<int32_t>(),
+                                         rank_quota_prefix.data_ptr<int32_t>(),
+                                         stream.stream(),
+                                         num_global_logical_experts,
+                                         num_ranks,
+                                         num_local_master_experts,
+                                         num_local_redundant_experts,
+                                         num_nvl_ranks,
+                                         num_ranks,
+                                         balance_threshold,
+                                         min_tokens_per_replica,
+                                         allow_zero_master_quota,
+                                         locality_aware,
+                                         oracle_eps,
+                                         kernel_stage,
+                                         rank_quota_source_rank);
+            }
+            return std::make_tuple(physical_to_logical_map,
+                                   logical_to_physical_map,
+                                   logical_replica_counts,
+                                   logical_instance_quota,
+                                   logical_instance_quota_prefix,
+                                   rank_quota_prefix);
+        },
+        pybind11::arg("expert_loads"),
+        pybind11::arg("expert_loads_per_rank"),
+        pybind11::arg("num_ranks"),
+        pybind11::arg("num_local_master_experts"),
+        pybind11::arg("num_local_redundant_experts"),
+        pybind11::arg("num_nvl_ranks"),
+        pybind11::arg("legacy_placement") = false,
+        pybind11::arg("balance_threshold") = 1.0f,
+        pybind11::arg("min_tokens_per_replica") = 1,
+        pybind11::arg("allow_zero_master_quota") = true,
+        pybind11::arg("locality_aware") = true,
+        pybind11::arg("oracle_eps") = 0.01f,
+        pybind11::arg("kernel_stage") = 1,
+        pybind11::arg("rank_quota_source_rank") = -1);
 
-    m.def("dense_reroute_for_test",
-          [](torch::Tensor routing_map,
-             torch::Tensor probs,
-             torch::Tensor logical_to_physical_map,
-             torch::Tensor logical_replica_counts,
-             torch::Tensor rank_quota_prefix,
-             int num_global_physical_experts,
-             bool quota_reroute,
-             bool interleave_by_rank_quota) {
-              EP_HOST_ASSERT(routing_map.is_cuda() && routing_map.dtype() == torch::kBool);
-              EP_HOST_ASSERT(probs.is_cuda() && probs.dtype() == torch::kFloat32);
-              EP_HOST_ASSERT(logical_to_physical_map.is_cuda() && logical_to_physical_map.dtype() == torch::kInt32);
-              EP_HOST_ASSERT(logical_replica_counts.is_cuda() && logical_replica_counts.dtype() == torch::kInt32);
-              EP_HOST_ASSERT(rank_quota_prefix.is_cuda() && rank_quota_prefix.dtype() == torch::kInt32);
-              EP_HOST_ASSERT(routing_map.dim() == 2 && probs.dim() == 2);
-              EP_HOST_ASSERT(routing_map.size(0) == probs.size(0) && routing_map.size(1) == probs.size(1));
-              EP_HOST_ASSERT(logical_to_physical_map.dim() == 2);
-              EP_HOST_ASSERT(logical_replica_counts.dim() == 1);
-              EP_HOST_ASSERT(rank_quota_prefix.dim() == 2);
-              const int T = routing_map.size(0);
-              const int L = routing_map.size(1);
-              const int max_replicas = logical_to_physical_map.size(1);
-              EP_HOST_ASSERT(logical_to_physical_map.size(0) == L);
-              EP_HOST_ASSERT(logical_replica_counts.size(0) == L);
-              EP_HOST_ASSERT(rank_quota_prefix.size(0) == L && rank_quota_prefix.size(1) == max_replicas);
-              auto routing_contig = routing_map.contiguous();
-              auto probs_contig = probs.contiguous();
-              auto l2p_contig = logical_to_physical_map.contiguous();
-              auto lcnts_contig = logical_replica_counts.contiguous();
-              auto rank_quota_contig = rank_quota_prefix.contiguous();
-              auto expanded_probs = torch::zeros(
-                  {T, num_global_physical_experts}, torch::TensorOptions().dtype(torch::kFloat32).device(probs.device()));
-              auto expanded_routing_map = torch::zeros({T, num_global_physical_experts},
-                                                       torch::TensorOptions().dtype(torch::kBool).device(probs.device()));
-              const int num_tiles = (T + kernels::kDenseRerouteTileTokens - 1) / kernels::kDenseRerouteTileTokens;
-              auto tile_counts = torch::empty({static_cast<int64_t>(L) * num_tiles},
-                                             torch::TensorOptions().dtype(torch::kInt32).device(probs.device()));
-              auto stream = at::cuda::getCurrentCUDAStream();
-              if (quota_reroute) {
-                  kernels::run_dense_reroute_forward_quota(routing_contig.data_ptr<bool>(),
-                                                           probs_contig.data_ptr<float>(),
-                                                           l2p_contig.data_ptr<int32_t>(),
-                                                           lcnts_contig.data_ptr<int32_t>(),
-                                                           rank_quota_contig.data_ptr<int32_t>(),
-                                                           expanded_routing_map.data_ptr<bool>(),
-                                                           expanded_probs.data_ptr<float>(),
-                                                           tile_counts.data_ptr<int32_t>(),
-                                                           T,
-                                                           L,
-                                                           num_global_physical_experts,
-                                                           max_replicas,
-                                                           interleave_by_rank_quota,
-                                                           stream.stream());
-              } else {
-                  kernels::run_dense_reroute_forward_round_robin(routing_contig.data_ptr<bool>(),
-                                                                 probs_contig.data_ptr<float>(),
-                                                                 l2p_contig.data_ptr<int32_t>(),
-                                                                 lcnts_contig.data_ptr<int32_t>(),
-                                                                 expanded_routing_map.data_ptr<bool>(),
-                                                                 expanded_probs.data_ptr<float>(),
-                                                                 tile_counts.data_ptr<int32_t>(),
-                                                                 T,
-                                                                 L,
-                                                                 num_global_physical_experts,
-                                                                 max_replicas,
-                                                                 stream.stream());
-              }
-              return std::make_tuple(expanded_probs, expanded_routing_map);
-          },
-          pybind11::arg("routing_map"),
-          pybind11::arg("probs"),
-          pybind11::arg("logical_to_physical_map"),
-          pybind11::arg("logical_replica_counts"),
-          pybind11::arg("rank_quota_prefix"),
-          pybind11::arg("num_global_physical_experts"),
-          pybind11::arg("quota_reroute") = true,
-          pybind11::arg("interleave_by_rank_quota") = true);
+    m.def(
+        "dense_reroute_for_test",
+        [](torch::Tensor routing_map,
+           torch::Tensor probs,
+           torch::Tensor logical_to_physical_map,
+           torch::Tensor logical_replica_counts,
+           torch::Tensor rank_quota_prefix,
+           int num_global_physical_experts,
+           bool quota_reroute,
+           bool interleave_by_rank_quota) {
+            EP_HOST_ASSERT(routing_map.is_cuda() && routing_map.dtype() == torch::kBool);
+            EP_HOST_ASSERT(probs.is_cuda() && probs.dtype() == torch::kFloat32);
+            EP_HOST_ASSERT(logical_to_physical_map.is_cuda() && logical_to_physical_map.dtype() == torch::kInt32);
+            EP_HOST_ASSERT(logical_replica_counts.is_cuda() && logical_replica_counts.dtype() == torch::kInt32);
+            EP_HOST_ASSERT(rank_quota_prefix.is_cuda() && rank_quota_prefix.dtype() == torch::kInt32);
+            EP_HOST_ASSERT(routing_map.dim() == 2 && probs.dim() == 2);
+            EP_HOST_ASSERT(routing_map.size(0) == probs.size(0) && routing_map.size(1) == probs.size(1));
+            EP_HOST_ASSERT(logical_to_physical_map.dim() == 2);
+            EP_HOST_ASSERT(logical_replica_counts.dim() == 1);
+            EP_HOST_ASSERT(rank_quota_prefix.dim() == 2);
+            const int T = routing_map.size(0);
+            const int L = routing_map.size(1);
+            const int max_replicas = logical_to_physical_map.size(1);
+            EP_HOST_ASSERT(logical_to_physical_map.size(0) == L);
+            EP_HOST_ASSERT(logical_replica_counts.size(0) == L);
+            EP_HOST_ASSERT(rank_quota_prefix.size(0) == L && rank_quota_prefix.size(1) == max_replicas);
+            auto routing_contig = routing_map.contiguous();
+            auto probs_contig = probs.contiguous();
+            auto l2p_contig = logical_to_physical_map.contiguous();
+            auto lcnts_contig = logical_replica_counts.contiguous();
+            auto rank_quota_contig = rank_quota_prefix.contiguous();
+            auto expanded_probs = torch::zeros({T, num_global_physical_experts},
+                                               torch::TensorOptions().dtype(torch::kFloat32).device(probs.device()));
+            auto expanded_routing_map = torch::zeros({T, num_global_physical_experts},
+                                                     torch::TensorOptions().dtype(torch::kBool).device(probs.device()));
+            const int num_tiles = (T + kernels::kDenseRerouteTileTokens - 1) / kernels::kDenseRerouteTileTokens;
+            auto tile_counts = torch::empty({static_cast<int64_t>(L) * num_tiles},
+                                            torch::TensorOptions().dtype(torch::kInt32).device(probs.device()));
+            auto stream = at::cuda::getCurrentCUDAStream();
+            if (quota_reroute) {
+                kernels::run_dense_reroute_forward_quota(routing_contig.data_ptr<bool>(),
+                                                         probs_contig.data_ptr<float>(),
+                                                         l2p_contig.data_ptr<int32_t>(),
+                                                         lcnts_contig.data_ptr<int32_t>(),
+                                                         rank_quota_contig.data_ptr<int32_t>(),
+                                                         expanded_routing_map.data_ptr<bool>(),
+                                                         expanded_probs.data_ptr<float>(),
+                                                         tile_counts.data_ptr<int32_t>(),
+                                                         T,
+                                                         L,
+                                                         num_global_physical_experts,
+                                                         max_replicas,
+                                                         interleave_by_rank_quota,
+                                                         stream.stream());
+            } else {
+                kernels::run_dense_reroute_forward_round_robin(routing_contig.data_ptr<bool>(),
+                                                               probs_contig.data_ptr<float>(),
+                                                               l2p_contig.data_ptr<int32_t>(),
+                                                               lcnts_contig.data_ptr<int32_t>(),
+                                                               expanded_routing_map.data_ptr<bool>(),
+                                                               expanded_probs.data_ptr<float>(),
+                                                               tile_counts.data_ptr<int32_t>(),
+                                                               T,
+                                                               L,
+                                                               num_global_physical_experts,
+                                                               max_replicas,
+                                                               stream.stream());
+            }
+            return std::make_tuple(expanded_probs, expanded_routing_map);
+        },
+        pybind11::arg("routing_map"),
+        pybind11::arg("probs"),
+        pybind11::arg("logical_to_physical_map"),
+        pybind11::arg("logical_replica_counts"),
+        pybind11::arg("rank_quota_prefix"),
+        pybind11::arg("num_global_physical_experts"),
+        pybind11::arg("quota_reroute") = true,
+        pybind11::arg("interleave_by_rank_quota") = true);
 }
 
 }  // namespace ultra_ep

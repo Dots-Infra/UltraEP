@@ -17,27 +17,27 @@ struct GradReduceTask {
 };
 
 void solve_placement(const int32_t* expert_loads,
-    const int32_t* expert_loads_per_rank,
-    int32_t* physical_to_logical_map,
-    int32_t* logical_to_physical_map,
-    int32_t* logical_replica_counts,
-    int32_t* logical_instance_quota,
-    int32_t* logical_instance_quota_prefix,
-    int32_t* rank_quota_prefix,
-    cudaStream_t stream,
-    int num_global_logical_experts,
-    int num_ranks,
-    int num_local_master_experts,
-    int num_local_redundant_experts,
-    int num_nvl_ranks,
-    int max_replicas_dim,
-    float balance_threshold = 1.0f,
-    int32_t min_tokens_per_replica = 1,
-    bool allow_zero_master_quota = true,
-    bool locality_aware = true,
-    float oracle_eps = 0.01f,
-    int kernel_stage = 1,
-    int rank_quota_source_rank = -1);
+                     const int32_t* expert_loads_per_rank,
+                     int32_t* physical_to_logical_map,
+                     int32_t* logical_to_physical_map,
+                     int32_t* logical_replica_counts,
+                     int32_t* logical_instance_quota,
+                     int32_t* logical_instance_quota_prefix,
+                     int32_t* rank_quota_prefix,
+                     cudaStream_t stream,
+                     int num_global_logical_experts,
+                     int num_ranks,
+                     int num_local_master_experts,
+                     int num_local_redundant_experts,
+                     int num_nvl_ranks,
+                     int max_replicas_dim,
+                     float balance_threshold = 1.0f,
+                     int32_t min_tokens_per_replica = 1,
+                     bool allow_zero_master_quota = true,
+                     bool locality_aware = true,
+                     float oracle_eps = 0.01f,
+                     int kernel_stage = 1,
+                     int rank_quota_source_rank = -1);
 
 void init_master_placement(int32_t* physical_to_logical_map,
                            int32_t* logical_to_physical_map,
@@ -56,26 +56,26 @@ void init_master_placement(int32_t* physical_to_logical_map,
 namespace legacy {
 
 void solve_placement(const int32_t* expert_loads,
-    const int32_t* expert_loads_per_rank,
-    int32_t* physical_to_logical_map,
-    int32_t* logical_to_physical_map,
-    int32_t* logical_replica_counts,
-    int32_t* logical_instance_quota,
-    int32_t* logical_instance_quota_prefix,
-    int32_t* rank_quota_prefix,
-    cudaStream_t stream,
-    int num_global_logical_experts,
-    int num_ranks,
-    int num_local_master_experts,
-    int num_local_redundant_experts,
-    int num_nvl_ranks,
-    int max_replicas_dim,
-    float balance_threshold = 1.0f,
-    int32_t min_tokens_per_replica = 1,
-    bool allow_zero_master_quota = true,
-    bool locality_aware = true,
-    float oracle_eps = 0.01f,
-    int kernel_stage = 1);
+                     const int32_t* expert_loads_per_rank,
+                     int32_t* physical_to_logical_map,
+                     int32_t* logical_to_physical_map,
+                     int32_t* logical_replica_counts,
+                     int32_t* logical_instance_quota,
+                     int32_t* logical_instance_quota_prefix,
+                     int32_t* rank_quota_prefix,
+                     cudaStream_t stream,
+                     int num_global_logical_experts,
+                     int num_ranks,
+                     int num_local_master_experts,
+                     int num_local_redundant_experts,
+                     int num_nvl_ranks,
+                     int max_replicas_dim,
+                     float balance_threshold = 1.0f,
+                     int32_t min_tokens_per_replica = 1,
+                     bool allow_zero_master_quota = true,
+                     bool locality_aware = true,
+                     float oracle_eps = 0.01f,
+                     int kernel_stage = 1);
 
 }  // namespace legacy
 
@@ -100,14 +100,14 @@ enum class WeightSyncPlanMode : int32_t {
 // A broadcast task from one master to multiple replicas
 // This structure enables loading SMEM once and TMA storing to multiple destinations
 struct WeightSyncTask {
-    __nv_bfloat16* master_local_addr;                              // Source: local master weight
-    __nv_bfloat16* replica_remote_addrs[kMaxNvlDomainSize - 1];    // Destinations: replica addresses
-    int num_replicas;                                              // Number of replicas (1 to kMaxNvlDomainSize-1)
-    size_t numel;                                                  // Number of elements
-    int wait_ready_slot;                                           // Local relay-ready flag slot, -1 if no wait
-    int num_ready_signals;                                         // Number of remote relay-ready flags to set
-    int ready_signal_slots[kMaxNvlDomainSize - 1];                 // Symmetric ready-flag slot per relay
-    int ready_signal_nvl_ranks[kMaxNvlDomainSize - 1];             // Target NVL-domain rank slot per relay-ready signal
+    __nv_bfloat16* master_local_addr;                            // Source: local master weight
+    __nv_bfloat16* replica_remote_addrs[kMaxNvlDomainSize - 1];  // Destinations: replica addresses
+    int num_replicas;                                            // Number of replicas (1 to kMaxNvlDomainSize-1)
+    size_t numel;                                                // Number of elements
+    int wait_ready_slot;                                         // Local relay-ready flag slot, -1 if no wait
+    int num_ready_signals;                                       // Number of remote relay-ready flags to set
+    int ready_signal_slots[kMaxNvlDomainSize - 1];               // Symmetric ready-flag slot per relay
+    int ready_signal_nvl_ranks[kMaxNvlDomainSize - 1];           // Target NVL-domain rank slot per relay-ready signal
 };
 
 // Run weight sync using the device-resident task list produced by the task-build kernel.
@@ -306,7 +306,6 @@ void run_sparse_reroute_quota(int64_t* topk_ids_ptr,
                               const int num_global_logical_experts,
                               const int max_replicas,
                               cudaStream_t stream);
-
 
 // Helper functions
 static __host__ __device__ __forceinline__ int ceil_div(const int a, const int b) {

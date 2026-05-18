@@ -37,12 +37,12 @@ __device__ __forceinline__ int gcd_int(int a, int b) {
 // Forward pass 1: count active tokens per (expert, tile)
 // ============================================================================
 template <int TILE_T, int WARPS_PER_BLOCK>
-__global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void reroute_forward_count_kernel(
-    const bool* __restrict__ routing_map,
-    int32_t* __restrict__ tile_counts,
-    const int T,
-    const int L,
-    const int num_tiles) {
+__global__ __launch_bounds__(WARPS_PER_BLOCK *
+                             32) void reroute_forward_count_kernel(const bool* __restrict__ routing_map,
+                                                                   int32_t* __restrict__ tile_counts,
+                                                                   const int T,
+                                                                   const int L,
+                                                                   const int num_tiles) {
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int expert_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
@@ -142,8 +142,9 @@ __global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void dense_rr_reroute_scatter
 
         if (active) {
             const int replica_idx = my_rank % C;
-            const int phys = (replica_idx < PREFETCH_REPLICAS) ? local_l2p[replica_idx]
-                                                               : logical_to_physical_map[expert_id * max_replicas + replica_idx];
+            const int phys = (replica_idx < PREFETCH_REPLICAS)
+                ? local_l2p[replica_idx]
+                : logical_to_physical_map[expert_id * max_replicas + replica_idx];
             expanded_routing_map[t * P + phys] = true;
             expanded_probs[t * P + phys] = probs[t * L + expert_id];
         }
@@ -200,9 +201,8 @@ __global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void dense_quota_reroute_scat
     int quota_perm_stride = 1;
     int quota_perm_offset = 0;
     if (C > 0) {
-        quota_local_total = (C <= PREFETCH_REPLICAS)
-                                ? local_prefix[C - 1]
-                                : rank_quota_prefix[expert_id * max_replicas + C - 1];
+        quota_local_total =
+            (C <= PREFETCH_REPLICAS) ? local_prefix[C - 1] : rank_quota_prefix[expert_id * max_replicas + C - 1];
     }
     if (interleave_by_rank_quota && quota_local_total > 1) {
         if (lane == 0) {
@@ -256,8 +256,8 @@ __global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void dense_quota_reroute_scat
         if (active) {
             int quota_rank = my_rank;
             if (interleave_by_rank_quota && quota_local_total > 1) {
-                quota_rank = static_cast<int>(
-                    (static_cast<int64_t>(my_rank) * quota_perm_stride + quota_perm_offset) % quota_local_total);
+                quota_rank = static_cast<int>((static_cast<int64_t>(my_rank) * quota_perm_stride + quota_perm_offset) %
+                                              quota_local_total);
             }
             int replica_idx = 0;
 #pragma unroll
@@ -270,8 +270,9 @@ __global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void dense_quota_reroute_scat
                 replica_idx += (quota_rank >= rank_quota_prefix[expert_id * max_replicas + j]) ? 1 : 0;
             }
             replica_idx = min(replica_idx, max(C - 1, 0));
-            const int phys = (replica_idx < PREFETCH_REPLICAS) ? local_l2p[replica_idx]
-                                                               : logical_to_physical_map[expert_id * max_replicas + replica_idx];
+            const int phys = (replica_idx < PREFETCH_REPLICAS)
+                ? local_l2p[replica_idx]
+                : logical_to_physical_map[expert_id * max_replicas + replica_idx];
             expanded_routing_map[t * P + phys] = true;
             expanded_probs[t * P + phys] = probs[t * L + expert_id];
         }
@@ -284,17 +285,16 @@ __global__ __launch_bounds__(WARPS_PER_BLOCK * 32) void dense_quota_reroute_scat
 // Backward kernel: row-parallel gather using expanded_routing_map lookup
 // ============================================================================
 template <typename scalar_t>
-__global__ __launch_bounds__(1024) void reroute_backward_gather_kernel(
-    const scalar_t* __restrict__ grad_expanded_probs,
-    const bool* __restrict__ routing_map,
-    const bool* __restrict__ expanded_routing_map,
-    const int32_t* __restrict__ l2p_map,
-    const int32_t* __restrict__ lcnts,
-    scalar_t* __restrict__ grad_probs,
-    const int T,
-    const int L,
-    const int P,
-    const int max_replicas) {
+__global__ __launch_bounds__(1024) void reroute_backward_gather_kernel(const scalar_t* __restrict__ grad_expanded_probs,
+                                                                       const bool* __restrict__ routing_map,
+                                                                       const bool* __restrict__ expanded_routing_map,
+                                                                       const int32_t* __restrict__ l2p_map,
+                                                                       const int32_t* __restrict__ lcnts,
+                                                                       scalar_t* __restrict__ grad_probs,
+                                                                       const int T,
+                                                                       const int L,
+                                                                       const int P,
+                                                                       const int max_replicas) {
     const int t = blockIdx.x * blockDim.y + threadIdx.y;
     const int l = blockIdx.y * blockDim.x + threadIdx.x;
 
@@ -427,17 +427,17 @@ void run_dense_reroute_backward(const void* grad_expanded_probs,
         dim3((T + block_y - 1) / block_y, (L + block_x - 1) / block_x), dim3(block_x, block_y), stream);
 
     launch_kernel(reroute_backward_gather_kernel<float>,
-                          config,
-                          static_cast<const float*>(grad_expanded_probs),
-                          routing_map,
-                          expanded_routing_map,
-                          logical_to_physical_map,
-                          logical_replica_counts,
-                          static_cast<float*>(grad_probs),
-                          T,
-                          L,
-                          P,
-                          max_replicas);
+                  config,
+                  static_cast<const float*>(grad_expanded_probs),
+                  routing_map,
+                  expanded_routing_map,
+                  logical_to_physical_map,
+                  logical_replica_counts,
+                  static_cast<float*>(grad_probs),
+                  T,
+                  L,
+                  P,
+                  max_replicas);
 }
 
 // ---------------------------------------------------------------------------
@@ -485,12 +485,12 @@ __device__ __forceinline__ int sparse_quota_replica_index(const int local_ordina
 }
 
 __global__ __launch_bounds__(256) void sparse_rr_reroute_kernel(int64_t* __restrict__ topk_ids,
-                                                                 const int32_t* __restrict__ logical_to_physical_map,
-                                                                 const int32_t* __restrict__ logical_replica_counts,
-                                                                 int* __restrict__ counters,
-                                                                 const int num_entries,
-                                                                 const int max_replicas,
-                                                                 const int num_experts) {
+                                                                const int32_t* __restrict__ logical_to_physical_map,
+                                                                const int32_t* __restrict__ logical_replica_counts,
+                                                                int* __restrict__ counters,
+                                                                const int num_entries,
+                                                                const int max_replicas,
+                                                                const int num_experts) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_entries; idx += gridDim.x * blockDim.x) {
         int64_t logical_id = topk_ids[idx];
         if (logical_id < 0 || logical_id >= num_experts)
@@ -508,13 +508,13 @@ __global__ __launch_bounds__(256) void sparse_rr_reroute_kernel(int64_t* __restr
 }
 
 __global__ __launch_bounds__(256) void sparse_quota_reroute_kernel(int64_t* __restrict__ topk_ids,
-                                                                    const int32_t* __restrict__ logical_to_physical_map,
-                                                                    const int32_t* __restrict__ logical_replica_counts,
-                                                                    const int32_t* __restrict__ rank_quota_prefix,
-                                                                    int* __restrict__ counters,
-                                                                    const int num_entries,
-                                                                    const int max_replicas,
-                                                                    const int num_experts) {
+                                                                   const int32_t* __restrict__ logical_to_physical_map,
+                                                                   const int32_t* __restrict__ logical_replica_counts,
+                                                                   const int32_t* __restrict__ rank_quota_prefix,
+                                                                   int* __restrict__ counters,
+                                                                   const int num_entries,
+                                                                   const int max_replicas,
+                                                                   const int num_experts) {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_entries; idx += gridDim.x * blockDim.x) {
         int64_t logical_id = topk_ids[idx];
         if (logical_id < 0 || logical_id >= num_experts)
@@ -525,8 +525,8 @@ __global__ __launch_bounds__(256) void sparse_quota_reroute_kernel(int64_t* __re
             continue;
 
         int local_ordinal = atomicAdd(&counters[logical_id], 1);
-        int replica_idx = sparse_quota_replica_index(
-            local_ordinal, static_cast<int>(logical_id), C, max_replicas, rank_quota_prefix);
+        int replica_idx =
+            sparse_quota_replica_index(local_ordinal, static_cast<int>(logical_id), C, max_replicas, rank_quota_prefix);
         int32_t physical_id = logical_to_physical_map[logical_id * max_replicas + replica_idx];
         topk_ids[idx] = static_cast<int64_t>(physical_id);
     }

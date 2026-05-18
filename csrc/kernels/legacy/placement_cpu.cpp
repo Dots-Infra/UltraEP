@@ -1,10 +1,9 @@
-#include "../api.cuh"
-
 #include <algorithm>
 #include <cstring>
 #include <vector>
 
 #include "../../utils/exception.cuh"
+#include "../api.cuh"
 
 namespace ultra_ep::kernels::legacy {
 
@@ -66,8 +65,7 @@ void solve_on_host(const int32_t* expert_loads,
         for (int offset = 0; offset < num_logical_per_nvl; ++offset) {
             total_load += expert_loads[domain_start_logical + offset];
         }
-        const double avg_per_slot =
-            total_load > 0.0 ? total_load / (num_nvl_ranks * num_local_master_experts) : 0.0;
+        const double avg_per_slot = total_load > 0.0 ? total_load / (num_nvl_ranks * num_local_master_experts) : 0.0;
 
         for (int slot = 0; slot < num_redundant_per_nvl; ++slot) {
             int best_logical = -1;
@@ -77,8 +75,7 @@ void solve_on_host(const int32_t* expert_loads,
                 if (logical_replica_counts[logical_id] - 1 >= max_extra_replicas) {
                     continue;
                 }
-                const double score =
-                    static_cast<double>(expert_loads[logical_id]) / logical_replica_counts[logical_id];
+                const double score = static_cast<double>(expert_loads[logical_id]) / logical_replica_counts[logical_id];
                 if (score > best_score || (score == best_score && (best_logical < 0 || logical_id < best_logical))) {
                     best_score = score;
                     best_logical = logical_id;
@@ -177,26 +174,26 @@ void solve_on_host(const int32_t* expert_loads,
 }  // namespace
 
 void solve_placement(const int32_t* expert_loads,
-                   const int32_t* expert_loads_per_rank,
-                   int32_t* physical_to_logical_map,
-                   int32_t* logical_to_physical_map,
-                   int32_t* logical_replica_counts,
-                   int32_t* logical_instance_quota,
-                   int32_t* logical_instance_quota_prefix,
-                   int32_t* rank_quota_prefix,
-                   cudaStream_t stream,
-                   int num_global_logical_experts,
-                   int num_ranks,
-                   int num_local_master_experts,
-                   int num_local_redundant_experts,
-                   int num_nvl_ranks,
-                   int max_replicas_dim,
-                   float balance_threshold,
-                   int32_t min_tokens_per_replica,
-                   bool allow_zero_master_quota,
-                   bool locality_aware,
-                   float oracle_eps,
-                   int kernel_stage) {
+                     const int32_t* expert_loads_per_rank,
+                     int32_t* physical_to_logical_map,
+                     int32_t* logical_to_physical_map,
+                     int32_t* logical_replica_counts,
+                     int32_t* logical_instance_quota,
+                     int32_t* logical_instance_quota_prefix,
+                     int32_t* rank_quota_prefix,
+                     cudaStream_t stream,
+                     int num_global_logical_experts,
+                     int num_ranks,
+                     int num_local_master_experts,
+                     int num_local_redundant_experts,
+                     int num_nvl_ranks,
+                     int max_replicas_dim,
+                     float balance_threshold,
+                     int32_t min_tokens_per_replica,
+                     bool allow_zero_master_quota,
+                     bool locality_aware,
+                     float oracle_eps,
+                     int kernel_stage) {
     (void)expert_loads_per_rank;
     (void)min_tokens_per_replica;
     (void)allow_zero_master_quota;
@@ -208,19 +205,16 @@ void solve_placement(const int32_t* expert_loads,
     const int num_global_physical_experts = num_local_physical_experts * num_ranks;
     const size_t loads_bytes = static_cast<size_t>(num_global_logical_experts) * sizeof(int32_t);
     const size_t p2l_bytes = static_cast<size_t>(num_global_physical_experts) * sizeof(int32_t);
-    const size_t l2p_bytes =
-        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t);
+    const size_t l2p_bytes = static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t);
     const size_t lcnts_bytes = static_cast<size_t>(num_global_logical_experts) * sizeof(int32_t);
-    const size_t quota_bytes =
-        static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t);
+    const size_t quota_bytes = static_cast<size_t>(num_global_logical_experts) * max_replicas_dim * sizeof(int32_t);
 
     std::vector<int32_t> host_loads(num_global_logical_experts);
     std::vector<int32_t> host_p2l(num_global_physical_experts);
     std::vector<int32_t> host_l2p(static_cast<size_t>(num_global_logical_experts) * max_replicas_dim);
     std::vector<int32_t> host_lcnts(num_global_logical_experts);
 
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
-        host_loads.data(), expert_loads, loads_bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(host_loads.data(), expert_loads, loads_bytes, cudaMemcpyDeviceToHost, stream));
     CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream));
 
     solve_on_host(host_loads.data(),
@@ -235,12 +229,12 @@ void solve_placement(const int32_t* expert_loads,
                   max_replicas_dim,
                   balance_threshold);
 
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
-        physical_to_logical_map, host_p2l.data(), p2l_bytes, cudaMemcpyHostToDevice, stream));
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
-        logical_to_physical_map, host_l2p.data(), l2p_bytes, cudaMemcpyHostToDevice, stream));
-    CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
-        logical_replica_counts, host_lcnts.data(), lcnts_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemcpyAsync(physical_to_logical_map, host_p2l.data(), p2l_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemcpyAsync(logical_to_physical_map, host_l2p.data(), l2p_bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_RUNTIME_CHECK(
+        cudaMemcpyAsync(logical_replica_counts, host_lcnts.data(), lcnts_bytes, cudaMemcpyHostToDevice, stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_instance_quota, 0, quota_bytes, stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(logical_instance_quota_prefix, 0, quota_bytes, stream));
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(rank_quota_prefix, 0, quota_bytes, stream));
