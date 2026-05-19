@@ -105,6 +105,7 @@ Manager::Manager(const int& num_layers,
                  const int& quota_kernel_stage,
                  const bool& quota_reroute_interleave,
                  const int& grad_reduce_num_sms,
+                 const bool& grad_reduce_deterministic,
                  const int& weight_sync_plan_mode,
                  const int& weight_sync_relay_min_replicas,
                  const int& weight_sync_relay_max_relays,
@@ -126,6 +127,7 @@ Manager::Manager(const int& num_layers,
       quota_kernel_stage_(quota_kernel_stage),
       quota_reroute_interleave_(quota_reroute_interleave),
       grad_reduce_num_sms_(grad_reduce_num_sms),
+      grad_reduce_deterministic_(grad_reduce_deterministic),
       weight_sync_plan_mode_(weight_sync_plan_mode),
       weight_sync_relay_min_replicas_(weight_sync_relay_min_replicas),
       weight_sync_relay_max_relays_(weight_sync_relay_max_relays),
@@ -816,6 +818,13 @@ void Manager::set_weight_sync_plan_mode(const int& plan_mode) {
     CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream.stream()));
 }
 
+void Manager::set_grad_reduce_deterministic(const bool& deterministic, const int& grad_reduce_num_sms) {
+    EP_HOST_ASSERT(grad_reduce_num_sms > 0);
+    EP_HOST_ASSERT(grad_reduce_num_sms % 2 == 0 && "grad_reduce_num_sms must be even");
+    grad_reduce_deterministic_ = deterministic;
+    grad_reduce_num_sms_ = std::min(grad_reduce_num_sms, runtime::num_device_sms);
+}
+
 std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
@@ -862,7 +871,8 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                              _task_metadata,
                              _global_task_or_tile_counter,
                              comm_stream,
-                             grad_reduce_num_sms_);
+                             grad_reduce_num_sms_,
+                             grad_reduce_deterministic_);
 
     // Wait streams
     if (async) {

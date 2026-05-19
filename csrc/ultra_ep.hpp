@@ -182,6 +182,7 @@ class Manager {
     int quota_kernel_stage_ = 1;
     bool quota_reroute_interleave_ = true;
     int grad_reduce_num_sms_ = 24;
+    bool grad_reduce_deterministic_ = false;
     int weight_sync_plan_mode_ = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive);
     int weight_sync_relay_min_replicas_ = 6;
     int weight_sync_relay_max_relays_ = 8;
@@ -213,6 +214,7 @@ public:
             const int& quota_kernel_stage = 1,
             const bool& quota_reroute_interleave = true,
             const int& grad_reduce_num_sms = 24,
+            const bool& grad_reduce_deterministic = false,
             const int& weight_sync_plan_mode = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
             const int& weight_sync_relay_min_replicas = 6,
             const int& weight_sync_relay_max_relays = 8,
@@ -265,6 +267,7 @@ public:
 
     torch::Stream get_comm_stream() const { return comm_stream; }
     void set_weight_sync_plan_mode(const int& plan_mode);
+    void set_grad_reduce_deterministic(const bool& deterministic, const int& grad_reduce_num_sms);
 
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
     torch::Tensor get_local_replica_grad_buffer_tensor() const {
@@ -303,6 +306,7 @@ static void register_apis(pybind11::module_& m) {
                             int,
                             bool,
                             int,
+                            bool,
                             int,
                             int,
                             int,
@@ -323,6 +327,7 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("quota_kernel_stage") = 1,
              pybind11::arg("quota_reroute_interleave") = true,
              pybind11::arg("grad_reduce_num_sms") = 24,
+             pybind11::arg("grad_reduce_deterministic") = false,
              pybind11::arg("weight_sync_plan_mode") = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
              pybind11::arg("weight_sync_relay_min_replicas") = 6,
              pybind11::arg("weight_sync_relay_max_relays") = 8,
@@ -343,6 +348,7 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("async_finish"))
         .def("weight_sync", &Manager::weight_sync)
         .def("set_weight_sync_plan_mode", &Manager::set_weight_sync_plan_mode)
+        .def("set_grad_reduce_deterministic", &Manager::set_grad_reduce_deterministic)
         .def("get_comm_stream", &Manager::get_comm_stream)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
         .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)

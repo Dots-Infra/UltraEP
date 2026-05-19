@@ -85,7 +85,8 @@ void run_grad_reduce(GradReduceTask* tasks,
                      int* task_metadata,
                      int* global_tile_counter,
                      cudaStream_t stream,
-                     int num_sms);
+                     int num_sms,
+                     bool deterministic = false);
 
 // ============================================================================
 // Weight Sync: Broadcast master weights to replicas

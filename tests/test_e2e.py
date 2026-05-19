@@ -297,7 +297,8 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
     )
 
 
-def run_grad_reduce(manager, args, layer_id):
+def run_grad_reduce(manager, args, layer_id, deterministic: bool):
+    manager.set_grad_reduce_deterministic(deterministic)
     fc1_weights = [
         torch.empty(0, device="cuda", dtype=torch.bfloat16)
         for _ in range(args.num_local_master)
@@ -361,16 +362,25 @@ def run_grad_reduce(manager, args, layer_id):
     valid_local_replicas = (
         manager.physical_to_logical_map[layer_id, local_replica_phys] >= 0
     )
-    correct = True
+    zero_correct = True
     if bool(valid_local_replicas.any().item()):
-        correct = bool((replica[valid_local_replicas] == 0).all().item())
+        zero_correct = bool((replica[valid_local_replicas] == 0).all().item())
+    assert zero_correct, f"grad_reduce replica zero mismatch on rank {dist.get_rank()}"
+
+    correct = True
     for idx in range(args.num_local_master):
-        correct = correct and torch.allclose(
-            fc1_grads[idx], expected_fc1[idx], atol=1e-5, rtol=1e-5
-        )
-        correct = correct and torch.allclose(
-            fc2_grads[idx], expected_fc2[idx], atol=1e-5, rtol=1e-5
-        )
+        if deterministic:
+            correct = correct and bitwise_equal(fc1_grads[idx], expected_fc1[idx])
+            correct = correct and bitwise_equal(fc2_grads[idx], expected_fc2[idx])
+        else:
+            correct = correct and torch.allclose(
+                fc1_grads[idx], expected_fc1[idx], atol=1e-5, rtol=1e-5
+            )
+            correct = correct and torch.allclose(
+                fc2_grads[idx], expected_fc2[idx], atol=1e-5, rtol=1e-5
+            )
+    check_name = "bitwise" if deterministic else "allclose"
+    assert correct, f"grad_reduce {check_name} mismatch on rank {dist.get_rank()}"
 
     def reset_grad_state():
         for idx in range(args.num_local_master):
@@ -388,19 +398,22 @@ def run_grad_reduce(manager, args, layer_id):
         use_barrier=True,
         pre_fn=reset_grad_state,
     )
+    kernel_name = (
+        "grad_reduce_deterministic_kernel" if deterministic else "grad_reduce_kernel"
+    )
     kernel = bench_kineto(
         reduce_once,
-        "grad_reduce_kernel",
+        kernel_name,
         num_tests=max(3, min(args.bench_iters, 30)),
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
-    status = "PASS" if correct else "MISMATCH"
+    mode_name = "deterministic" if deterministic else "atomic"
     print_metric(
-        "grad_reduce",
+        f"grad_reduce/{mode_name}",
         avg * 1000,
         kernel * 1000,
-        f"correctness {status}",
+        f"{check_name} PASS ({manager.grad_reduce_num_sms} SMs)",
         print_fn=print_rank0,
     )
 
@@ -545,7 +558,8 @@ def run_case(manager, args, ratio: float):
     )
     for plan_mode in args.weight_sync_plan_modes:
         run_weight_sync(manager, args, layer_id, plan_mode)
-    run_grad_reduce(manager, args, layer_id)
+    for deterministic in (False, True):
+        run_grad_reduce(manager, args, layer_id, deterministic)
     if args.include_token_a2a:
         run_hybridep_a2a(args, expanded_routing)
 

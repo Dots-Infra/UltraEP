@@ -68,7 +68,9 @@ class Manager:
         self._mb_counters = [0] * self.real_num_alloc_layers
 
         tuning = load_tuning_from_env()
+        self.grad_reduce_base_num_sms = tuning.grad_reduce_base_num_sms
         self.grad_reduce_num_sms = tuning.grad_reduce_num_sms
+        self.grad_reduce_deterministic = tuning.grad_reduce_deterministic
 
         # Expert loads logging
         self.log_expert_loads = tuning.log_expert_loads
@@ -108,6 +110,7 @@ class Manager:
             tuning.quota_kernel_stage,
             tuning.quota_reroute_interleave,
             self.grad_reduce_num_sms,
+            self.grad_reduce_deterministic,
             tuning.weight_sync_plan_mode_id,
             tuning.weight_sync_relay_min_replicas,
             tuning.weight_sync_relay_max_relays,
@@ -277,6 +280,8 @@ class Manager:
         Notes:
             The grad-reduce SM budget is controlled globally via the
             ``ULTRA_EP_GRAD_REDUCE_NUM_SMS`` environment variable.
+            Set ``ULTRA_EP_GRAD_REDUCE_DETERMINISTIC=1`` to use the deterministic
+            non-atomic path.
         """
         assert layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
@@ -340,6 +345,15 @@ class Manager:
             )
         self.weight_sync_plan_mode = normalized
         self.runtime.set_weight_sync_plan_mode(mode_ids[normalized])
+
+    def set_grad_reduce_deterministic(self, deterministic: bool):
+        self.grad_reduce_deterministic = bool(deterministic)
+        self.grad_reduce_num_sms = self.grad_reduce_base_num_sms * (
+            2 if self.grad_reduce_deterministic else 1
+        )
+        self.runtime.set_grad_reduce_deterministic(
+            self.grad_reduce_deterministic, self.grad_reduce_num_sms
+        )
 
     def update_placement(
         self,

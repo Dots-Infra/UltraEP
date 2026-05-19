@@ -5,6 +5,11 @@
 
 namespace ultra_ep::kernels {
 
+inline constexpr int kGradReduceDeterministicSubtileSizeBytes = kGradReduceTileSizeBytes / 2;
+inline constexpr int kGradReduceDeterministicSubtileElements =
+    kGradReduceDeterministicSubtileSizeBytes / kGradElementBytes;
+inline constexpr int kGradReduceDeterministicSharedBytes = kGradReduceTileSizeBytes;
+
 // ---------------------------------------------------------------------------
 // Grad Reduce Task Build
 // ---------------------------------------------------------------------------
@@ -262,12 +267,147 @@ __global__ __launch_bounds__(kGradReduceThreadsPerBlock) void grad_reduce_kernel
     }
 }
 
+__device__ __forceinline__ bool is_same_reduce_group(const GradReduceTask& lhs, const GradReduceTask& rhs) {
+    return lhs.master_local_addr == rhs.master_local_addr && lhs.numel == rhs.numel;
+}
+
+__device__ __forceinline__ bool is_first_reduce_group_task(const GradReduceTask* grad_reduce_tasks,
+                                                           const int task_idx) {
+    if (task_idx < 2) {
+        return true;
+    }
+    return !is_same_reduce_group(grad_reduce_tasks[task_idx], grad_reduce_tasks[task_idx - 2]);
+}
+
+// Deterministic path:
+//   * only the first task in each (master, shard) replica group owns the output tile
+//   * replicas are accumulated in task-list order
+//   * each output element is written by exactly one CTA, so no atomic add is needed
+//
+// SMEM stays at kGradReduceTileSizeBytes: half is the accumulator, half is the
+// TMA load buffer.
+__global__ __launch_bounds__(kGradReduceThreadsPerBlock) void grad_reduce_deterministic_kernel(
+    const GradReduceTask* grad_reduce_tasks,
+    const int* task_tile_offsets,
+    const int* task_metadata,
+    int* global_tile_counter) {
+    extern __shared__ float smem_pool[];
+    float* acc_smem = smem_pool;
+    float* load_smem = smem_pool + kGradReduceDeterministicSubtileElements;
+
+    ptx::mbarrier* mbarrier_ptr = ptx::create_mbarrier();
+    __shared__ ptx::arrival_phase phase;
+
+    __shared__ int total_tasks;
+    __shared__ int total_tiles;
+
+    if (threadIdx.x == 0) {
+        total_tasks = task_metadata[0];
+        total_tiles = task_metadata[1];
+        ptx::mbarrier_init(mbarrier_ptr, 1);
+        phase = 0;
+    }
+    __syncthreads();
+
+    if (total_tasks == 0) {
+        if (threadIdx.x == 0) {
+            ptx::mbarrier_invalidate(mbarrier_ptr);
+        }
+        return;
+    }
+
+    while (true) {
+        __shared__ int my_tile_idx;
+        if (threadIdx.x == 0) {
+            my_tile_idx = atomicAdd(global_tile_counter, 1);
+        }
+        __syncthreads();
+
+        if (my_tile_idx >= total_tiles) {
+            break;
+        }
+
+        TileInfo tile = get_tile_info(grad_reduce_tasks, task_tile_offsets, total_tasks, my_tile_idx);
+        if (!is_first_reduce_group_task(grad_reduce_tasks, tile.task_idx)) {
+            continue;
+        }
+
+        const GradReduceTask first_task = grad_reduce_tasks[tile.task_idx];
+        for (int subtile_start = 0; subtile_start < tile.num_elements;
+             subtile_start += kGradReduceDeterministicSubtileElements) {
+            const int remaining = tile.num_elements - subtile_start;
+            const int subtile_elements = remaining < kGradReduceDeterministicSubtileElements
+                ? remaining
+                : kGradReduceDeterministicSubtileElements;
+            const size_t subtile_global_offset = tile.global_offset + static_cast<size_t>(subtile_start);
+
+            for (int i = threadIdx.x; i < subtile_elements; i += blockDim.x) {
+                acc_smem[i] = first_task.master_local_addr[subtile_global_offset + i];
+            }
+            __syncthreads();
+
+            for (int reduce_task_idx = tile.task_idx; reduce_task_idx < total_tasks; reduce_task_idx += 2) {
+                GradReduceTask task = grad_reduce_tasks[reduce_task_idx];
+                if (!is_same_reduce_group(task, first_task)) {
+                    break;
+                }
+
+                size_t bytes = static_cast<size_t>(subtile_elements) * sizeof(float);
+                bytes = (bytes + 15) & ~15;
+
+                if (threadIdx.x == 0) {
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, bytes);
+                    ptx::tma_load_1d(load_smem,
+                                     task.replica_remote_addr + subtile_global_offset,
+                                     mbarrier_ptr,
+                                     bytes,
+                                     ptx::TMACacheHint::kEvictFirst);
+                }
+
+                if (threadIdx.x == 0) {
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
+                __syncthreads();
+
+                for (int i = threadIdx.x; i < subtile_elements; i += blockDim.x) {
+                    acc_smem[i] += load_smem[i];
+                }
+                __syncthreads();
+
+                memset_zero_tile(task.replica_remote_addr + subtile_global_offset, subtile_elements);
+                __syncthreads();
+            }
+
+            for (int i = threadIdx.x; i < subtile_elements; i += blockDim.x) {
+                first_task.master_local_addr[subtile_global_offset + i] = acc_smem[i];
+            }
+            __syncthreads();
+        }
+
+        __threadfence_system();
+    }
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ptx::mbarrier_invalidate(mbarrier_ptr);
+    }
+}
+
 void run_grad_reduce(GradReduceTask* tasks,
                      int* task_tile_offsets,
                      int* task_metadata,
                      int* global_tile_counter,
                      cudaStream_t stream,
-                     int num_sms) {
+                     int num_sms,
+                     bool deterministic) {
+    if (deterministic) {
+        const auto config = make_launch_config(
+            dim3(num_sms), dim3(kGradReduceThreadsPerBlock), stream, kGradReduceDeterministicSharedBytes);
+        launch_kernel(
+            grad_reduce_deterministic_kernel, config, tasks, task_tile_offsets, task_metadata, global_tile_counter);
+        return;
+    }
+
     const auto config =
         make_launch_config(dim3(num_sms), dim3(kGradReduceThreadsPerBlock), stream, kGradReduceTileSizeBytes);
     launch_kernel(grad_reduce_kernel, config, tasks, task_tile_offsets, task_metadata, global_tile_counter);
