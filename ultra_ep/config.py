@@ -61,7 +61,6 @@ class UltraEPTuning:
     quota_locality_aware: bool
     quota_min_tokens_per_replica: int
     quota_allow_zero_master_quota: bool
-    grad_reduce_base_num_sms: int
     grad_reduce_num_sms: int
     grad_reduce_deterministic: bool
     quota_oracle_eps: float
@@ -80,30 +79,14 @@ def load_tuning_from_env() -> UltraEPTuning:
     weight_sync_plan_mode = _normalize_weight_sync_plan_mode(
         _read_str_env("ULTRA_EP_WEIGHT_SYNC_PLAN_MODE", "adaptive")
     )
-    grad_reduce_base_num_sms = _read_int_env("ULTRA_EP_GRAD_REDUCE_NUM_SMS", 24)
-    if grad_reduce_base_num_sms <= 0:
+    grad_reduce_num_sms = _read_int_env("ULTRA_EP_GRAD_REDUCE_NUM_SMS", 24)
+    if grad_reduce_num_sms <= 0:
         raise ValueError("ULTRA_EP_GRAD_REDUCE_NUM_SMS must be positive")
-    if grad_reduce_base_num_sms % 2 != 0:
+    if grad_reduce_num_sms % 2 != 0:
         raise ValueError("ULTRA_EP_GRAD_REDUCE_NUM_SMS must be even")
-    grad_reduce_num_sms = grad_reduce_base_num_sms
     grad_reduce_deterministic = _read_bool_env(
         "ULTRA_EP_GRAD_REDUCE_DETERMINISTIC", False
     )
-    if grad_reduce_deterministic:
-        doubled_num_sms = grad_reduce_base_num_sms * 2
-        if (
-            os.environ.get("RANK", "0") == "0"
-            and os.environ.get("LOCAL_RANK", "0") == "0"
-        ):
-            print(
-                "UltraEP: deterministic grad_reduce enabled via "
-                "ULTRA_EP_GRAD_REDUCE_DETERMINISTIC; "
-                f"using {doubled_num_sms} requested SMs "
-                f"(2x ULTRA_EP_GRAD_REDUCE_NUM_SMS={grad_reduce_base_num_sms}, "
-                "capped by device at runtime).",
-                flush=True,
-            )
-        grad_reduce_num_sms = doubled_num_sms
 
     quota_kernel_stage = _read_int_env("ULTRA_EP_QUOTA_KERNEL_STAGE", 1)
     if quota_kernel_stage not in (0, 1):
@@ -118,7 +101,6 @@ def load_tuning_from_env() -> UltraEPTuning:
         quota_allow_zero_master_quota=_read_bool_env(
             "ULTRA_EP_QUOTA_ALLOW_ZERO_MASTER_QUOTA", False
         ),
-        grad_reduce_base_num_sms=grad_reduce_base_num_sms,
         grad_reduce_num_sms=grad_reduce_num_sms,
         grad_reduce_deterministic=grad_reduce_deterministic,
         quota_oracle_eps=_read_float_env("ULTRA_EP_QUOTA_ORACLE_EPS", 0.01),

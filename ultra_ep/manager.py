@@ -68,7 +68,6 @@ class Manager:
         self._mb_counters = [0] * self.real_num_alloc_layers
 
         tuning = load_tuning_from_env()
-        self.grad_reduce_base_num_sms = tuning.grad_reduce_base_num_sms
         self.grad_reduce_num_sms = tuning.grad_reduce_num_sms
         self.grad_reduce_deterministic = tuning.grad_reduce_deterministic
 
@@ -359,9 +358,6 @@ class Manager:
 
     def set_grad_reduce_deterministic(self, deterministic: bool):
         self.grad_reduce_deterministic = bool(deterministic)
-        self.grad_reduce_num_sms = self.grad_reduce_base_num_sms * (
-            2 if self.grad_reduce_deterministic else 1
-        )
         self.runtime.set_grad_reduce_deterministic(
             self.grad_reduce_deterministic, self.grad_reduce_num_sms
         )

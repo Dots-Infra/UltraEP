@@ -193,7 +193,7 @@ Algorithm and kernel tuning now live entirely on the Python side and are read fr
 
 - `ULTRA_EP_GRAD_REDUCE_DETERMINISTIC`
   Default: `0`
-  Enables the deterministic non-atomic grad-reduce path. When enabled, the requested grad-reduce SM count is doubled from `ULTRA_EP_GRAD_REDUCE_NUM_SMS` and then capped by the device SM count.
+  Enables the deterministic non-atomic grad-reduce path. Use more SMs to alleviate performance drop.
 
 - `ULTRA_EP_WEIGHT_SYNC_PLAN_MODE`  
   Default: `adaptive`  
