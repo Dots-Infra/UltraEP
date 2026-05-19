@@ -21,6 +21,7 @@ from utils import (
     format_load_imbalance,
     generate_routing_map_zipf,
     max_mean,
+    nvl_domain_physical_lower_bound,
     print_metric,
     print_section,
     rank_token_count,
@@ -195,6 +196,9 @@ def run_update_and_reroute(manager, args, layer_id, routing_map, probs):
     )
     dist.all_reduce(rank_load_before)
     dist.all_reduce(rank_load_after)
+    physical_lower_bound = nvl_domain_physical_lower_bound(
+        rank_load_before, manager.nvl_domain_size
+    )
 
     def reroute():
         manager.reroute(layer_id, probs, routing_map)
@@ -222,7 +226,8 @@ def run_update_and_reroute(manager, args, layer_id, routing_map, probs):
         reroute_avg * 1000,
         reroute_kernel * 1000,
         f"rank max/mean {max_mean(rank_load_before).item():.3f} -> "
-        f"{max_mean(rank_load_after).item():.3f}",
+        f"{max_mean(rank_load_after).item():.3f} "
+        f"(lower bound {physical_lower_bound.item():.3f})",
         print_fn=print_rank0,
     )
     return expanded_probs, expanded_routing

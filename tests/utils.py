@@ -565,6 +565,17 @@ def max_mean(t: torch.Tensor) -> torch.Tensor:
     return torch.where(mean > 0, values.max() / mean, torch.ones_like(mean))
 
 
+def nvl_domain_physical_lower_bound(
+    rank_loads: torch.Tensor, nvl_domain_size: int
+) -> torch.Tensor:
+    values = rank_loads.float()
+    mean = values.mean()
+    if nvl_domain_size <= 0 or values.numel() % nvl_domain_size != 0:
+        raise ValueError("nvl_domain_size must evenly divide rank_loads")
+    domain_means = values.view(-1, nvl_domain_size).mean(dim=1)
+    return torch.where(mean > 0, domain_means.max() / mean, torch.ones_like(mean))
+
+
 def summarize_vector(t: torch.Tensor) -> dict:
     values = t.float()
     if values.numel() == 0:

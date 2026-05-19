@@ -20,6 +20,7 @@ from utils import (
     generate_loads_per_rank_zipf,
     load_imbalance_summary,
     max_mean,
+    nvl_domain_physical_lower_bound,
     print_section,
     rank_token_count,
     summarize_vector,
@@ -253,6 +254,9 @@ def report_solution(
         dim=1
     )
     rank_loads_after = phys_loads.view(args.num_ranks, num_local_physical).sum(dim=1)
+    physical_lower_bound = nvl_domain_physical_lower_bound(
+        rank_loads_before, args.nvl_domain_size
+    )
     replicas = lcnts - 1
     used_slots = int(
         (p2l.view(args.num_ranks, num_local_physical)[:, args.num_local_master :] >= 0)
@@ -280,7 +284,8 @@ def report_solution(
     )
     print(
         f"    {'rank max/mean':<{W}}: {max_mean(rank_loads_before).item():.3f} -> "
-        f"{max_mean(rank_loads_after).item():.3f}",
+        f"{max_mean(rank_loads_after).item():.3f} "
+        f"(lower bound: {physical_lower_bound.item():.3f})",
         flush=True,
     )
     print(
