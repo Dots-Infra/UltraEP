@@ -948,6 +948,7 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                              current_epoch,
                              comm_stream,
                              runtime::num_device_sms,
+                             runtime::num_nvl_ranks,
                              _max_ws_total_tiles,
                              2);
 
@@ -963,6 +964,7 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                  current_epoch,
                                  relay_stream,
                                  runtime::num_device_sms,
+                                 runtime::num_nvl_ranks,
                                  _max_ws_total_tiles,
                                  1);
         launched_stage2 = true;

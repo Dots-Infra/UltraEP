@@ -286,13 +286,14 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
         use_barrier=True,
         pre_fn=randomize_replica,
     )
-    kernel = bench_kineto(
+    kernel_parts = bench_kineto(
         sync_once,
-        "weight_sync_kernel",
+        ("weight_sync_kernel", "weight_sync_thread_copy_kernel"),
         num_tests=max(3, min(args.bench_iters, 30)),
         barrier_comm_profiling=True,
         suppress_kineto_output=True,
     )
+    kernel = sum(kernel_parts)
     print_metric(
         f"weight_sync/{plan_mode}",
         avg * 1000,

@@ -122,6 +122,7 @@ void run_weight_sync(WeightSyncTask* tasks,
                      uint64_t current_epoch,
                      cudaStream_t stream,
                      int num_device_sms,
+                     int num_nvl_ranks,
                      int max_possible_tiles,
                      int cta_multiplier = 2);
 

@@ -86,7 +86,18 @@ class Manager:
         self.legacy_placement = legacy_placement
         self.quota_kernel_stage = tuning.quota_kernel_stage
         self.quota_reroute_interleave = tuning.quota_reroute_interleave
-        self.weight_sync_plan_mode = tuning.weight_sync_plan_mode
+        weight_sync_plan_mode = tuning.weight_sync_plan_mode
+        weight_sync_plan_mode_id = tuning.weight_sync_plan_mode_id
+        if self.nvl_domain_size <= 8 and weight_sync_plan_mode != "direct":
+            if self.rank == 0:
+                print(
+                    "UltraEP: NVL domain size <= 8; forcing weight_sync "
+                    f"plan mode to direct (was {weight_sync_plan_mode}).",
+                    flush=True,
+                )
+            weight_sync_plan_mode = "direct"
+            weight_sync_plan_mode_id = 0
+        self.weight_sync_plan_mode = weight_sync_plan_mode
         self.weight_sync_relay_min_replicas = tuning.weight_sync_relay_min_replicas
         self.weight_sync_relay_max_relays = tuning.weight_sync_relay_max_relays
         self.weight_sync_relay_min_fanout_gain = (
@@ -111,7 +122,7 @@ class Manager:
             tuning.quota_reroute_interleave,
             self.grad_reduce_num_sms,
             self.grad_reduce_deterministic,
-            tuning.weight_sync_plan_mode_id,
+            weight_sync_plan_mode_id,
             tuning.weight_sync_relay_min_replicas,
             tuning.weight_sync_relay_max_relays,
             tuning.weight_sync_relay_min_fanout_gain,

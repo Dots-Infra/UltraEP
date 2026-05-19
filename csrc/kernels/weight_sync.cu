@@ -7,6 +7,9 @@ namespace ultra_ep::kernels {
 
 // Helper functions
 
+static constexpr int kWeightSyncThreadCopyMaxNvlRanks = 8;
+static constexpr int kWeightSyncThreadCopyCtaMultiplier = 4;
+
 static __host__ __device__ __forceinline__ size_t weight_sync_chunk_offset_elements(const int chunk_idx) {
     return static_cast<size_t>(chunk_idx) * kWeightSyncRelayChunkTiles * kWeightSyncTileElements;
 }
@@ -550,6 +553,92 @@ __device__ __forceinline__ void wait_for_weight_sync_task_ready(const WeightSync
     __threadfence_system();
 }
 
+__device__ __forceinline__ void copy_weight_sync_tile_threaded(const __nv_bfloat16* __restrict__ src,
+                                                               __nv_bfloat16* __restrict__ dst,
+                                                               const int num_elements) {
+    const size_t bytes = static_cast<size_t>(num_elements) * sizeof(__nv_bfloat16);
+    const std::uintptr_t alignment_bits =
+        reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst) | bytes;
+
+    if ((alignment_bits & (sizeof(uint4) - 1)) == 0) {
+        const int num_vecs = static_cast<int>(bytes / sizeof(uint4));
+        const uint4* __restrict__ src_vec = reinterpret_cast<const uint4*>(src);
+        uint4* __restrict__ dst_vec = reinterpret_cast<uint4*>(dst);
+        for (int vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x) {
+            const uint4 value = src_vec[vec_idx];
+            ptx::st_global_v4_u32_streaming(dst_vec + vec_idx, value.x, value.y, value.z, value.w);
+        }
+        return;
+    }
+
+    for (int element_idx = threadIdx.x; element_idx < num_elements; element_idx += blockDim.x) {
+        dst[element_idx] = src[element_idx];
+    }
+}
+
+__global__ __launch_bounds__(kWeightSyncThreadsPerBlock) void weight_sync_thread_copy_kernel(
+    const WeightSyncTask* weight_sync_tasks,
+    const int* task_tile_offsets,
+    const int* task_metadata,
+    int* global_tile_counter,
+    int* task_remaining_tiles,
+    uint64_t* local_ready_flags,
+    uint64_t* const* remote_ready_flag_ptrs,
+    uint64_t current_epoch) {
+    const bool is_leader = (threadIdx.x == 0);
+
+    __shared__ int total_tasks;
+    __shared__ int total_tiles;
+    __shared__ int tile_idx;
+    if (is_leader) {
+        total_tasks = task_metadata[0];
+        total_tiles = task_metadata[1];
+    }
+    __syncthreads();
+
+    if (total_tasks == 0) {
+        return;
+    }
+
+    while (true) {
+        if (is_leader) {
+            tile_idx = atomicAdd(global_tile_counter, 1);
+        }
+        __syncthreads();
+
+        if (tile_idx >= total_tiles) {
+            break;
+        }
+
+        const WeightSyncTileInfo tile =
+            get_weight_sync_tile_info(weight_sync_tasks, task_tile_offsets, total_tasks, tile_idx);
+        const WeightSyncTask& task = weight_sync_tasks[tile.task_idx];
+
+        if (is_leader) {
+            wait_for_weight_sync_task_ready(task, local_ready_flags, current_epoch);
+        }
+        __syncthreads();
+
+        const __nv_bfloat16* src = task.master_local_addr + tile.element_offset;
+        for (int replica_idx = 0; replica_idx < task.num_replicas; ++replica_idx) {
+            __nv_bfloat16* dst = task.replica_remote_addrs[replica_idx] + tile.element_offset;
+            copy_weight_sync_tile_threaded(src, dst, tile.num_elements);
+        }
+        __syncthreads();
+
+        if (is_leader && task_remaining_tiles != nullptr && task.num_ready_signals > 0) {
+            __threadfence_system();
+            finalize_completed_weight_sync_task(weight_sync_tasks,
+                                                tile.task_idx,
+                                                task_remaining_tiles,
+                                                local_ready_flags,
+                                                remote_ready_flag_ptrs,
+                                                current_epoch);
+        }
+        __syncthreads();
+    }
+}
+
 // Weight sync kernel with double buffering for true pipelining
 // Pipeline: TMA_Load[N+1] overlaps with TMA_Store[N]
 // This achieves true overlap of local HBM reads and remote NVLINK writes.
@@ -724,8 +813,28 @@ void run_weight_sync(WeightSyncTask* tasks,
                      uint64_t current_epoch,
                      cudaStream_t stream,
                      int num_device_sms,
+                     int num_nvl_ranks,
                      int max_possible_tiles,
                      int cta_multiplier) {
+    if (num_nvl_ranks <= kWeightSyncThreadCopyMaxNvlRanks && task_remaining_tiles != nullptr) {
+        const int thread_copy_cta_multiplier =
+            cta_multiplier > kWeightSyncThreadCopyCtaMultiplier ? cta_multiplier : kWeightSyncThreadCopyCtaMultiplier;
+        const int num_ctas = clamp_num_ctas(num_device_sms * thread_copy_cta_multiplier, max_possible_tiles);
+        const auto config = make_launch_config(dim3(num_ctas), dim3(kWeightSyncThreadsPerBlock), stream, 0);
+
+        launch_kernel(weight_sync_thread_copy_kernel,
+                      config,
+                      tasks,
+                      task_tile_offsets,
+                      task_metadata,
+                      global_tile_counter,
+                      task_remaining_tiles,
+                      local_ready_flags,
+                      remote_ready_flag_ptrs,
+                      current_epoch);
+        return;
+    }
+
     // Use conservative upper bound for grid size; persistent kernel handles over-launch
     const int num_ctas = clamp_num_ctas(num_device_sms * cta_multiplier, max_possible_tiles);
     const auto config = make_launch_config(
