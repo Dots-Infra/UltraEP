@@ -17,7 +17,7 @@ IpcManager::IpcManager() {
         std::snprintf(hostname_, sizeof(hostname_), "unknown");
     }
 
-    // It seems a dummy call to set the device. but it is useful to prevent the invalid device context error in gb..
+    // It seems a dummy call to set the device. but it is useful to prevent the invalid device context error
     int device_id = -1;
     CUDA_RUNTIME_CHECK(cudaGetDevice(&device_id));
     CUDA_RUNTIME_CHECK(cudaSetDevice(device_id));

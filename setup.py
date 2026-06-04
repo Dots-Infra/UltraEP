@@ -117,7 +117,7 @@ if __name__ == "__main__":
         else:
             raise RuntimeError(
                 f"Unsupported CUDA compute capability: {compute_cap} (SM{sm}). "
-                "Only SM90 (Hopper) and SM100 (Blackwell) are supported. "
+                "Only SM90 and SM100 are supported. "
                 "Set TORCH_CUDA_ARCH_LIST manually to override."
             )
 

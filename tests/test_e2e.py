@@ -113,7 +113,7 @@ def make_probs(routing_map: torch.Tensor):
     return probs
 
 
-def expected_replica_weights(manager, args, layer_id, fc1_weights, fc2_weights, before):
+def expected_replica_weights(manager, args, layer_id, before):
     rank = dist.get_rank()
     num_local_physical = manager.num_local_physical_experts
     placement_device = manager.physical_to_logical_map.device
@@ -142,11 +142,8 @@ def expected_replica_weights(manager, args, layer_id, fc1_weights, fc2_weights, 
     return expected
 
 
-def expected_master_grads(
-    manager, args, layer_id, fc1_grads, fc2_grads, replica_before
-):
+def expected_master_grads(manager, args, layer_id, fc1_grads, fc2_grads):
     rank = dist.get_rank()
-    num_local_physical = manager.num_local_physical_experts
     expected_fc1 = [g.clone() for g in fc1_grads]
     expected_fc2 = [g.clone() for g in fc2_grads]
     for local_idx in range(args.num_local_master):
@@ -262,9 +259,7 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
     )
     replica = manager.local_replica_weight_buffer
     replica.random_(0, 3)
-    expected = expected_replica_weights(
-        manager, args, layer_id, fc1_weights, fc2_weights, replica.clone()
-    )
+    expected = expected_replica_weights(manager, args, layer_id, replica.clone())
     dist.barrier()
     manager.weight_sync(layer_id, async_finish=False)
     torch.cuda.synchronize()
@@ -353,7 +348,7 @@ def run_grad_reduce(manager, args, layer_id, deterministic: bool):
     fc2_base = [g.clone() for g in fc2_grads]
     replica.copy_(replica_ref)
     expected_fc1, expected_fc2 = expected_master_grads(
-        manager, args, layer_id, fc1_grads, fc2_grads, replica_ref
+        manager, args, layer_id, fc1_grads, fc2_grads
     )
     dist.barrier()
     manager.grad_reduce(layer_id, async_finish=False)

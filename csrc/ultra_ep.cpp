@@ -3,11 +3,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
-#include <string>
-#include <vector>
+#include <cstdio>
 
 namespace ultra_ep {
 
@@ -34,8 +30,6 @@ void GlobalExpertPlacement::init(int num_layers, int P, int L, int R, int device
     // Allocate GPU buffer. Individual placement initializers set active fields.
     CUDA_RUNTIME_CHECK(cudaMalloc(&device_buffer, total_bytes));
     CUDA_RUNTIME_CHECK(cudaMemset(device_buffer, 0, total_bytes));
-    quota_buf_device = device_buffer + p2l_numel + l2p_numel + lcnts_numel;
-
     // Create GPU tensor views with strides
     auto device_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::Device(torch::kCUDA, device_id));
     physical_to_logical_map =
@@ -59,7 +53,6 @@ void GlobalExpertPlacement::cleanup() {
     if (device_buffer != nullptr) {
         cudaFree(device_buffer);
         device_buffer = nullptr;
-        quota_buf_device = nullptr;
     }
     physical_to_logical_map = torch::Tensor();
     logical_to_physical_map = torch::Tensor();
@@ -286,13 +279,6 @@ Manager::Manager(const int& num_layers,
         kernels::weight_sync_num_tiles(static_cast<size_t>(expert_fc2_numel));
     _max_ws_total_tiles = num_local_physical_experts * max_stage_tiles_per_expert;
 
-    const int64_t max_fc_numel = std::max(expert_fc1_numel, expert_fc2_numel);
-    const int max_replicas = runtime::num_nvl_ranks - 1;
-    _max_gr_total_tasks = 2 * num_local_master_experts * max_replicas;
-    const int gr_tiles_per_task =
-        static_cast<int>((max_fc_numel + kernels::kGradReduceTileElements - 1) / kernels::kGradReduceTileElements);
-    _max_gr_total_tiles = _max_gr_total_tasks * gr_tiles_per_task;
-
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_reroute_sparse_counters, num_global_logical_experts * sizeof(int)));
 
     global_logical_expert_loads =
@@ -302,11 +288,6 @@ Manager::Manager(const int& num_layers,
     expert_loads_per_rank = reinterpret_cast<int32_t*>(
         nvshmem::alloc(static_cast<size_t>(runtime::num_ranks) * num_global_logical_experts * sizeof(int32_t),
                        kernels::kNvshmemAlignment));
-    if (legacy_placement_) {
-        CUDA_RUNTIME_CHECK(
-            cudaMallocHost((void**)&global_logical_expert_loads_cpu, num_global_logical_experts * sizeof(int)));
-    }
-
     // Initialize default placement (master-only) for all layers so sparse reroute
     // remains valid before the first placement update.
     for (int lid = 0; lid < num_layers; ++lid) {
@@ -427,12 +408,6 @@ void Manager::destroy() {
     // Free sparse reroute counters
     CUDA_RUNTIME_CHECK(cudaFree(_reroute_sparse_counters));
     _reroute_sparse_counters = nullptr;
-
-    // Free expert load buffers
-    if (global_logical_expert_loads_cpu != nullptr) {
-        CUDA_RUNTIME_CHECK(cudaFreeHost(global_logical_expert_loads_cpu));
-        global_logical_expert_loads_cpu = nullptr;
-    }
 
     // Free contiguous placement buffers (CPU pinned + GPU)
     placement.cleanup();
@@ -707,10 +682,7 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::dense_reroute_forward(const in
         EP_HOST_ASSERT(probs.scalar_type() == torch::kFloat32);
 
         if (!legacy_placement_) {
-            auto [logical_instance_quota, logical_instance_quota_prefix, rank_quota_prefix] =
-                placement.get_quota_ptrs(layer_id);
-            (void)logical_instance_quota;
-            (void)logical_instance_quota_prefix;
+            const int32_t* rank_quota_prefix = std::get<2>(placement.get_quota_ptrs(layer_id));
             kernels::run_dense_reroute_forward_quota(routing_map.data_ptr<bool>(),
                                                      probs.data_ptr(),
                                                      logical_to_physical_map,

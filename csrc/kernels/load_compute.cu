@@ -62,7 +62,7 @@ void rmap_local_sum(int T,
     int threads_y = 1024 / block_x;      // maximize parallelism along Y dimension
     dim3 block(block_x, threads_y);
 
-    // Launch enough blocks to fill all SMs (H100 has 132, Blackwell even more, here at most 256)
+    // Launch enough blocks to fill all SMs
     int num_blocks = min(256, (T + threads_y - 1) / threads_y);
     dim3 grid(num_blocks);
 

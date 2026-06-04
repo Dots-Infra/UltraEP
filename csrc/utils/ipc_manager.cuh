@@ -1,6 +1,3 @@
-// Deprecated for remote memory management
-// Use NVSHMEM symmetric heap instead
-
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
@@ -26,8 +23,6 @@ struct MemHandle {
     size_t size;
     char src_hostname[256];
 };
-
-constexpr size_t HANDLE_SIZE = sizeof(MemHandle);
 
 class IpcManager {
 public:

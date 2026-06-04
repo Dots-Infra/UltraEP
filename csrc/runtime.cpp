@@ -1,5 +1,10 @@
 #include "runtime.hpp"
 
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
 namespace ultra_ep::runtime {
 
 bool is_runtime_initialized = false;

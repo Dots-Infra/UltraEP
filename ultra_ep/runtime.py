@@ -12,7 +12,7 @@ _nvl_domain_size = None
 def init_runtime(group: dist.ProcessGroup):
     global _group, _nvl_domain_size
     if _C.is_runtime_initialized():
-        assert group == _group, f"All EP buffers should share the same process group"
+        assert group == _group, "All EP buffers should share the same process group"
         return _nvl_domain_size
 
     # * IMPORTANT: NVSHMEM environment variables

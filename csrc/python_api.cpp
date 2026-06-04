@@ -9,8 +9,6 @@
 #define TORCH_EXTENSION_NAME _C
 #endif
 
-namespace ultra_ep {}  // namespace ultra_ep
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "UltraEP: an efficient expert-parallel load balancing library";
 

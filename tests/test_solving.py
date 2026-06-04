@@ -174,7 +174,6 @@ def remote_tokens_from_rank_quotas(rank_quota_prefixes, l2p, args):
 def traffic_tokens(
     loads_per_rank,
     l2p,
-    quota,
     args,
     legacy: bool,
     rank_quota_prefixes=None,
@@ -196,29 +195,17 @@ def traffic_tokens(
             ),
         }
 
-    local_with_quota = torch.zeros(
-        (), dtype=torch.float32, device=loads_per_rank.device
-    )
-    local_without_quota = torch.zeros_like(local_with_quota)
+    local_tokens = torch.zeros((), dtype=torch.float32, device=loads_per_rank.device)
     for src_rank in range(args.num_ranks):
         src_loads = loads_per_rank[src_rank].float()
         local_slot = (phys_rank == src_rank) & valid
-        if legacy:
-            local_without_quota += (
-                src_loads * local_slot.any(dim=1).float() / l2p.size(1)
-            ).sum()
-            local_with_quota = local_without_quota
-            continue
+        local_tokens += (src_loads * local_slot.any(dim=1).float() / l2p.size(1)).sum()
 
-        total_quota = quota.masked_fill(~valid, 0).sum(dim=1).clamp_min(1).float()
-        local_quota = quota.masked_fill(~local_slot, 0).sum(dim=1).float()
-        local_without_quota += (src_loads * local_quota / total_quota).sum()
-        local_with_quota += torch.minimum(src_loads, local_quota).sum()
-
+    remote_tokens = routed_total - int(local_tokens.round().item())
     return {
         "routed_total": routed_total,
-        "without_locality": routed_total - int(local_without_quota.round().item()),
-        "with_locality": routed_total - int(local_with_quota.round().item()),
+        "without_locality": remote_tokens,
+        "with_locality": remote_tokens,
     }
 
 
@@ -266,7 +253,6 @@ def report_solution(
     traffic = traffic_tokens(
         loads_per_rank,
         l2p,
-        quota,
         args,
         legacy,
         rank_quota_prefixes,

@@ -1,20 +1,3 @@
-/**
- * Optimized CUDA kernels for reroute: expand logical routing map to physical routing map.
- *
- * Forward (two-pass, deterministic round-robin):
- *   Pass 1 — Count: each warp counts active tokens for one (expert, tile) pair
- *            using __ballot_sync / __popc.  Fully parallel across all (expert, tile) pairs.
- *   Pass 2 — Scatter: each warp computes its base rank via warp-parallel prefix-sum of
- *            tile_counts, then scatters probs to the physical expert determined by
- *            l2p_map[expert, rank % C].  Fully parallel.
- *
- * Backward (row-parallel gather):
- *   Each thread handles one (token, expert) pair.  For active pairs, it searches the
- *   forward's expanded_routing_map to find which physical replica was assigned, then
- *   gathers the gradient.  This eliminates the serial round-robin recomputation entirely.
- *   For typical replica counts (1–4), the search is 1–4 iterations.
- */
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 

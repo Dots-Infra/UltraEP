@@ -4,10 +4,9 @@
 #include <torch/extension.h>
 
 #include <cstdint>
-#include <memory>
 #include <optional>
-#include <string>
 #include <tuple>
+#include <vector>
 
 #include "kernels/api.cuh"
 #include "kernels/config.cuh"
@@ -61,8 +60,6 @@ struct GlobalExpertPlacement {
     // with padding to alignment.
     // Cross-layer stride is per_layer_stride_numel (may be > per_layer_data_numel for alignment).
     int32_t* device_buffer = nullptr;
-    int32_t* quota_buf_device = nullptr;
-
     int num_layers_ = 0;
     int p2l_numel = 0;               // = num_global_physical_experts
     int l2p_numel = 0;               // = num_global_logical_experts * max_replicas_dim
@@ -114,7 +111,6 @@ class Manager {
 
     // Destructor settings
     bool explicitly_destroy;
-    bool destroyed = false;
 
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
@@ -165,8 +161,6 @@ class Manager {
     uint64_t** _remote_ready_flag_ptrs = nullptr;  // [kMaxNvlDomainSize]
     // Pre-computed upper bounds for device-path grid sizing
     int _max_ws_total_tiles = 0;
-    int _max_gr_total_tasks = 0;
-    int _max_gr_total_tiles = 0;
 
     // Sparse reroute: per-expert round-robin counters [num_global_logical_experts]
     int* _reroute_sparse_counters = nullptr;
@@ -188,10 +182,9 @@ class Manager {
     int weight_sync_relay_max_relays_ = 8;
     int weight_sync_relay_min_fanout_gain_ = 2;
     // Shape: [num_global_logical_experts]
-    int* global_logical_expert_loads = nullptr;      // alloc by nvshmem for allreduce
-    int* global_logical_expert_loads_cpu = nullptr;  // host scratch for legacy placement
-    int32_t* local_expert_loads = nullptr;           // [L] — symmetric source buffer for allgather
-    int32_t* expert_loads_per_rank = nullptr;        // [num_ranks, L] — symmetric allgather output
+    int* global_logical_expert_loads = nullptr;  // alloc by nvshmem for allreduce
+    int32_t* local_expert_loads = nullptr;       // [L] — symmetric source buffer for allgather
+    int32_t* expert_loads_per_rank = nullptr;    // [num_ranks, L] — symmetric allgather output
 
     int placement_sync_slot(const int layer_id) const { return is_train ? layer_id : 0; }
     void record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream);
