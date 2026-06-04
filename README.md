@@ -211,16 +211,6 @@ Algorithm and kernel tuning now live entirely on the Python side and are read fr
   Default: `2`  
   Minimum expected fanout improvement required before adaptive relay is used.
 
-### Logging
-
-- `ULTRA_EP_LOG_EXPERT_LOADS`  
-  Default: `0`  
-  Enables per-layer load-balance logging.
-
-- `ULTRA_EP_LOADS_SAVE_DIR`  
-  Default: `/var/log/ultra_ep_loads`  
-  Output directory for load-balance logs.
-
 ## Tests
 
 The remaining tests focus on the current runtime surface instead of the removed standalone solver classes:

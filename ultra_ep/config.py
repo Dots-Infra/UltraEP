@@ -71,8 +71,6 @@ class UltraEPTuning:
     weight_sync_relay_min_replicas: int
     weight_sync_relay_max_relays: int
     weight_sync_relay_min_fanout_gain: int
-    log_expert_loads: bool
-    loads_save_dir: str
 
 
 def load_tuning_from_env() -> UltraEPTuning:
@@ -118,9 +116,5 @@ def load_tuning_from_env() -> UltraEPTuning:
         ),
         weight_sync_relay_min_fanout_gain=_read_int_env(
             "ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_FANOUT_GAIN", 2
-        ),
-        log_expert_loads=_read_bool_env("ULTRA_EP_LOG_EXPERT_LOADS", False),
-        loads_save_dir=_read_str_env(
-            "ULTRA_EP_LOADS_SAVE_DIR", "/var/log/ultra_ep_loads"
         ),
     )
