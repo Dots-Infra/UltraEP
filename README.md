@@ -185,6 +185,33 @@ Algorithm and kernel tuning now live entirely on the Python side and are read fr
   Default: `1`  
   Enables deterministic quota interleaving inside quota-aware dense reroute.
 
+### Load Profiling
+
+- `ULTRA_EP_LOAD_PROFILING`  
+  Default: `0`  
+  Enables expert load tracing. Profiling is supported for the default quota placement path only; enabling it with `legacy_placement=True` raises an assertion.
+
+- `ULTRA_EP_LOAD_PROFILE_DIR`  
+  Default: `ultra_ep_traces`  
+  Directory for chunked `.npz` trace files and per-writer manifests. By default only EP-group rank 0 writes, because the traced loads are already group-consistent after the runtime collectives.
+
+- `ULTRA_EP_LOAD_PROFILE_FLUSH_INTERVAL`  
+  Default: `128`  
+  Number of recorded microbatches per disk chunk. Device-to-host copies are still scheduled every recorded microbatch into pinned CPU memory.
+
+- `ULTRA_EP_LOAD_PROFILE_RECORD_INTERVAL`  
+  Default: `1`  
+  Records every Nth microbatch per real layer.
+
+Launch the viewer from a trace directory, or pass `--path` explicitly:
+
+```bash
+cd <path/to/ultra_ep_traces>
+python -m ultra_ep.load_viewer --host 0.0.0.0 --port 8765
+# or
+python -m ultra_ep.load_viewer --path <path/to/ultra_ep_traces> --host 0.0.0.0 --port 8765
+```
+
 ### Communication Planning
 
 - `ULTRA_EP_GRAD_REDUCE_NUM_SMS`  

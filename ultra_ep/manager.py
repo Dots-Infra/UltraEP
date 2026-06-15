@@ -6,7 +6,9 @@ import ultra_ep._C as _C
 from .config import load_tuning_from_env
 from .runtime import init_runtime
 from .event import EventHandle
+from .profiling import ExpertLoadProfiler, load_profile_config
 from .reroute import _DenseRerouteFunction
+from .util import profile_physical_loads_from_quota_triton
 
 
 class Manager:
@@ -23,7 +25,13 @@ class Manager:
         max_microbatches: int = 1,
         legacy_placement: bool = False,
     ):
-        # Initialize global nvshmem runtime (if not initialized)
+        self._load_profile_config = load_profile_config()
+        if self._load_profile_config.enabled and legacy_placement:
+            raise AssertionError(
+                "UltraEP load profiling is only supported by quota placement; "
+                "disable ULTRA_EP_LOAD_PROFILING or legacy_placement."
+            )
+
         self.nvl_domain_size = init_runtime(group)
 
         self.group = group
@@ -149,6 +157,25 @@ class Manager:
             self.local_replica_grad_buffer = None
 
         self.check_tensors_blob_from_cpp()
+        self._load_profiler = ExpertLoadProfiler(
+            config=self._load_profile_config,
+            group_rank=self.rank,
+            global_rank=dist.get_rank() if dist.is_initialized() else self.rank,
+            metadata={
+                "ep_group_id": f"{self.id:x}",
+                "ep_rank": self.rank,
+                "ep_size": self.num_ranks,
+                "num_layers": self.num_layers,
+                "max_microbatches": self.max_microbatches,
+                "num_local_master_experts": self.num_local_master_experts,
+                "num_local_redundant_experts": self.num_local_redundant_experts,
+                "num_local_physical_experts": self.num_local_physical_experts,
+                "num_global_logical_experts": self.num_global_logical_experts,
+                "num_global_physical_experts": self.num_global_physical_experts,
+                "nvl_domain_size": self.nvl_domain_size,
+                "placement_mode": self.reroute_mode,
+            },
+        )
 
     @property
     def physical_to_logical_map(self) -> torch.Tensor:
@@ -186,6 +213,7 @@ class Manager:
     def destroy(self):
         assert self.explicitly_destroy
 
+        self._load_profiler.close()
         if self.runtime is not None:
             self.runtime.destroy()
         self.runtime = None
@@ -212,6 +240,33 @@ class Manager:
     def _real_layer_id(self, virtual_layer_id: int) -> int:
         """Map a virtual layer ID back to the real layer ID."""
         return virtual_layer_id // self.max_microbatches
+
+    def _profile_physical_loads_from_quota(
+        self, layer_id: int, fused: bool = True
+    ) -> torch.Tensor:
+        l2p = self._logical_to_physical_map[layer_id]
+        quota = self._logical_instance_quota[layer_id]
+        if fused:
+            return profile_physical_loads_from_quota_triton(
+                self._physical_to_logical_map[layer_id],
+                l2p,
+                quota,
+            )
+
+        flat_l2p = l2p.reshape(-1)
+        flat_quota = quota.reshape(-1)
+        valid = flat_l2p >= 0
+        post_loads = torch.zeros(
+            (self.num_global_physical_experts,),
+            dtype=torch.int32,
+            device=quota.device,
+        )
+        post_loads.scatter_add_(
+            0,
+            flat_l2p.clamp_min(0),
+            torch.where(valid, flat_quota, torch.zeros_like(flat_quota)),
+        )
+        return post_loads
 
     def construct_local_master_ptr_pool(
         self,
@@ -375,6 +430,11 @@ class Manager:
         assert layer_id < self.num_alloc_layers
         with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
             self.runtime.update_placement(layer_id, routing_map)
+        self._load_profiler.stage_pre(
+            layer_id,
+            self._real_layer_id(layer_id),
+            self.runtime.get_global_logical_expert_loads_tensor(),
+        )
         if verify_reduced_loads:
             global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
             dist.all_reduce(global_logical_expert_loads, group=self.group)
@@ -390,6 +450,12 @@ class Manager:
     ):
         assert layer_id < self.num_alloc_layers
         self.runtime.update_placement_sparse(layer_id, topk_ids)
+        with torch.cuda.stream(self.get_comm_stream()):
+            self._load_profiler.stage_pre(
+                layer_id,
+                self._real_layer_id(layer_id),
+                self.runtime.get_global_logical_expert_loads_tensor(),
+            )
 
     def reroute(
         self,
@@ -423,6 +489,10 @@ class Manager:
         expanded_probs, expanded_routing_map = self._dense_reroute(
             layer_id, probs, routing_map
         )
+        if self._load_profiler.has_staged(layer_id):
+            self._load_profiler.record_post(
+                layer_id, self._profile_physical_loads_from_quota(layer_id)
+            )
 
         return expanded_probs, expanded_routing_map
 
@@ -456,6 +526,10 @@ class Manager:
         assert layer_id < self.num_alloc_layers
 
         self.runtime.reroute_sparse(layer_id, topk_ids)
+        if self._load_profiler.has_staged(layer_id):
+            self._load_profiler.record_post(
+                layer_id, self._profile_physical_loads_from_quota(layer_id)
+            )
 
     def check_tensors_blob_from_cpp(self):
         assert (
