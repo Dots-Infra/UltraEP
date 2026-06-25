@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -100,14 +99,14 @@ enum class WeightSyncPlanMode : int32_t {
 // A broadcast task from one master to multiple replicas
 // This structure enables loading SMEM once and TMA storing to multiple destinations
 struct WeightSyncTask {
-    __nv_bfloat16* master_local_addr;                            // Source: local master weight
-    __nv_bfloat16* replica_remote_addrs[kMaxNvlDomainSize - 1];  // Destinations: replica addresses
-    int num_replicas;                                            // Number of replicas (1 to kMaxNvlDomainSize-1)
-    size_t numel;                                                // Number of elements
-    int wait_ready_slot;                                         // Local relay-ready flag slot, -1 if no wait
-    int num_ready_signals;                                       // Number of remote relay-ready flags to set
-    int ready_signal_slots[kMaxNvlDomainSize - 1];               // Symmetric ready-flag slot per relay
-    int ready_signal_nvl_ranks[kMaxNvlDomainSize - 1];           // Target NVL-domain rank slot per relay-ready signal
+    const uint8_t* master_local_addr;                      // Source: local master weight/scale bytes
+    uint8_t* replica_remote_addrs[kMaxNvlDomainSize - 1];  // Destinations: replica byte addresses
+    int num_replicas;                                      // Number of replicas (1 to kMaxNvlDomainSize-1)
+    size_t num_bytes;                                      // Number of bytes to copy
+    int wait_ready_slot;                                   // Local relay-ready flag slot, -1 if no wait
+    int num_ready_signals;                                 // Number of remote relay-ready flags to set
+    int ready_signal_slots[kMaxNvlDomainSize - 1];         // Symmetric ready-flag slot per relay
+    int ready_signal_nvl_ranks[kMaxNvlDomainSize - 1];     // Target NVL-domain rank slot per relay-ready signal
 };
 
 // Run weight sync using the device-resident task list produced by the task-build kernel.
@@ -140,6 +139,15 @@ struct TaskBuildConfig {
     int64_t expert_fc1_numel;
     int64_t expert_fc2_numel;
     int64_t expert_total_numel;
+    int64_t expert_fc1_weight_scale_numel;
+    int64_t expert_fc2_weight_scale_numel;
+    int64_t expert_weight_scale_total_numel;
+    int64_t expert_fc1_weight_scale_bytes;
+    int64_t expert_fc2_weight_scale_bytes;
+    int64_t expert_weight_scale_fc2_offset_bytes;
+    int64_t expert_weight_scale_stride_bytes;
+    int weight_data_element_bytes;
+    int weight_scale_element_bytes;
     int max_replicas_dim;
     int weight_sync_plan_mode;
     int weight_sync_relay_min_replicas;
@@ -155,9 +163,13 @@ void build_weight_sync_task_lists(const TaskBuildConfig* config,
                                   const int32_t* logical_to_physical_map,
                                   const int32_t* logical_replica_counts,
                                   void* const* remote_weight_ptrs,
+                                  void* const* remote_weight_scale_ptrs,
                                   const int64_t* local_master_fc1_ptrs,
                                   const int64_t* local_master_fc2_ptrs,
-                                  __nv_bfloat16* local_replica_weight_buffer,
+                                  const int64_t* local_master_fc1_scale_ptrs,
+                                  const int64_t* local_master_fc2_scale_ptrs,
+                                  uint8_t* local_replica_weight_buffer,
+                                  uint8_t* local_replica_weight_scale_buffer,
                                   WeightSyncTask* stage1_tasks,
                                   int* stage1_task_tile_offsets,
                                   int* stage1_task_metadata,
@@ -315,11 +327,11 @@ static __host__ __device__ __forceinline__ int ceil_div(const int a, const int b
 static __host__ __device__ __forceinline__ int64_t ceil_div(const int64_t a, const int64_t b) {
     return static_cast<int>((a + b - 1) / b);
 }
-static __host__ __device__ __forceinline__ int weight_sync_num_tiles(const size_t numel) {
-    return static_cast<int>((numel + kWeightSyncTileElements - 1) / kWeightSyncTileElements);
+static __host__ __device__ __forceinline__ int weight_sync_num_tiles(const size_t num_bytes) {
+    return static_cast<int>((num_bytes + kWeightSyncTileSizeBytes - 1) / kWeightSyncTileSizeBytes);
 }
-static __host__ __device__ __forceinline__ int weight_sync_num_chunks(const size_t numel) {
-    return ceil_div(weight_sync_num_tiles(numel), kWeightSyncRelayChunkTiles);
+static __host__ __device__ __forceinline__ int weight_sync_num_chunks(const size_t num_bytes) {
+    return ceil_div(weight_sync_num_tiles(num_bytes), kWeightSyncRelayChunkTiles);
 }
 
 }  // namespace ultra_ep::kernels

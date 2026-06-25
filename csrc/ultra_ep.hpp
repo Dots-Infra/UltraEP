@@ -99,6 +99,15 @@ class Manager {
     int num_local_physical_experts;
     int64_t expert_fc1_numel, expert_fc2_numel;
     int64_t expert_total_numel;
+    int64_t expert_fc1_weight_scale_numel, expert_fc2_weight_scale_numel;
+    int64_t expert_weight_scale_total_numel;
+    int64_t expert_fc1_weight_scale_bytes = 0;
+    int64_t expert_fc2_weight_scale_bytes = 0;
+    int64_t expert_weight_scale_fc2_offset_bytes = 0;
+    int64_t expert_weight_scale_stride_bytes = 0;
+    int weight_data_element_bytes;
+    int weight_scale_element_bytes;
+    int grad_element_bytes;
     int num_global_physical_experts;
     int num_global_logical_experts;
     bool is_train;
@@ -120,17 +129,25 @@ class Manager {
     std::vector<std::optional<EventHandle>> placement_ready_events_;
     std::vector<int64_t> placement_ready_stream_ids_;
 
-    // Device-side local replica weight (bf16)/grad (fp32) buffers, shared by layers
-    // Allocated via NVSHMEM symmetric heap for cross-GPU access
-    // Shape (before flattened): [num_local_redundant_experts, expert_total_numel]
+    // Device-side local replica weight data/scale and grad buffers, shared by layers.
+    // Allocated via NVSHMEM symmetric heap for cross-GPU access.
     void* local_replica_weight_buffer = nullptr;
+    void* local_replica_weight_scale_buffer = nullptr;
     void* local_replica_grad_buffer = nullptr;
     torch::Tensor local_replica_weight_buffer_tensor;
+    torch::Tensor local_replica_fc1_weight_buffer_tensor;
+    torch::Tensor local_replica_fc2_weight_buffer_tensor;
+    torch::Tensor local_replica_weight_scale_buffer_tensor;
+    torch::Tensor local_replica_fc1_weight_scale_buffer_tensor;
+    torch::Tensor local_replica_fc2_weight_scale_buffer_tensor;
     torch::Tensor local_replica_grad_buffer_tensor;
+    torch::Tensor local_replica_fc1_grad_buffer_tensor;
+    torch::Tensor local_replica_fc2_grad_buffer_tensor;
 
     // Host-side remote memory pointers obtained via nvshmem_ptr() for NVL ranks
     // Shape: [num_nvl_ranks,]
     void* global_replica_weight_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
+    void* global_replica_weight_scale_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
     void* global_replica_grad_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
     uint64_t* global_weight_sync_ready_flag_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
 
@@ -157,6 +174,7 @@ class Manager {
     // Device task-build support: config + remote pointer tables.
     kernels::TaskBuildConfig* _task_build_config = nullptr;
     void** _remote_weight_ptrs = nullptr;          // [kMaxNvlDomainSize]
+    void** _remote_weight_scale_ptrs = nullptr;    // [kMaxNvlDomainSize]
     void** _remote_grad_ptrs = nullptr;            // [kMaxNvlDomainSize]
     uint64_t** _remote_ready_flag_ptrs = nullptr;  // [kMaxNvlDomainSize]
     // Pre-computed upper bounds for device-path grid sizing
@@ -196,6 +214,11 @@ public:
             const int& num_local_redundant_experts,
             const int64_t& expert_fc1_numel,
             const int64_t& expert_fc2_numel,
+            const int& weight_data_element_bytes,
+            const int& weight_scale_element_bytes,
+            const int64_t& expert_fc1_weight_scale_numel,
+            const int64_t& expert_fc2_weight_scale_numel,
+            const int& grad_element_bytes,
             const bool& is_train,
             const bool& explicitly_destroy,
             const bool& legacy_placement = false,
@@ -233,6 +256,8 @@ public:
     std::optional<EventHandle> weight_sync(const int& layer_id,
                                            torch::Tensor& local_master_fc1_weight_ptr_tensor,
                                            torch::Tensor& local_master_fc2_weight_ptr_tensor,
+                                           torch::Tensor& local_master_fc1_weight_scale_ptr_tensor,
+                                           torch::Tensor& local_master_fc2_weight_scale_ptr_tensor,
                                            std::optional<EventHandle>& previous_event,
                                            bool async);
 
@@ -263,9 +288,28 @@ public:
     void set_grad_reduce_deterministic(const bool& deterministic, const int& grad_reduce_num_sms);
 
     torch::Tensor get_local_replica_weight_buffer_tensor() const { return local_replica_weight_buffer_tensor; }
+    torch::Tensor get_local_replica_fc1_weight_buffer_tensor() const { return local_replica_fc1_weight_buffer_tensor; }
+    torch::Tensor get_local_replica_fc2_weight_buffer_tensor() const { return local_replica_fc2_weight_buffer_tensor; }
+    torch::Tensor get_local_replica_weight_scale_buffer_tensor() const {
+        return local_replica_weight_scale_buffer_tensor;
+    }
+    torch::Tensor get_local_replica_fc1_weight_scale_buffer_tensor() const {
+        return local_replica_fc1_weight_scale_buffer_tensor;
+    }
+    torch::Tensor get_local_replica_fc2_weight_scale_buffer_tensor() const {
+        return local_replica_fc2_weight_scale_buffer_tensor;
+    }
     torch::Tensor get_local_replica_grad_buffer_tensor() const {
         EP_HOST_ASSERT(is_train && "Grad buffer not available in inference mode");
         return local_replica_grad_buffer_tensor;
+    }
+    torch::Tensor get_local_replica_fc1_grad_buffer_tensor() const {
+        EP_HOST_ASSERT(is_train && "Grad buffer not available in inference mode");
+        return local_replica_fc1_grad_buffer_tensor;
+    }
+    torch::Tensor get_local_replica_fc2_grad_buffer_tensor() const {
+        EP_HOST_ASSERT(is_train && "Grad buffer not available in inference mode");
+        return local_replica_fc2_grad_buffer_tensor;
     }
     torch::Tensor get_physical_to_logical_map_tensor() const { return placement.physical_to_logical_map; }
     torch::Tensor get_logical_to_physical_map_tensor() const { return placement.logical_to_physical_map; }
@@ -288,6 +332,11 @@ static void register_apis(pybind11::module_& m) {
                             int,
                             int64_t,
                             int64_t,
+                            int,
+                            int,
+                            int64_t,
+                            int64_t,
+                            int,
                             bool,
                             bool,
                             bool,
@@ -309,6 +358,11 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("num_local_redundant_experts"),
              pybind11::arg("expert_fc1_numel"),
              pybind11::arg("expert_fc2_numel"),
+             pybind11::arg("weight_data_element_bytes"),
+             pybind11::arg("weight_scale_element_bytes"),
+             pybind11::arg("expert_fc1_weight_scale_numel"),
+             pybind11::arg("expert_fc2_weight_scale_numel"),
+             pybind11::arg("grad_element_bytes"),
              pybind11::arg("is_train"),
              pybind11::arg("explicitly_destroy"),
              pybind11::arg("legacy_placement") = false,
@@ -339,12 +393,29 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("local_master_fc2_grad_ptr_tensor"),
              pybind11::arg("previous_event"),
              pybind11::arg("async_finish"))
-        .def("weight_sync", &Manager::weight_sync)
+        .def("weight_sync",
+             &Manager::weight_sync,
+             pybind11::arg("layer_id"),
+             pybind11::arg("local_master_fc1_weight_ptr_tensor"),
+             pybind11::arg("local_master_fc2_weight_ptr_tensor"),
+             pybind11::arg("local_master_fc1_weight_scale_ptr_tensor"),
+             pybind11::arg("local_master_fc2_weight_scale_ptr_tensor"),
+             pybind11::arg("previous_event"),
+             pybind11::arg("async_finish"))
         .def("set_weight_sync_plan_mode", &Manager::set_weight_sync_plan_mode)
         .def("set_grad_reduce_deterministic", &Manager::set_grad_reduce_deterministic)
         .def("get_comm_stream", &Manager::get_comm_stream)
         .def("get_local_replica_weight_buffer_tensor", &Manager::get_local_replica_weight_buffer_tensor)
+        .def("get_local_replica_fc1_weight_buffer_tensor", &Manager::get_local_replica_fc1_weight_buffer_tensor)
+        .def("get_local_replica_fc2_weight_buffer_tensor", &Manager::get_local_replica_fc2_weight_buffer_tensor)
+        .def("get_local_replica_weight_scale_buffer_tensor", &Manager::get_local_replica_weight_scale_buffer_tensor)
+        .def("get_local_replica_fc1_weight_scale_buffer_tensor",
+             &Manager::get_local_replica_fc1_weight_scale_buffer_tensor)
+        .def("get_local_replica_fc2_weight_scale_buffer_tensor",
+             &Manager::get_local_replica_fc2_weight_scale_buffer_tensor)
         .def("get_local_replica_grad_buffer_tensor", &Manager::get_local_replica_grad_buffer_tensor)
+        .def("get_local_replica_fc1_grad_buffer_tensor", &Manager::get_local_replica_fc1_grad_buffer_tensor)
+        .def("get_local_replica_fc2_grad_buffer_tensor", &Manager::get_local_replica_fc2_grad_buffer_tensor)
         .def("get_physical_to_logical_map_tensor", &Manager::get_physical_to_logical_map_tensor)
         .def("get_logical_to_physical_map_tensor", &Manager::get_logical_to_physical_map_tensor)
         .def("get_logical_replica_counts_tensor", &Manager::get_logical_replica_counts_tensor)

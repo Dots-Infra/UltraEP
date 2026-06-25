@@ -10,19 +10,19 @@ namespace ultra_ep::kernels {
 static constexpr int kWeightSyncThreadCopyMaxNvlRanks = 8;
 static constexpr int kWeightSyncThreadCopyCtaMultiplier = 4;
 
-static __host__ __device__ __forceinline__ size_t weight_sync_chunk_offset_elements(const int chunk_idx) {
-    return static_cast<size_t>(chunk_idx) * kWeightSyncRelayChunkTiles * kWeightSyncTileElements;
+static __host__ __device__ __forceinline__ size_t weight_sync_chunk_offset_bytes(const int chunk_idx) {
+    return static_cast<size_t>(chunk_idx) * kWeightSyncRelayChunkTiles * kWeightSyncTileSizeBytes;
 }
 
-static __host__ __device__ __forceinline__ size_t weight_sync_chunk_numel(const size_t total_numel,
-                                                                          const int chunk_idx) {
-    const size_t chunk_offset = weight_sync_chunk_offset_elements(chunk_idx);
-    if (chunk_offset >= total_numel) {
+static __host__ __device__ __forceinline__ size_t weight_sync_chunk_num_bytes(const size_t total_bytes,
+                                                                              const int chunk_idx) {
+    const size_t chunk_offset = weight_sync_chunk_offset_bytes(chunk_idx);
+    if (chunk_offset >= total_bytes) {
         return 0;
     }
 
-    const size_t chunk_capacity = static_cast<size_t>(kWeightSyncRelayChunkTiles) * kWeightSyncTileElements;
-    const size_t remaining = total_numel - chunk_offset;
+    const size_t chunk_capacity = static_cast<size_t>(kWeightSyncRelayChunkTiles) * kWeightSyncTileSizeBytes;
+    const size_t remaining = total_bytes - chunk_offset;
     return remaining < chunk_capacity ? remaining : chunk_capacity;
 }
 
@@ -32,6 +32,98 @@ static __host__ __device__ __forceinline__ int floor_sqrt_int(const int x) {
         ++root;
     }
     return root;
+}
+
+static __host__ __device__ __forceinline__ int weight_sync_num_shards(const TaskBuildConfig& config) {
+    return config.expert_weight_scale_total_numel > 0 ? 4 : 2;
+}
+
+static __host__ __device__ __forceinline__ size_t weight_sync_shard_num_bytes(const TaskBuildConfig& config,
+                                                                              const int shard_idx) {
+    if (shard_idx == 0) {
+        return static_cast<size_t>(config.expert_fc1_numel) * config.weight_data_element_bytes;
+    }
+    if (shard_idx == 1) {
+        return static_cast<size_t>(config.expert_fc2_numel) * config.weight_data_element_bytes;
+    }
+    if (shard_idx == 2) {
+        return static_cast<size_t>(config.expert_fc1_weight_scale_bytes);
+    }
+    return static_cast<size_t>(config.expert_fc2_weight_scale_bytes);
+}
+
+static __host__ __device__ __forceinline__ size_t weight_sync_shard_offset_bytes(const TaskBuildConfig& config,
+                                                                                 const int shard_idx) {
+    if (shard_idx == 0 || shard_idx == 2) {
+        return 0;
+    }
+    if (shard_idx == 1) {
+        return static_cast<size_t>(config.expert_fc1_numel) * config.weight_data_element_bytes;
+    }
+    return static_cast<size_t>(config.expert_weight_scale_fc2_offset_bytes);
+}
+
+static __host__ __device__ __forceinline__ size_t weight_sync_expert_buffer_bytes(const TaskBuildConfig& config,
+                                                                                  const bool scale_shard) {
+    if (scale_shard) {
+        return static_cast<size_t>(config.expert_weight_scale_stride_bytes);
+    }
+    return static_cast<size_t>(config.expert_total_numel) * config.weight_data_element_bytes;
+}
+
+static __host__ __device__ __forceinline__ size_t weight_sync_expert_total_bytes(const TaskBuildConfig& config) {
+    size_t total = 0;
+    const int num_shards = weight_sync_num_shards(config);
+    for (int shard_idx = 0; shard_idx < num_shards; ++shard_idx) {
+        total += weight_sync_shard_num_bytes(config, shard_idx);
+    }
+    return total;
+}
+
+static __device__ __forceinline__ const uint8_t* weight_sync_local_master_addr(
+    const int64_t* __restrict__ local_master_fc1_ptrs,
+    const int64_t* __restrict__ local_master_fc2_ptrs,
+    const int64_t* __restrict__ local_master_fc1_scale_ptrs,
+    const int64_t* __restrict__ local_master_fc2_scale_ptrs,
+    const int local_master_idx,
+    const int shard_idx) {
+    if (shard_idx == 0) {
+        return reinterpret_cast<const uint8_t*>(local_master_fc1_ptrs[local_master_idx]);
+    }
+    if (shard_idx == 1) {
+        return reinterpret_cast<const uint8_t*>(local_master_fc2_ptrs[local_master_idx]);
+    }
+    if (shard_idx == 2) {
+        return reinterpret_cast<const uint8_t*>(local_master_fc1_scale_ptrs[local_master_idx]);
+    }
+    return reinterpret_cast<const uint8_t*>(local_master_fc2_scale_ptrs[local_master_idx]);
+}
+
+static __device__ __forceinline__ uint8_t* weight_sync_remote_shard_addr(const TaskBuildConfig& config,
+                                                                         void* const* __restrict__ remote_weight_ptrs,
+                                                                         void* const* __restrict__ remote_scale_ptrs,
+                                                                         const int replica_nvl_rank,
+                                                                         const int replica_local_offset,
+                                                                         const int shard_idx) {
+    const bool scale_shard = shard_idx >= 2;
+    void* const* remote_ptrs = scale_shard ? remote_scale_ptrs : remote_weight_ptrs;
+    uint8_t* remote_buf = reinterpret_cast<uint8_t*>(remote_ptrs[replica_nvl_rank]);
+    return remote_buf +
+        static_cast<size_t>(replica_local_offset) * weight_sync_expert_buffer_bytes(config, scale_shard) +
+        weight_sync_shard_offset_bytes(config, shard_idx);
+}
+
+static __device__ __forceinline__ uint8_t* weight_sync_local_replica_shard_addr(
+    const TaskBuildConfig& config,
+    uint8_t* __restrict__ local_replica_weight_buffer,
+    uint8_t* __restrict__ local_replica_weight_scale_buffer,
+    const int replica_local_offset,
+    const int shard_idx) {
+    const bool scale_shard = shard_idx >= 2;
+    uint8_t* local_buf = scale_shard ? local_replica_weight_scale_buffer : local_replica_weight_buffer;
+    return local_buf +
+        static_cast<size_t>(replica_local_offset) * weight_sync_expert_buffer_bytes(config, scale_shard) +
+        weight_sync_shard_offset_bytes(config, shard_idx);
 }
 
 static __host__ __device__ __forceinline__ int choose_weight_sync_relay_count(const int num_replicas,
@@ -54,16 +146,22 @@ static __host__ __device__ __forceinline__ int choose_weight_sync_relay_count(co
 }
 
 static __host__ __device__ __forceinline__ int max_weight_sync_relay_chunks_per_shard(const TaskBuildConfig& config) {
-    const size_t max_numel = static_cast<size_t>(
-        config.expert_fc1_numel > config.expert_fc2_numel ? config.expert_fc1_numel : config.expert_fc2_numel);
-    return weight_sync_num_chunks(max_numel);
+    size_t max_bytes = 0;
+    const int num_shards = weight_sync_num_shards(config);
+    for (int shard_idx = 0; shard_idx < num_shards; ++shard_idx) {
+        const size_t shard_bytes = weight_sync_shard_num_bytes(config, shard_idx);
+        max_bytes = max_bytes > shard_bytes ? max_bytes : shard_bytes;
+    }
+    return weight_sync_num_chunks(max_bytes);
 }
 
 static __host__ __device__ __forceinline__ int weight_sync_ready_flag_slot(const TaskBuildConfig& config,
                                                                            const int local_replica_offset,
                                                                            const int shard_idx,
                                                                            const int chunk_idx) {
-    return ((local_replica_offset * 2 + shard_idx) * max_weight_sync_relay_chunks_per_shard(config)) + chunk_idx;
+    return ((local_replica_offset * weight_sync_num_shards(config) + shard_idx) *
+            max_weight_sync_relay_chunks_per_shard(config)) +
+        chunk_idx;
 }
 
 static __host__ __device__ __forceinline__ bool should_use_weight_sync_relay(const int num_replicas,
@@ -99,7 +197,7 @@ static __host__ __device__ __forceinline__ bool should_use_weight_sync_relay(con
 static __device__ __forceinline__ void init_weight_sync_task(WeightSyncTask& task) {
     task.master_local_addr = nullptr;
     task.num_replicas = 0;
-    task.numel = 0;
+    task.num_bytes = 0;
     task.wait_ready_slot = -1;
     task.num_ready_signals = 0;
 }
@@ -110,9 +208,13 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
     const int32_t* __restrict__ l2p,
     const int32_t* __restrict__ lcnts,
     void* const* __restrict__ remote_weight_ptrs,
+    void* const* __restrict__ remote_weight_scale_ptrs,
     const int64_t* __restrict__ local_master_fc1_ptrs,
     const int64_t* __restrict__ local_master_fc2_ptrs,
-    __nv_bfloat16* __restrict__ local_replica_weight_buffer,
+    const int64_t* __restrict__ local_master_fc1_scale_ptrs,
+    const int64_t* __restrict__ local_master_fc2_scale_ptrs,
+    uint8_t* __restrict__ local_replica_weight_buffer,
+    uint8_t* __restrict__ local_replica_weight_scale_buffer,
     WeightSyncTask* __restrict__ stage1_tasks,
     int* __restrict__ stage1_tile_offsets,
     int* __restrict__ stage1_task_metadata,
@@ -129,17 +231,9 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
     const int num_nvl_ranks = config->num_nvl_ranks;
     const int num_local_master = config->num_local_master_experts;
     const int num_local_physical = config->num_local_physical_experts;
-    const int64_t total_numel = config->expert_total_numel;
     const int max_rep_dim = config->max_replicas_dim;
-    const int64_t weight_bytes_per_expert = config->expert_total_numel * kWeightElementBytes;
-    const size_t shard_numels[2] = {
-        static_cast<size_t>(config->expert_fc1_numel),
-        static_cast<size_t>(config->expert_fc2_numel),
-    };
-    const size_t shard_offsets[2] = {
-        0,
-        static_cast<size_t>(config->expert_fc1_numel),
-    };
+    const int num_weight_shards = weight_sync_num_shards(*config);
+    const int64_t weight_bytes_per_expert = static_cast<int64_t>(weight_sync_expert_total_bytes(*config));
 
     int64_t sender_load_bytes[kMaxNvlDomainSize] = {0};
     int stage1_num_tasks = 0;
@@ -163,16 +257,21 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
             if (!use_relay) {
                 sender_load_bytes[domain_nvl_rank] += static_cast<int64_t>(num_replicas) * weight_bytes_per_expert;
                 if (master_rank == rank_idx) {
-                    __nv_bfloat16* local_master_addrs[2] = {
-                        reinterpret_cast<__nv_bfloat16*>(local_master_fc1_ptrs[local_master_idx]),
-                        reinterpret_cast<__nv_bfloat16*>(local_master_fc2_ptrs[local_master_idx]),
-                    };
-                    for (int shard_idx = 0; shard_idx < 2; ++shard_idx) {
+                    for (int shard_idx = 0; shard_idx < num_weight_shards; ++shard_idx) {
+                        const size_t shard_bytes = weight_sync_shard_num_bytes(*config, shard_idx);
+                        if (shard_bytes == 0) {
+                            continue;
+                        }
                         WeightSyncTask& task = stage1_tasks[stage1_num_tasks++];
                         init_weight_sync_task(task);
-                        task.master_local_addr = local_master_addrs[shard_idx];
+                        task.master_local_addr = weight_sync_local_master_addr(local_master_fc1_ptrs,
+                                                                               local_master_fc2_ptrs,
+                                                                               local_master_fc1_scale_ptrs,
+                                                                               local_master_fc2_scale_ptrs,
+                                                                               local_master_idx,
+                                                                               shard_idx);
                         task.num_replicas = num_replicas;
-                        task.numel = shard_numels[shard_idx];
+                        task.num_bytes = shard_bytes;
 
                         for (int replica_idx = 0; replica_idx < num_replicas; ++replica_idx) {
                             const int replica_phy = l2p[logical_expert * max_rep_dim + replica_idx + 1];
@@ -180,11 +279,13 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
                             const int replica_nvl_rank = replica_rank % num_nvl_ranks;
                             const int replica_local_offset = replica_phy % num_local_physical - num_local_master;
 
-                            __nv_bfloat16* remote_buf =
-                                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank]);
-                            __nv_bfloat16* remote_expert_base =
-                                remote_buf + replica_local_offset * total_numel + shard_offsets[shard_idx];
-                            task.replica_remote_addrs[replica_idx] = remote_expert_base;
+                            task.replica_remote_addrs[replica_idx] =
+                                weight_sync_remote_shard_addr(*config,
+                                                              remote_weight_ptrs,
+                                                              remote_weight_scale_ptrs,
+                                                              replica_nvl_rank,
+                                                              replica_local_offset,
+                                                              shard_idx);
                         }
                     }
                 }
@@ -314,28 +415,35 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
             }
 
             if (master_rank == rank_idx) {
-                __nv_bfloat16* local_master_addrs[2] = {
-                    reinterpret_cast<__nv_bfloat16*>(local_master_fc1_ptrs[local_master_idx]),
-                    reinterpret_cast<__nv_bfloat16*>(local_master_fc2_ptrs[local_master_idx]),
-                };
-                for (int shard_idx = 0; shard_idx < 2; ++shard_idx) {
-                    const int num_chunks = weight_sync_num_chunks(shard_numels[shard_idx]);
+                for (int shard_idx = 0; shard_idx < num_weight_shards; ++shard_idx) {
+                    const size_t shard_bytes = weight_sync_shard_num_bytes(*config, shard_idx);
+                    if (shard_bytes == 0) {
+                        continue;
+                    }
+                    const int num_chunks = weight_sync_num_chunks(shard_bytes);
                     for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
                         WeightSyncTask& task = stage1_tasks[stage1_num_tasks++];
                         init_weight_sync_task(task);
-                        task.master_local_addr =
-                            local_master_addrs[shard_idx] + weight_sync_chunk_offset_elements(chunk_idx);
+                        task.master_local_addr = weight_sync_local_master_addr(local_master_fc1_ptrs,
+                                                                               local_master_fc2_ptrs,
+                                                                               local_master_fc1_scale_ptrs,
+                                                                               local_master_fc2_scale_ptrs,
+                                                                               local_master_idx,
+                                                                               shard_idx) +
+                            weight_sync_chunk_offset_bytes(chunk_idx);
                         task.num_replicas = relay_count;
-                        task.numel = weight_sync_chunk_numel(shard_numels[shard_idx], chunk_idx);
+                        task.num_bytes = weight_sync_chunk_num_bytes(shard_bytes, chunk_idx);
                         task.num_ready_signals = relay_count;
 
                         for (int relay_idx = 0; relay_idx < relay_count; ++relay_idx) {
-                            __nv_bfloat16* remote_buf =
-                                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[relay_nvl_ranks[relay_idx]]);
-                            __nv_bfloat16* remote_expert_base =
-                                remote_buf + relay_local_offsets[relay_idx] * total_numel + shard_offsets[shard_idx];
+                            uint8_t* remote_expert_base = weight_sync_remote_shard_addr(*config,
+                                                                                        remote_weight_ptrs,
+                                                                                        remote_weight_scale_ptrs,
+                                                                                        relay_nvl_ranks[relay_idx],
+                                                                                        relay_local_offsets[relay_idx],
+                                                                                        shard_idx);
                             task.replica_remote_addrs[relay_idx] =
-                                remote_expert_base + weight_sync_chunk_offset_elements(chunk_idx);
+                                remote_expert_base + weight_sync_chunk_offset_bytes(chunk_idx);
                             task.ready_signal_slots[relay_idx] = weight_sync_ready_flag_slot(
                                 *config, relay_local_offsets[relay_idx], shard_idx, chunk_idx);
                             task.ready_signal_nvl_ranks[relay_idx] = relay_nvl_ranks[relay_idx];
@@ -349,17 +457,23 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
                     continue;
                 }
 
-                __nv_bfloat16* local_relay_base =
-                    local_replica_weight_buffer + relay_local_offsets[relay_idx] * total_numel;
-                for (int shard_idx = 0; shard_idx < 2; ++shard_idx) {
-                    const int num_chunks = weight_sync_num_chunks(shard_numels[shard_idx]);
+                for (int shard_idx = 0; shard_idx < num_weight_shards; ++shard_idx) {
+                    const size_t shard_bytes = weight_sync_shard_num_bytes(*config, shard_idx);
+                    if (shard_bytes == 0) {
+                        continue;
+                    }
+                    uint8_t* local_relay_base = weight_sync_local_replica_shard_addr(*config,
+                                                                                     local_replica_weight_buffer,
+                                                                                     local_replica_weight_scale_buffer,
+                                                                                     relay_local_offsets[relay_idx],
+                                                                                     shard_idx);
+                    const int num_chunks = weight_sync_num_chunks(shard_bytes);
                     for (int chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
                         WeightSyncTask& task = stage2_tasks[stage2_num_tasks++];
                         init_weight_sync_task(task);
-                        task.master_local_addr =
-                            local_relay_base + shard_offsets[shard_idx] + weight_sync_chunk_offset_elements(chunk_idx);
+                        task.master_local_addr = local_relay_base + weight_sync_chunk_offset_bytes(chunk_idx);
                         task.num_replicas = relay_child_counts[relay_idx];
-                        task.numel = weight_sync_chunk_numel(shard_numels[shard_idx], chunk_idx);
+                        task.num_bytes = weight_sync_chunk_num_bytes(shard_bytes, chunk_idx);
                         task.wait_ready_slot =
                             weight_sync_ready_flag_slot(*config, relay_local_offsets[relay_idx], shard_idx, chunk_idx);
 
@@ -374,12 +488,14 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
                             const int replica_nvl_rank = replica_rank % num_nvl_ranks;
                             const int replica_local_offset = replica_phy % num_local_physical - num_local_master;
 
-                            __nv_bfloat16* remote_buf =
-                                reinterpret_cast<__nv_bfloat16*>(remote_weight_ptrs[replica_nvl_rank]);
-                            __nv_bfloat16* remote_expert_base =
-                                remote_buf + replica_local_offset * total_numel + shard_offsets[shard_idx];
+                            uint8_t* remote_expert_base = weight_sync_remote_shard_addr(*config,
+                                                                                        remote_weight_ptrs,
+                                                                                        remote_weight_scale_ptrs,
+                                                                                        replica_nvl_rank,
+                                                                                        replica_local_offset,
+                                                                                        shard_idx);
                             task.replica_remote_addrs[child_idx++] =
-                                remote_expert_base + weight_sync_chunk_offset_elements(chunk_idx);
+                                remote_expert_base + weight_sync_chunk_offset_bytes(chunk_idx);
                         }
                     }
                 }
@@ -389,7 +505,7 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
 
     stage1_tile_offsets[0] = 0;
     for (int task_idx = 0; task_idx < stage1_num_tasks; ++task_idx) {
-        const int num_tiles = weight_sync_num_tiles(stage1_tasks[task_idx].numel);
+        const int num_tiles = weight_sync_num_tiles(stage1_tasks[task_idx].num_bytes);
         stage1_tile_offsets[task_idx + 1] = stage1_tile_offsets[task_idx] + num_tiles;
         stage1_remaining_tiles[task_idx] = num_tiles;
     }
@@ -398,7 +514,7 @@ __global__ __launch_bounds__(32) void build_weight_sync_task_lists_kernel(
 
     stage2_tile_offsets[0] = 0;
     for (int task_idx = 0; task_idx < stage2_num_tasks; ++task_idx) {
-        const int num_tiles = weight_sync_num_tiles(stage2_tasks[task_idx].numel);
+        const int num_tiles = weight_sync_num_tiles(stage2_tasks[task_idx].num_bytes);
         stage2_tile_offsets[task_idx + 1] = stage2_tile_offsets[task_idx] + num_tiles;
     }
     stage2_task_metadata[0] = stage2_num_tasks;
@@ -410,9 +526,13 @@ void build_weight_sync_task_lists(const TaskBuildConfig* config,
                                   const int32_t* logical_to_physical_map,
                                   const int32_t* logical_replica_counts,
                                   void* const* remote_weight_ptrs,
+                                  void* const* remote_weight_scale_ptrs,
                                   const int64_t* local_master_fc1_ptrs,
                                   const int64_t* local_master_fc2_ptrs,
-                                  __nv_bfloat16* local_replica_weight_buffer,
+                                  const int64_t* local_master_fc1_scale_ptrs,
+                                  const int64_t* local_master_fc2_scale_ptrs,
+                                  uint8_t* local_replica_weight_buffer,
+                                  uint8_t* local_replica_weight_scale_buffer,
                                   WeightSyncTask* stage1_tasks,
                                   int* stage1_task_tile_offsets,
                                   int* stage1_task_metadata,
@@ -431,9 +551,13 @@ void build_weight_sync_task_lists(const TaskBuildConfig* config,
                   logical_to_physical_map,
                   logical_replica_counts,
                   remote_weight_ptrs,
+                  remote_weight_scale_ptrs,
                   local_master_fc1_ptrs,
                   local_master_fc2_ptrs,
+                  local_master_fc1_scale_ptrs,
+                  local_master_fc2_scale_ptrs,
                   local_replica_weight_buffer,
+                  local_replica_weight_scale_buffer,
                   stage1_tasks,
                   stage1_task_tile_offsets,
                   stage1_task_metadata,
@@ -478,8 +602,8 @@ void build_weight_sync_task_lists(const TaskBuildConfig* config,
 struct WeightSyncTileInfo {
     int task_idx;
     int tile_idx_in_task;
-    size_t element_offset;
-    int num_elements;
+    size_t byte_offset;
+    int num_bytes;
 };
 
 // Map a global tile index to task and tile within task
@@ -502,12 +626,11 @@ __device__ __forceinline__ WeightSyncTileInfo get_weight_sync_tile_info(const We
 
     info.task_idx = lo;
     info.tile_idx_in_task = global_tile_idx - task_tile_offsets[lo];
-    info.element_offset = static_cast<size_t>(info.tile_idx_in_task) * kWeightSyncTileElements;
+    info.byte_offset = static_cast<size_t>(info.tile_idx_in_task) * kWeightSyncTileSizeBytes;
 
-    // Compute number of elements in this tile
-    size_t task_numel = tasks[info.task_idx].numel;
-    size_t remaining = task_numel - info.element_offset;
-    info.num_elements = min(static_cast<size_t>(kWeightSyncTileElements), remaining);
+    const size_t task_bytes = tasks[info.task_idx].num_bytes;
+    const size_t remaining = task_bytes - info.byte_offset;
+    info.num_bytes = min(static_cast<size_t>(kWeightSyncTileSizeBytes), remaining);
 
     return info;
 }
@@ -553,26 +676,38 @@ __device__ __forceinline__ void wait_for_weight_sync_task_ready(const WeightSync
     __threadfence_system();
 }
 
-__device__ __forceinline__ void copy_weight_sync_tile_threaded(const __nv_bfloat16* __restrict__ src,
-                                                               __nv_bfloat16* __restrict__ dst,
-                                                               const int num_elements) {
-    const size_t bytes = static_cast<size_t>(num_elements) * sizeof(__nv_bfloat16);
-    const std::uintptr_t alignment_bits =
-        reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst) | bytes;
+__device__ __forceinline__ bool can_use_tma_for_weight_sync_tile(const WeightSyncTask& task,
+                                                                 const WeightSyncTileInfo& tile) {
+    std::uintptr_t alignment_bits = reinterpret_cast<std::uintptr_t>(task.master_local_addr + tile.byte_offset);
+    for (int replica_idx = 0; replica_idx < task.num_replicas; ++replica_idx) {
+        alignment_bits |= reinterpret_cast<std::uintptr_t>(task.replica_remote_addrs[replica_idx] + tile.byte_offset);
+    }
+    return (alignment_bits & (sizeof(uint4) - 1)) == 0;
+}
+
+__device__ __forceinline__ void copy_weight_sync_tile_threaded(const uint8_t* __restrict__ src,
+                                                               uint8_t* __restrict__ dst,
+                                                               const int num_bytes) {
+    const std::uintptr_t alignment_bits = reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst);
 
     if ((alignment_bits & (sizeof(uint4) - 1)) == 0) {
-        const int num_vecs = static_cast<int>(bytes / sizeof(uint4));
+        const int num_vecs = num_bytes / static_cast<int>(sizeof(uint4));
         const uint4* __restrict__ src_vec = reinterpret_cast<const uint4*>(src);
         uint4* __restrict__ dst_vec = reinterpret_cast<uint4*>(dst);
         for (int vec_idx = threadIdx.x; vec_idx < num_vecs; vec_idx += blockDim.x) {
             const uint4 value = src_vec[vec_idx];
             ptx::st_global_v4_u32_streaming(dst_vec + vec_idx, value.x, value.y, value.z, value.w);
         }
+
+        const int tail_start = num_vecs * static_cast<int>(sizeof(uint4));
+        for (int byte_idx = tail_start + threadIdx.x; byte_idx < num_bytes; byte_idx += blockDim.x) {
+            dst[byte_idx] = src[byte_idx];
+        }
         return;
     }
 
-    for (int element_idx = threadIdx.x; element_idx < num_elements; element_idx += blockDim.x) {
-        dst[element_idx] = src[element_idx];
+    for (int byte_idx = threadIdx.x; byte_idx < num_bytes; byte_idx += blockDim.x) {
+        dst[byte_idx] = src[byte_idx];
     }
 }
 
@@ -619,10 +754,10 @@ __global__ __launch_bounds__(kWeightSyncThreadsPerBlock) void weight_sync_thread
         }
         __syncthreads();
 
-        const __nv_bfloat16* src = task.master_local_addr + tile.element_offset;
+        const uint8_t* src = task.master_local_addr + tile.byte_offset;
         for (int replica_idx = 0; replica_idx < task.num_replicas; ++replica_idx) {
-            __nv_bfloat16* dst = task.replica_remote_addrs[replica_idx] + tile.element_offset;
-            copy_weight_sync_tile_threaded(src, dst, tile.num_elements);
+            uint8_t* dst = task.replica_remote_addrs[replica_idx] + tile.byte_offset;
+            copy_weight_sync_tile_threaded(src, dst, tile.num_bytes);
         }
         __syncthreads();
 
@@ -654,8 +789,8 @@ __global__ __launch_bounds__(kWeightSyncThreadsPerBlock) void weight_sync_kernel
     uint64_t* const* remote_ready_flag_ptrs,
     uint64_t current_epoch) {
     // Double-buffered shared memory
-    extern __shared__ __nv_bfloat16 smem_base[];
-    __nv_bfloat16* smem[2] = {smem_base, smem_base + kWeightSyncTileElements};
+    extern __shared__ uint8_t smem_base[];
+    uint8_t* smem[2] = {smem_base, smem_base + kWeightSyncTileSizeBytes};
 
     // Mbarriers for TMA load synchronization
     ptx::mbarrier* mbarriers = ptx::create_mbarriers<2>();
@@ -721,21 +856,61 @@ __global__ __launch_bounds__(kWeightSyncThreadsPerBlock) void weight_sync_kernel
         }
         __syncthreads();
 
-        size_t bytes = tile.num_elements * sizeof(__nv_bfloat16);
-        bytes = (bytes + 15) & ~15;
+        const bool use_tma = can_use_tma_for_weight_sync_tile(task, tile);
+        const int tma_bytes = (tile.num_bytes / static_cast<int>(sizeof(uint4))) * static_cast<int>(sizeof(uint4));
+        const int tail_bytes = tile.num_bytes - tma_bytes;
+        const int next_buf = 1 - cur_buf;
 
-        // Issue TMA Load for current tile
+        if (!use_tma || tma_bytes == 0) {
+            if (has_pending_store) {
+                if (is_leader) {
+                    ptx::tma_store_wait<0>();
+                    __threadfence_system();
+                    finalize_completed_weight_sync_task(weight_sync_tasks,
+                                                        pending_task_idx,
+                                                        task_remaining_tiles,
+                                                        local_ready_flags,
+                                                        remote_ready_flag_ptrs,
+                                                        current_epoch);
+                    has_pending_store = false;
+                }
+                __syncthreads();
+            }
+
+            const uint8_t* src = task.master_local_addr + tile.byte_offset;
+            for (int replica_idx = 0; replica_idx < task.num_replicas; ++replica_idx) {
+                uint8_t* dst = task.replica_remote_addrs[replica_idx] + tile.byte_offset;
+                copy_weight_sync_tile_threaded(src, dst, tile.num_bytes);
+            }
+            __syncthreads();
+
+            if (is_leader) {
+                __threadfence_system();
+                finalize_completed_weight_sync_task(weight_sync_tasks,
+                                                    tile.task_idx,
+                                                    task_remaining_tiles,
+                                                    local_ready_flags,
+                                                    remote_ready_flag_ptrs,
+                                                    current_epoch);
+                tile_indices[cur_buf] = atomicAdd(global_tile_counter, 1);
+            }
+            __syncthreads();
+            continue;
+        }
+
+        const size_t bytes = static_cast<size_t>(tma_bytes);
+
+        // Issue TMA Load for the 16-byte aligned bulk of the current tile.
         if (is_leader) {
             ptx::mbarrier_arrive_and_set_tx(&mbarriers[cur_buf], bytes);
             ptx::tma_load_1d(smem[cur_buf],
-                             task.master_local_addr + tile.element_offset,
+                             task.master_local_addr + tile.byte_offset,
                              &mbarriers[cur_buf],
                              bytes,
                              ptx::TMACacheHint::kEvictNormal);
         }
 
         // Prefetch next tile index while TMA Load is in flight
-        int next_buf = 1 - cur_buf;
         if (is_leader) {
             tile_indices[next_buf] = atomicAdd(global_tile_counter, 1);
         }
@@ -762,16 +937,23 @@ __global__ __launch_bounds__(kWeightSyncThreadsPerBlock) void weight_sync_kernel
             __syncthreads();
         }
 
-        // Fence and issue TMA stores for current tile
+        // Fence and issue TMA stores for current tile.
         if (is_leader) {
             ptx::tma_store_fence();
             for (int r = 0; r < task.num_replicas; ++r) {
-                __nv_bfloat16* replica_addr = task.replica_remote_addrs[r] + tile.element_offset;
+                uint8_t* replica_addr = task.replica_remote_addrs[r] + tile.byte_offset;
                 ptx::tma_store_1d(replica_addr, smem[cur_buf], bytes, ptx::TMACacheHint::kEvictNormal);
             }
             ptx::tma_store_commit();
             has_pending_store = true;
             pending_task_idx = tile.task_idx;
+        }
+        if (tail_bytes > 0) {
+            const uint8_t* tail_src = task.master_local_addr + tile.byte_offset + tma_bytes;
+            for (int replica_idx = 0; replica_idx < task.num_replicas; ++replica_idx) {
+                uint8_t* tail_dst = task.replica_remote_addrs[replica_idx] + tile.byte_offset + tma_bytes;
+                copy_weight_sync_tile_threaded(tail_src, tail_dst, tail_bytes);
+            }
         }
         __syncthreads();
 

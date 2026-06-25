@@ -8,7 +8,11 @@ from .runtime import init_runtime
 from .event import EventHandle
 from .profiling import ExpertLoadProfiler, load_profile_config
 from .reroute import _DenseRerouteFunction
-from .util import profile_physical_loads_from_quota_triton
+from .util import (
+    profile_physical_loads_from_quota_triton,
+    check_dtype,
+    dtype_element_size,
+)
 
 
 class Manager:
@@ -24,6 +28,11 @@ class Manager:
         explicitly_destroy: bool = False,
         max_microbatches: int = 1,
         legacy_placement: bool = False,
+        weight_data_dtype: torch.dtype = torch.bfloat16,
+        weight_scale_dtype: torch.dtype = torch.float32,
+        expert_fc1_weight_scale_numel: int = 0,
+        expert_fc2_weight_scale_numel: int = 0,
+        grad_dtype: torch.dtype = torch.float32,
     ):
         self._load_profile_config = load_profile_config()
         if self._load_profile_config.enabled and legacy_placement:
@@ -46,6 +55,19 @@ class Manager:
         self.expert_fc1_numel = expert_fc1_numel
         self.expert_fc2_numel = expert_fc2_numel
         self.expert_total_numel = expert_fc1_numel + expert_fc2_numel
+        self.expert_fc1_weight_scale_numel = expert_fc1_weight_scale_numel
+        self.expert_fc2_weight_scale_numel = expert_fc2_weight_scale_numel
+        self.expert_weight_scale_total_numel = (
+            expert_fc1_weight_scale_numel + expert_fc2_weight_scale_numel
+        )
+        self.weight_data_dtype = check_dtype("weight_data_dtype", weight_data_dtype)
+        self.weight_scale_dtype = check_dtype("weight_scale_dtype", weight_scale_dtype)
+        self.grad_dtype = check_dtype("grad_dtype", grad_dtype)
+        if self.grad_dtype is not torch.float32:
+            raise ValueError("UltraEP currently supports only fp32 gradients")
+        self.weight_data_element_bytes = dtype_element_size(self.weight_data_dtype)
+        self.weight_scale_element_bytes = dtype_element_size(self.weight_scale_dtype)
+        self.grad_element_bytes = dtype_element_size(self.grad_dtype)
         self.num_local_physical_experts = (
             num_local_master_experts + num_local_redundant_experts
         )
@@ -66,6 +88,12 @@ class Manager:
         # Master weight/grad pointer pools, indexed by real layer.
         self.local_master_fc1_weight_ptr_pool = [None] * self.real_num_alloc_layers
         self.local_master_fc2_weight_ptr_pool = [None] * self.real_num_alloc_layers
+        self.local_master_fc1_weight_scale_ptr_pool = [
+            None
+        ] * self.real_num_alloc_layers
+        self.local_master_fc2_weight_scale_ptr_pool = [
+            None
+        ] * self.real_num_alloc_layers
         self.local_master_fc1_grad_ptr_pool = [None] * self.real_num_alloc_layers
         self.local_master_fc2_grad_ptr_pool = [None] * self.real_num_alloc_layers
 
@@ -105,6 +133,11 @@ class Manager:
             num_local_redundant_experts,
             expert_fc1_numel,
             expert_fc2_numel,
+            self.weight_data_element_bytes,
+            self.weight_scale_element_bytes,
+            expert_fc1_weight_scale_numel,
+            expert_fc2_weight_scale_numel,
+            self.grad_element_bytes,
             is_train,
             explicitly_destroy,
             legacy_placement,
@@ -144,17 +177,72 @@ class Manager:
         self._rank_quota_prefix: torch.Tensor = (
             self.runtime.get_rank_quota_prefix_tensor()
         )
-        # Replica weight buffer shared by layers on GPU
+        # Full buffers keep the original contiguous expert layout for backward
+        # compatibility. The fc1/fc2 tensors below are strided views into these
+        # buffers: each expert row is contiguous, while rows use the full-expert stride.
         self.local_replica_weight_buffer: torch.Tensor = (
             self.runtime.get_local_replica_weight_buffer_tensor()
+            .view(self.weight_data_dtype)
+            .view(self.num_local_redundant_experts, self.expert_total_numel)
         )
+        self.local_replica_fc1_weight_buffer: torch.Tensor = (
+            self.runtime.get_local_replica_fc1_weight_buffer_tensor()
+            .view(self.weight_data_dtype)
+            .view(self.num_local_redundant_experts, self.expert_fc1_numel)
+        )
+        self.local_replica_fc2_weight_buffer: torch.Tensor = (
+            self.runtime.get_local_replica_fc2_weight_buffer_tensor()
+            .view(self.weight_data_dtype)
+            .view(self.num_local_redundant_experts, self.expert_fc2_numel)
+        )
+        self.local_replica_weight_scale_buffer_raw: torch.Tensor = (
+            self.runtime.get_local_replica_weight_scale_buffer_tensor()
+        )
+        raw_fc1_scale_buffer = (
+            self.runtime.get_local_replica_fc1_weight_scale_buffer_tensor()
+        )
+        raw_fc2_scale_buffer = (
+            self.runtime.get_local_replica_fc2_weight_scale_buffer_tensor()
+        )
+        if self.expert_weight_scale_total_numel > 0:
+            self.local_replica_fc1_weight_scale_buffer: (
+                torch.Tensor
+            ) = raw_fc1_scale_buffer.view(self.weight_scale_dtype).view(
+                self.num_local_redundant_experts,
+                self.expert_fc1_weight_scale_numel,
+            )
+            self.local_replica_fc2_weight_scale_buffer: (
+                torch.Tensor
+            ) = raw_fc2_scale_buffer.view(self.weight_scale_dtype).view(
+                self.num_local_redundant_experts,
+                self.expert_fc2_weight_scale_numel,
+            )
+        else:
+            self.local_replica_fc1_weight_scale_buffer = torch.empty(
+                (self.num_local_redundant_experts, 0),
+                dtype=self.weight_scale_dtype,
+                device=raw_fc1_scale_buffer.device,
+            )
+            self.local_replica_fc2_weight_scale_buffer = torch.empty(
+                (self.num_local_redundant_experts, 0),
+                dtype=self.weight_scale_dtype,
+                device=raw_fc2_scale_buffer.device,
+            )
         # Grad buffer only available in training mode
         if self.is_train:
             self.local_replica_grad_buffer: torch.Tensor = (
                 self.runtime.get_local_replica_grad_buffer_tensor()
             )
+            self.local_replica_fc1_grad_buffer: torch.Tensor = (
+                self.runtime.get_local_replica_fc1_grad_buffer_tensor()
+            )
+            self.local_replica_fc2_grad_buffer: torch.Tensor = (
+                self.runtime.get_local_replica_fc2_grad_buffer_tensor()
+            )
         else:
             self.local_replica_grad_buffer = None
+            self.local_replica_fc1_grad_buffer = None
+            self.local_replica_fc2_grad_buffer = None
 
         self.check_tensors_blob_from_cpp()
         self._load_profiler = ExpertLoadProfiler(
@@ -275,6 +363,8 @@ class Manager:
         fc2_weights: List[torch.Tensor],
         fc1_grads: Optional[List[torch.Tensor]] = None,
         fc2_grads: Optional[List[torch.Tensor]] = None,
+        fc1_weight_scales: Optional[List[torch.Tensor]] = None,
+        fc2_weight_scales: Optional[List[torch.Tensor]] = None,
     ):
         assert layer_id < self.real_num_alloc_layers
         assert len(fc1_weights) == self.num_local_master_experts
@@ -286,8 +376,8 @@ class Manager:
                     t.dtype == dtype
                 ), f"Expected weight/grad dtype {dtype}, got {t.dtype}"
 
-        check_tensors_dtype(fc1_weights, torch.bfloat16)
-        check_tensors_dtype(fc2_weights, torch.bfloat16)
+        check_tensors_dtype(fc1_weights, self.weight_data_dtype)
+        check_tensors_dtype(fc2_weights, self.weight_data_dtype)
 
         def _to_dataptr_tensor(tensors: List[torch.Tensor], device) -> torch.Tensor:
             return torch.tensor(
@@ -302,14 +392,34 @@ class Manager:
             fc2_weights, device=weight_or_grad_device
         )
 
+        if self.expert_weight_scale_total_numel > 0:
+            if fc1_weight_scales is None or fc2_weight_scales is None:
+                raise AssertionError(
+                    "Weight scale tensors are required when scale numel is non-zero"
+                )
+            assert len(fc1_weight_scales) == self.num_local_master_experts
+            assert len(fc2_weight_scales) == self.num_local_master_experts
+            check_tensors_dtype(fc1_weight_scales, self.weight_scale_dtype)
+            check_tensors_dtype(fc2_weight_scales, self.weight_scale_dtype)
+            self.local_master_fc1_weight_scale_ptr_pool[layer_id] = _to_dataptr_tensor(
+                fc1_weight_scales, device=weight_or_grad_device
+            )
+            self.local_master_fc2_weight_scale_ptr_pool[layer_id] = _to_dataptr_tensor(
+                fc2_weight_scales, device=weight_or_grad_device
+            )
+        else:
+            empty_ptrs = torch.empty(0, dtype=torch.int64, device=weight_or_grad_device)
+            self.local_master_fc1_weight_scale_ptr_pool[layer_id] = empty_ptrs
+            self.local_master_fc2_weight_scale_ptr_pool[layer_id] = empty_ptrs
+
         if self.is_train:
             assert (
                 fc1_grads is not None and fc2_grads is not None
             ), "Grad tensors required in training mode"
             assert len(fc1_grads) == self.num_local_master_experts
             assert len(fc2_grads) == self.num_local_master_experts
-            check_tensors_dtype(fc1_grads, torch.float32)
-            check_tensors_dtype(fc2_grads, torch.float32)
+            check_tensors_dtype(fc1_grads, self.grad_dtype)
+            check_tensors_dtype(fc2_grads, self.grad_dtype)
             self.local_master_fc1_grad_ptr_pool[layer_id] = _to_dataptr_tensor(
                 fc1_grads, device=weight_or_grad_device
             )
@@ -378,12 +488,16 @@ class Manager:
         assert (
             self.local_master_fc1_weight_ptr_pool[real_lid] is not None
             and self.local_master_fc2_weight_ptr_pool[real_lid] is not None
+            and self.local_master_fc1_weight_scale_ptr_pool[real_lid] is not None
+            and self.local_master_fc2_weight_scale_ptr_pool[real_lid] is not None
         )
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
             event = self.runtime.weight_sync(
                 layer_id,
                 self.local_master_fc1_weight_ptr_pool[real_lid],
                 self.local_master_fc2_weight_ptr_pool[real_lid],
+                self.local_master_fc1_weight_scale_ptr_pool[real_lid],
+                self.local_master_fc2_weight_scale_ptr_pool[real_lid],
                 getattr(previous_event, "event", None),
                 async_finish,
             )
@@ -576,19 +690,75 @@ class Manager:
         assert self.local_replica_weight_buffer.device == torch.device(
             "cuda", self.device
         )
-        assert self.local_replica_weight_buffer.dtype == torch.bfloat16
+        assert self.local_replica_weight_buffer.dtype == self.weight_data_dtype
         assert self.local_replica_weight_buffer.shape == (
             self.num_local_redundant_experts,
             self.expert_total_numel,
+        )
+        assert self.local_replica_fc1_weight_buffer.device == torch.device(
+            "cuda", self.device
+        )
+        assert self.local_replica_fc1_weight_buffer.dtype == self.weight_data_dtype
+        assert self.local_replica_fc1_weight_buffer.shape == (
+            self.num_local_redundant_experts,
+            self.expert_fc1_numel,
+        )
+        assert self.local_replica_fc2_weight_buffer.device == torch.device(
+            "cuda", self.device
+        )
+        assert self.local_replica_fc2_weight_buffer.dtype == self.weight_data_dtype
+        assert self.local_replica_fc2_weight_buffer.shape == (
+            self.num_local_redundant_experts,
+            self.expert_fc2_numel,
+        )
+        assert self.local_replica_weight_scale_buffer_raw.device == torch.device(
+            "cuda", self.device
+        )
+        assert self.local_replica_weight_scale_buffer_raw.dtype == torch.uint8
+        assert self.local_replica_fc1_weight_scale_buffer.device == torch.device(
+            "cuda", self.device
+        )
+        assert (
+            self.local_replica_fc1_weight_scale_buffer.dtype == self.weight_scale_dtype
+        )
+        assert self.local_replica_fc1_weight_scale_buffer.shape == (
+            self.num_local_redundant_experts,
+            self.expert_fc1_weight_scale_numel,
+        )
+        assert self.local_replica_fc2_weight_scale_buffer.device == torch.device(
+            "cuda", self.device
+        )
+        assert (
+            self.local_replica_fc2_weight_scale_buffer.dtype == self.weight_scale_dtype
+        )
+        assert self.local_replica_fc2_weight_scale_buffer.shape == (
+            self.num_local_redundant_experts,
+            self.expert_fc2_weight_scale_numel,
         )
         if self.is_train:
             assert self.local_replica_grad_buffer.device == torch.device(
                 "cuda", self.device
             )
-            assert self.local_replica_grad_buffer.dtype == torch.float32
+            assert self.local_replica_grad_buffer.dtype == self.grad_dtype
             assert self.local_replica_grad_buffer.shape == (
                 self.num_local_redundant_experts,
                 self.expert_total_numel,
+            )
+            assert self.local_replica_fc1_grad_buffer.device == torch.device(
+                "cuda", self.device
+            )
+            assert self.local_replica_fc1_grad_buffer.dtype == self.grad_dtype
+            assert self.local_replica_fc1_grad_buffer.shape == (
+                self.num_local_redundant_experts,
+                self.expert_fc1_numel,
+            )
+            assert self.local_replica_fc2_grad_buffer.device == torch.device(
+                "cuda", self.device
+            )
+            assert self.local_replica_fc2_grad_buffer.dtype == self.grad_dtype
+            assert self.local_replica_fc2_grad_buffer.shape == (
+                self.num_local_redundant_experts,
+                self.expert_fc2_numel,
             )
 
     def get_comm_stream(self) -> torch.Stream:

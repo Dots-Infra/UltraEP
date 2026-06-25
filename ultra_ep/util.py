@@ -14,6 +14,16 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 
 
+def check_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"{name} must be a torch.dtype, got {type(dtype).__name__}")
+    return dtype
+
+
+def dtype_element_size(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
 def print_rank_0(message):
     if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
         print(message, flush=True)

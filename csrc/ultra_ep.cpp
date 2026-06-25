@@ -1,11 +1,120 @@
 #include "ultra_ep.hpp"
 
-#include <cuda_bf16.h>
-
 #include <algorithm>
 #include <cstdio>
 
 namespace ultra_ep {
+
+namespace {
+
+int64_t checked_num_bytes(const int64_t numel, const int elem_bytes) {
+    EP_HOST_ASSERT(numel >= 0);
+    EP_HOST_ASSERT(elem_bytes > 0);
+    return numel * static_cast<int64_t>(elem_bytes);
+}
+
+int64_t align_up_bytes(const int64_t value, const int64_t alignment) {
+    EP_HOST_ASSERT(value >= 0 && alignment > 0);
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+void fill_task_build_config(kernels::TaskBuildConfig& config,
+                            int num_local_master_experts,
+                            int num_local_physical_experts,
+                            int num_local_redundant_experts,
+                            int64_t expert_fc1_numel,
+                            int64_t expert_fc2_numel,
+                            int64_t expert_total_numel,
+                            int64_t expert_fc1_weight_scale_numel,
+                            int64_t expert_fc2_weight_scale_numel,
+                            int64_t expert_weight_scale_total_numel,
+                            int64_t expert_fc1_weight_scale_bytes,
+                            int64_t expert_fc2_weight_scale_bytes,
+                            int64_t expert_weight_scale_fc2_offset_bytes,
+                            int64_t expert_weight_scale_stride_bytes,
+                            int weight_data_element_bytes,
+                            int weight_scale_element_bytes,
+                            int weight_sync_plan_mode,
+                            int weight_sync_relay_min_replicas,
+                            int weight_sync_relay_max_relays,
+                            int weight_sync_relay_min_fanout_gain) {
+    config = {};
+    config.rank_idx = runtime::rank_idx;
+    config.nvl_rank_idx = runtime::nvl_rank_idx;
+    config.num_nvl_ranks = runtime::num_nvl_ranks;
+    config.num_local_master_experts = num_local_master_experts;
+    config.num_local_physical_experts = num_local_physical_experts;
+    config.num_local_redundant_experts = num_local_redundant_experts;
+    config.expert_fc1_numel = expert_fc1_numel;
+    config.expert_fc2_numel = expert_fc2_numel;
+    config.expert_total_numel = expert_total_numel;
+    config.expert_fc1_weight_scale_numel = expert_fc1_weight_scale_numel;
+    config.expert_fc2_weight_scale_numel = expert_fc2_weight_scale_numel;
+    config.expert_weight_scale_total_numel = expert_weight_scale_total_numel;
+    config.expert_fc1_weight_scale_bytes = expert_fc1_weight_scale_bytes;
+    config.expert_fc2_weight_scale_bytes = expert_fc2_weight_scale_bytes;
+    config.expert_weight_scale_fc2_offset_bytes = expert_weight_scale_fc2_offset_bytes;
+    config.expert_weight_scale_stride_bytes = expert_weight_scale_stride_bytes;
+    config.weight_data_element_bytes = weight_data_element_bytes;
+    config.weight_scale_element_bytes = weight_scale_element_bytes;
+    config.max_replicas_dim = runtime::num_ranks;
+    config.weight_sync_plan_mode = weight_sync_plan_mode;
+    config.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas;
+    config.weight_sync_relay_max_relays = weight_sync_relay_max_relays;
+    config.weight_sync_relay_min_fanout_gain = weight_sync_relay_min_fanout_gain;
+}
+
+int weight_sync_num_shards(const int64_t expert_weight_scale_total_numel) {
+    return expert_weight_scale_total_numel > 0 ? 4 : 2;
+}
+
+int weight_sync_chunks_for_shards(int64_t expert_fc1_numel,
+                                  int64_t expert_fc2_numel,
+                                  int64_t expert_fc1_weight_scale_bytes,
+                                  int64_t expert_fc2_weight_scale_bytes,
+                                  int weight_data_element_bytes) {
+    return kernels::weight_sync_num_chunks(
+               static_cast<size_t>(checked_num_bytes(expert_fc1_numel, weight_data_element_bytes))) +
+        kernels::weight_sync_num_chunks(
+               static_cast<size_t>(checked_num_bytes(expert_fc2_numel, weight_data_element_bytes))) +
+        kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc1_weight_scale_bytes)) +
+        kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc2_weight_scale_bytes));
+}
+
+int weight_sync_tiles_for_shards(int64_t expert_fc1_numel,
+                                 int64_t expert_fc2_numel,
+                                 int64_t expert_fc1_weight_scale_bytes,
+                                 int64_t expert_fc2_weight_scale_bytes,
+                                 int weight_data_element_bytes) {
+    return kernels::weight_sync_num_tiles(
+               static_cast<size_t>(checked_num_bytes(expert_fc1_numel, weight_data_element_bytes))) +
+        kernels::weight_sync_num_tiles(
+               static_cast<size_t>(checked_num_bytes(expert_fc2_numel, weight_data_element_bytes))) +
+        kernels::weight_sync_num_tiles(static_cast<size_t>(expert_fc1_weight_scale_bytes)) +
+        kernels::weight_sync_num_tiles(static_cast<size_t>(expert_fc2_weight_scale_bytes));
+}
+
+int max_weight_sync_chunks_per_shard(int64_t expert_fc1_numel,
+                                     int64_t expert_fc2_numel,
+                                     int64_t expert_fc1_weight_scale_bytes,
+                                     int64_t expert_fc2_weight_scale_bytes,
+                                     int weight_data_element_bytes) {
+    int max_chunks = 0;
+    const int chunks[4] = {
+        kernels::weight_sync_num_chunks(
+            static_cast<size_t>(checked_num_bytes(expert_fc1_numel, weight_data_element_bytes))),
+        kernels::weight_sync_num_chunks(
+            static_cast<size_t>(checked_num_bytes(expert_fc2_numel, weight_data_element_bytes))),
+        kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc1_weight_scale_bytes)),
+        kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc2_weight_scale_bytes)),
+    };
+    for (int value : chunks) {
+        max_chunks = std::max(max_chunks, value);
+    }
+    return max_chunks;
+}
+
+}  // namespace
 
 // ============================================================================
 // GlobalExpertPlacement
@@ -87,6 +196,11 @@ Manager::Manager(const int& num_layers,
                  const int& num_local_redundant_experts,
                  const int64_t& expert_fc1_numel,
                  const int64_t& expert_fc2_numel,
+                 const int& weight_data_element_bytes,
+                 const int& weight_scale_element_bytes,
+                 const int64_t& expert_fc1_weight_scale_numel,
+                 const int64_t& expert_fc2_weight_scale_numel,
+                 const int& grad_element_bytes,
                  const bool& is_train,
                  const bool& explicitly_destroy,
                  const bool& legacy_placement,
@@ -110,6 +224,16 @@ Manager::Manager(const int& num_layers,
       expert_fc1_numel(expert_fc1_numel),
       expert_fc2_numel(expert_fc2_numel),
       expert_total_numel(expert_fc1_numel + expert_fc2_numel),
+      expert_fc1_weight_scale_numel(expert_fc1_weight_scale_numel),
+      expert_fc2_weight_scale_numel(expert_fc2_weight_scale_numel),
+      expert_weight_scale_total_numel(expert_fc1_weight_scale_numel + expert_fc2_weight_scale_numel),
+      expert_fc1_weight_scale_bytes(0),
+      expert_fc2_weight_scale_bytes(0),
+      expert_weight_scale_fc2_offset_bytes(0),
+      expert_weight_scale_stride_bytes(0),
+      weight_data_element_bytes(weight_data_element_bytes),
+      weight_scale_element_bytes(weight_scale_element_bytes),
+      grad_element_bytes(grad_element_bytes),
       is_train(is_train),
       explicitly_destroy(explicitly_destroy),
       legacy_placement_(legacy_placement),
@@ -134,6 +258,23 @@ Manager::Manager(const int& num_layers,
 {
     // Common checks
     EP_HOST_ASSERT(runtime::is_runtime_initialized and "Runtime must be initialized before creating Manager");
+    EP_HOST_ASSERT(weight_data_element_bytes > 0);
+    EP_HOST_ASSERT(weight_scale_element_bytes > 0);
+    EP_HOST_ASSERT(grad_element_bytes == static_cast<int>(sizeof(float)) &&
+                   "UltraEP currently supports only fp32 gradients");
+    EP_HOST_ASSERT(expert_fc1_numel >= 0 && expert_fc2_numel >= 0);
+    EP_HOST_ASSERT(expert_fc1_weight_scale_numel >= 0 && expert_fc2_weight_scale_numel >= 0);
+    const int64_t expert_fc1_weight_bytes = checked_num_bytes(expert_fc1_numel, weight_data_element_bytes);
+    const int64_t expert_fc2_weight_bytes = checked_num_bytes(expert_fc2_numel, weight_data_element_bytes);
+    EP_HOST_ASSERT(expert_fc1_weight_bytes % kernels::kNumTMAAlignBytes == 0 &&
+                   "fc1 weight shard bytes must be 16-byte aligned for TMA weight_sync");
+    EP_HOST_ASSERT(expert_fc2_weight_bytes % kernels::kNumTMAAlignBytes == 0 &&
+                   "fc2 weight shard bytes must be 16-byte aligned for TMA weight_sync");
+    expert_fc1_weight_scale_bytes = checked_num_bytes(expert_fc1_weight_scale_numel, weight_scale_element_bytes);
+    expert_fc2_weight_scale_bytes = checked_num_bytes(expert_fc2_weight_scale_numel, weight_scale_element_bytes);
+    expert_weight_scale_fc2_offset_bytes = align_up_bytes(expert_fc1_weight_scale_bytes, kernels::kNumTMAAlignBytes);
+    expert_weight_scale_stride_bytes = align_up_bytes(
+        expert_weight_scale_fc2_offset_bytes + expert_fc2_weight_scale_bytes, kernels::kNumTMAAlignBytes);
     EP_HOST_ASSERT(weight_sync_plan_mode_ >= static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
                    weight_sync_plan_mode_ <= static_cast<int>(kernels::WeightSyncPlanMode::kForceRelay));
     EP_HOST_ASSERT(weight_sync_relay_min_replicas_ >= 0);
@@ -147,8 +288,11 @@ Manager::Manager(const int& num_layers,
     num_global_physical_experts = num_local_physical_experts * runtime::num_ranks;
     num_global_logical_experts = num_local_master_experts * runtime::num_ranks;
     _weight_sync_task_capacity = num_local_physical_experts *
-        (kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc1_numel)) +
-         kernels::weight_sync_num_chunks(static_cast<size_t>(expert_fc2_numel)));
+        weight_sync_chunks_for_shards(expert_fc1_numel,
+                                      expert_fc2_numel,
+                                      expert_fc1_weight_scale_bytes,
+                                      expert_fc2_weight_scale_bytes,
+                                      weight_data_element_bytes);
 
     // Allocate global placement tensors using contiguous per-layer device buffers.
     int num_ranks = runtime::num_ranks;
@@ -159,25 +303,68 @@ Manager::Manager(const int& num_layers,
                    num_ranks,  // max_replicas_dim = num_ranks
                    device_id);
 
-    // Allocate local replica weight buffer via NVSHMEM symmetric heap
-    // This enables automatic cross-GPU access within NVL domain
-    int64_t local_replica_weight_bytes =
-        static_cast<int64_t>(num_local_redundant_experts) * expert_total_numel * kernels::kWeightElementBytes;
+    // Allocate local replica weight data buffer via NVSHMEM symmetric heap.
+    // This enables automatic cross-GPU access within NVL domain.
+    const int64_t local_replica_weight_bytes = static_cast<int64_t>(num_local_redundant_experts) *
+        checked_num_bytes(expert_total_numel, weight_data_element_bytes);
 
-    local_replica_weight_buffer = nvshmem::alloc(local_replica_weight_bytes, kernels::kNvshmemAlignment);
+    local_replica_weight_buffer = nvshmem::alloc(local_replica_weight_bytes, kernels::kNumTMAAlignBytes);
     EP_HOST_ASSERT(local_replica_weight_buffer != nullptr && "Failed to allocate NVSHMEM weight buffer");
 
-    local_replica_weight_buffer_tensor = make_tensor_from_buffer(local_replica_weight_buffer,
-                                                                 {num_local_redundant_experts, expert_total_numel},
-                                                                 torch::kBFloat16,
-                                                                 torch::Device(torch::kCUDA, device_id));
+    auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id));
+    const int64_t expert_total_weight_bytes = checked_num_bytes(expert_total_numel, weight_data_element_bytes);
+    local_replica_weight_buffer_tensor = torch::from_blob(local_replica_weight_buffer,
+                                                          {num_local_redundant_experts, expert_total_weight_bytes},
+                                                          {expert_total_weight_bytes, 1},
+                                                          byte_opts);
+    local_replica_fc1_weight_buffer_tensor = torch::from_blob(local_replica_weight_buffer,
+                                                              {num_local_redundant_experts, expert_fc1_weight_bytes},
+                                                              {expert_total_weight_bytes, 1},
+                                                              byte_opts);
+    local_replica_fc2_weight_buffer_tensor =
+        torch::from_blob(reinterpret_cast<uint8_t*>(local_replica_weight_buffer) + expert_fc1_weight_bytes,
+                         {num_local_redundant_experts, expert_fc2_weight_bytes},
+                         {expert_total_weight_bytes, 1},
+                         byte_opts);
 
-    const int max_relay_chunks_per_shard =
-        kernels::weight_sync_num_chunks(static_cast<size_t>(std::max(expert_fc1_numel, expert_fc2_numel)));
-    const int64_t local_ready_flag_count =
-        static_cast<int64_t>(num_local_redundant_experts) * 2 * max_relay_chunks_per_shard;
+    if (expert_weight_scale_total_numel > 0) {
+        const int64_t local_replica_weight_scale_bytes =
+            static_cast<int64_t>(num_local_redundant_experts) * expert_weight_scale_stride_bytes;
+        local_replica_weight_scale_buffer =
+            nvshmem::alloc(local_replica_weight_scale_bytes, kernels::kNumTMAAlignBytes);
+        EP_HOST_ASSERT(local_replica_weight_scale_buffer != nullptr &&
+                       "Failed to allocate NVSHMEM weight-scale buffer");
+        local_replica_weight_scale_buffer_tensor =
+            torch::from_blob(local_replica_weight_scale_buffer,
+                             {num_local_redundant_experts, expert_weight_scale_stride_bytes},
+                             {expert_weight_scale_stride_bytes, 1},
+                             byte_opts);
+        local_replica_fc1_weight_scale_buffer_tensor =
+            torch::from_blob(local_replica_weight_scale_buffer,
+                             {num_local_redundant_experts, expert_fc1_weight_scale_bytes},
+                             {expert_weight_scale_stride_bytes, 1},
+                             byte_opts);
+        local_replica_fc2_weight_scale_buffer_tensor = torch::from_blob(
+            reinterpret_cast<uint8_t*>(local_replica_weight_scale_buffer) + expert_weight_scale_fc2_offset_bytes,
+            {num_local_redundant_experts, expert_fc2_weight_scale_bytes},
+            {expert_weight_scale_stride_bytes, 1},
+            byte_opts);
+    } else {
+        auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id));
+        local_replica_weight_scale_buffer_tensor = torch::empty({num_local_redundant_experts, 0}, byte_opts);
+        local_replica_fc1_weight_scale_buffer_tensor = torch::empty({num_local_redundant_experts, 0}, byte_opts);
+        local_replica_fc2_weight_scale_buffer_tensor = torch::empty({num_local_redundant_experts, 0}, byte_opts);
+    }
+
+    const int max_relay_chunks_per_shard = max_weight_sync_chunks_per_shard(expert_fc1_numel,
+                                                                            expert_fc2_numel,
+                                                                            expert_fc1_weight_scale_bytes,
+                                                                            expert_fc2_weight_scale_bytes,
+                                                                            weight_data_element_bytes);
+    const int64_t local_ready_flag_count = static_cast<int64_t>(num_local_redundant_experts) *
+        weight_sync_num_shards(expert_weight_scale_total_numel) * max_relay_chunks_per_shard;
     local_weight_sync_ready_flags = reinterpret_cast<uint64_t*>(
-        nvshmem::alloc(local_ready_flag_count * sizeof(uint64_t), kernels::kNvshmemAlignment));
+        nvshmem::alloc(local_ready_flag_count * sizeof(uint64_t), kernels::kNumTMAAlignBytes));
     EP_HOST_ASSERT(local_weight_sync_ready_flags != nullptr &&
                    "Failed to allocate NVSHMEM ready-flag buffer for relay weight sync");
     if (local_ready_flag_count > 0) {
@@ -186,14 +373,24 @@ Manager::Manager(const int& num_layers,
 
     // Grad buffer only needed for training
     if (is_train) {
-        int64_t local_replica_grad_bytes =
-            static_cast<int64_t>(num_local_redundant_experts) * expert_total_numel * kernels::kGradElementBytes;
-        local_replica_grad_buffer = nvshmem::alloc(local_replica_grad_bytes, kernels::kNvshmemAlignment);
+        int64_t local_replica_grad_bytes = static_cast<int64_t>(num_local_redundant_experts) *
+            checked_num_bytes(expert_total_numel, grad_element_bytes);
+        local_replica_grad_buffer = nvshmem::alloc(local_replica_grad_bytes, kernels::kNumTMAAlignBytes);
         EP_HOST_ASSERT(local_replica_grad_buffer != nullptr && "Failed to allocate NVSHMEM grad buffer");
-        local_replica_grad_buffer_tensor = make_tensor_from_buffer(local_replica_grad_buffer,
-                                                                   {num_local_redundant_experts, expert_total_numel},
-                                                                   torch::kFloat32,
-                                                                   torch::Device(torch::kCUDA, device_id));
+        auto grad_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, device_id));
+        local_replica_grad_buffer_tensor = torch::from_blob(local_replica_grad_buffer,
+                                                            {num_local_redundant_experts, expert_total_numel},
+                                                            {expert_total_numel, 1},
+                                                            grad_opts);
+        local_replica_fc1_grad_buffer_tensor = torch::from_blob(local_replica_grad_buffer,
+                                                                {num_local_redundant_experts, expert_fc1_numel},
+                                                                {expert_total_numel, 1},
+                                                                grad_opts);
+        local_replica_fc2_grad_buffer_tensor =
+            torch::from_blob(reinterpret_cast<float*>(local_replica_grad_buffer) + expert_fc1_numel,
+                             {num_local_redundant_experts, expert_fc2_numel},
+                             {expert_total_numel, 1},
+                             grad_opts);
         local_replica_grad_buffer_tensor.zero_();
     }
 
@@ -208,6 +405,11 @@ Manager::Manager(const int& num_layers,
         global_replica_weight_buffer_ptrs[i] = nvshmem::ptr(local_replica_weight_buffer, target_rank);
         EP_HOST_ASSERT(global_replica_weight_buffer_ptrs[i] != nullptr &&
                        "nvshmem_ptr failed for weight buffer - target PE may not be in same NVL domain");
+        if (expert_weight_scale_total_numel > 0) {
+            global_replica_weight_scale_buffer_ptrs[i] = nvshmem::ptr(local_replica_weight_scale_buffer, target_rank);
+            EP_HOST_ASSERT(global_replica_weight_scale_buffer_ptrs[i] != nullptr &&
+                           "nvshmem_ptr failed for weight-scale buffer - target PE may not be in same NVL domain");
+        }
         global_weight_sync_ready_flag_ptrs[i] =
             reinterpret_cast<uint64_t*>(nvshmem::ptr(local_weight_sync_ready_flags, target_rank));
         EP_HOST_ASSERT(global_weight_sync_ready_flag_ptrs[i] != nullptr &&
@@ -244,20 +446,26 @@ Manager::Manager(const int& num_layers,
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_metadata, 2 * sizeof(int)));
 
     kernels::TaskBuildConfig config_cpu = {};
-    config_cpu.rank_idx = runtime::rank_idx;
-    config_cpu.nvl_rank_idx = runtime::nvl_rank_idx;
-    config_cpu.num_nvl_ranks = runtime::num_nvl_ranks;
-    config_cpu.num_local_master_experts = num_local_master_experts;
-    config_cpu.num_local_physical_experts = num_local_physical_experts;
-    config_cpu.num_local_redundant_experts = num_local_redundant_experts;
-    config_cpu.expert_fc1_numel = expert_fc1_numel;
-    config_cpu.expert_fc2_numel = expert_fc2_numel;
-    config_cpu.expert_total_numel = expert_total_numel;
-    config_cpu.max_replicas_dim = runtime::num_ranks;
-    config_cpu.weight_sync_plan_mode = weight_sync_plan_mode_;
-    config_cpu.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas_;
-    config_cpu.weight_sync_relay_max_relays = weight_sync_relay_max_relays_;
-    config_cpu.weight_sync_relay_min_fanout_gain = weight_sync_relay_min_fanout_gain_;
+    fill_task_build_config(config_cpu,
+                           num_local_master_experts,
+                           num_local_physical_experts,
+                           num_local_redundant_experts,
+                           expert_fc1_numel,
+                           expert_fc2_numel,
+                           expert_total_numel,
+                           expert_fc1_weight_scale_numel,
+                           expert_fc2_weight_scale_numel,
+                           expert_weight_scale_total_numel,
+                           expert_fc1_weight_scale_bytes,
+                           expert_fc2_weight_scale_bytes,
+                           expert_weight_scale_fc2_offset_bytes,
+                           expert_weight_scale_stride_bytes,
+                           weight_data_element_bytes,
+                           weight_scale_element_bytes,
+                           weight_sync_plan_mode_,
+                           weight_sync_relay_min_replicas_,
+                           weight_sync_relay_max_relays_,
+                           weight_sync_relay_min_fanout_gain_);
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_task_build_config, sizeof(kernels::TaskBuildConfig)));
     CUDA_RUNTIME_CHECK(
         cudaMemcpy(_task_build_config, &config_cpu, sizeof(kernels::TaskBuildConfig), cudaMemcpyHostToDevice));
@@ -267,6 +475,13 @@ Manager::Manager(const int& num_layers,
                                   global_replica_weight_buffer_ptrs,
                                   kernels::kMaxNvlDomainSize * sizeof(void*),
                                   cudaMemcpyHostToDevice));
+    if (expert_weight_scale_total_numel > 0) {
+        CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_weight_scale_ptrs, kernels::kMaxNvlDomainSize * sizeof(void*)));
+        CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_weight_scale_ptrs,
+                                      global_replica_weight_scale_buffer_ptrs,
+                                      kernels::kMaxNvlDomainSize * sizeof(void*),
+                                      cudaMemcpyHostToDevice));
+    }
     if (is_train) {
         CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_remote_grad_ptrs, kernels::kMaxNvlDomainSize * sizeof(void*)));
         CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_grad_ptrs,
@@ -275,19 +490,22 @@ Manager::Manager(const int& num_layers,
                                       cudaMemcpyHostToDevice));
     }
 
-    const int max_stage_tiles_per_expert = kernels::weight_sync_num_tiles(static_cast<size_t>(expert_fc1_numel)) +
-        kernels::weight_sync_num_tiles(static_cast<size_t>(expert_fc2_numel));
+    const int max_stage_tiles_per_expert = weight_sync_tiles_for_shards(expert_fc1_numel,
+                                                                        expert_fc2_numel,
+                                                                        expert_fc1_weight_scale_bytes,
+                                                                        expert_fc2_weight_scale_bytes,
+                                                                        weight_data_element_bytes);
     _max_ws_total_tiles = num_local_physical_experts * max_stage_tiles_per_expert;
 
     CUDA_RUNTIME_CHECK(cudaMalloc((void**)&_reroute_sparse_counters, num_global_logical_experts * sizeof(int)));
 
     global_logical_expert_loads =
-        reinterpret_cast<int*>(nvshmem::alloc(num_global_logical_experts * sizeof(int), kernels::kNvshmemAlignment));
+        reinterpret_cast<int*>(nvshmem::alloc(num_global_logical_experts * sizeof(int), kernels::kNumTMAAlignBytes));
     local_expert_loads = reinterpret_cast<int32_t*>(
-        nvshmem::alloc(num_global_logical_experts * sizeof(int32_t), kernels::kNvshmemAlignment));
+        nvshmem::alloc(num_global_logical_experts * sizeof(int32_t), kernels::kNumTMAAlignBytes));
     expert_loads_per_rank = reinterpret_cast<int32_t*>(
         nvshmem::alloc(static_cast<size_t>(runtime::num_ranks) * num_global_logical_experts * sizeof(int32_t),
-                       kernels::kNvshmemAlignment));
+                       kernels::kNumTMAAlignBytes));
     // Initialize default placement (master-only) for all layers so sparse reroute
     // remains valid before the first placement update.
     for (int lid = 0; lid < num_layers; ++lid) {
@@ -333,6 +551,10 @@ void Manager::destroy() {
     // Free NVSHMEM symmetric heap buffers
     nvshmem::free(local_replica_weight_buffer);
     local_replica_weight_buffer = nullptr;
+    if (local_replica_weight_scale_buffer != nullptr) {
+        nvshmem::free(local_replica_weight_scale_buffer);
+        local_replica_weight_scale_buffer = nullptr;
+    }
     if (local_weight_sync_ready_flags != nullptr) {
         nvshmem::free(local_weight_sync_ready_flags);
         local_weight_sync_ready_flags = nullptr;
@@ -355,6 +577,7 @@ void Manager::destroy() {
     // Clear remote pointers
     for (int i = 0; i < runtime::num_nvl_ranks; ++i) {
         global_replica_weight_buffer_ptrs[i] = nullptr;
+        global_replica_weight_scale_buffer_ptrs[i] = nullptr;
         global_replica_grad_buffer_ptrs[i] = nullptr;
         global_weight_sync_ready_flag_ptrs[i] = nullptr;
     }
@@ -395,6 +618,10 @@ void Manager::destroy() {
     if (_remote_weight_ptrs) {
         CUDA_RUNTIME_CHECK(cudaFree(_remote_weight_ptrs));
         _remote_weight_ptrs = nullptr;
+    }
+    if (_remote_weight_scale_ptrs) {
+        CUDA_RUNTIME_CHECK(cudaFree(_remote_weight_scale_ptrs));
+        _remote_weight_scale_ptrs = nullptr;
     }
     if (_remote_grad_ptrs) {
         CUDA_RUNTIME_CHECK(cudaFree(_remote_grad_ptrs));
@@ -763,28 +990,37 @@ void Manager::set_weight_sync_plan_mode(const int& plan_mode) {
     weight_sync_plan_mode_ = plan_mode;
     auto stream = at::cuda::getCurrentCUDAStream();
     if (local_weight_sync_ready_flags != nullptr) {
-        const int max_relay_chunks_per_shard =
-            kernels::weight_sync_num_chunks(static_cast<size_t>(std::max(expert_fc1_numel, expert_fc2_numel)));
-        const int64_t local_ready_flag_count =
-            static_cast<int64_t>(num_local_redundant_experts) * 2 * max_relay_chunks_per_shard;
+        const int max_relay_chunks_per_shard = max_weight_sync_chunks_per_shard(expert_fc1_numel,
+                                                                                expert_fc2_numel,
+                                                                                expert_fc1_weight_scale_bytes,
+                                                                                expert_fc2_weight_scale_bytes,
+                                                                                weight_data_element_bytes);
+        const int64_t local_ready_flag_count = static_cast<int64_t>(num_local_redundant_experts) *
+            weight_sync_num_shards(expert_weight_scale_total_numel) * max_relay_chunks_per_shard;
         CUDA_RUNTIME_CHECK(cudaMemsetAsync(
             local_weight_sync_ready_flags, 0, local_ready_flag_count * sizeof(uint64_t), stream.stream()));
     }
     kernels::TaskBuildConfig config_cpu = {};
-    config_cpu.rank_idx = runtime::rank_idx;
-    config_cpu.nvl_rank_idx = runtime::nvl_rank_idx;
-    config_cpu.num_nvl_ranks = runtime::num_nvl_ranks;
-    config_cpu.num_local_master_experts = num_local_master_experts;
-    config_cpu.num_local_physical_experts = num_local_physical_experts;
-    config_cpu.num_local_redundant_experts = num_local_redundant_experts;
-    config_cpu.expert_fc1_numel = expert_fc1_numel;
-    config_cpu.expert_fc2_numel = expert_fc2_numel;
-    config_cpu.expert_total_numel = expert_total_numel;
-    config_cpu.max_replicas_dim = runtime::num_ranks;
-    config_cpu.weight_sync_plan_mode = weight_sync_plan_mode_;
-    config_cpu.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas_;
-    config_cpu.weight_sync_relay_max_relays = weight_sync_relay_max_relays_;
-    config_cpu.weight_sync_relay_min_fanout_gain = weight_sync_relay_min_fanout_gain_;
+    fill_task_build_config(config_cpu,
+                           num_local_master_experts,
+                           num_local_physical_experts,
+                           num_local_redundant_experts,
+                           expert_fc1_numel,
+                           expert_fc2_numel,
+                           expert_total_numel,
+                           expert_fc1_weight_scale_numel,
+                           expert_fc2_weight_scale_numel,
+                           expert_weight_scale_total_numel,
+                           expert_fc1_weight_scale_bytes,
+                           expert_fc2_weight_scale_bytes,
+                           expert_weight_scale_fc2_offset_bytes,
+                           expert_weight_scale_stride_bytes,
+                           weight_data_element_bytes,
+                           weight_scale_element_bytes,
+                           weight_sync_plan_mode_,
+                           weight_sync_relay_min_replicas_,
+                           weight_sync_relay_max_relays_,
+                           weight_sync_relay_min_fanout_gain_);
     CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
         _task_build_config, &config_cpu, sizeof(kernels::TaskBuildConfig), cudaMemcpyHostToDevice, stream.stream()));
     CUDA_RUNTIME_CHECK(cudaStreamSynchronize(stream.stream()));
@@ -859,6 +1095,8 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
 std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_weight_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_weight_ptr_tensor,
+                                                torch::Tensor& local_master_fc1_weight_scale_ptr_tensor,
+                                                torch::Tensor& local_master_fc2_weight_scale_ptr_tensor,
                                                 std::optional<EventHandle>& previous_event,
                                                 bool async) {
     EP_HOST_ASSERT(is_available());
@@ -878,6 +1116,14 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.numel() == num_local_master_experts);
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.numel() == num_local_master_experts);
+    if (expert_weight_scale_total_numel > 0) {
+        EP_HOST_ASSERT(local_master_fc1_weight_scale_ptr_tensor.dtype() == torch::kInt64);
+        EP_HOST_ASSERT(local_master_fc2_weight_scale_ptr_tensor.dtype() == torch::kInt64);
+        EP_HOST_ASSERT(local_master_fc1_weight_scale_ptr_tensor.numel() == num_local_master_experts);
+        EP_HOST_ASSERT(local_master_fc2_weight_scale_ptr_tensor.numel() == num_local_master_experts);
+        EP_HOST_ASSERT(local_master_fc1_weight_scale_ptr_tensor.is_cuda());
+        EP_HOST_ASSERT(local_master_fc2_weight_scale_ptr_tensor.is_cuda());
+    }
     const bool enable_relay_stages = weight_sync_plan_mode_ != static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
         num_local_redundant_experts > 0 && runtime::num_nvl_ranks > 2;
     const uint64_t current_epoch = ++_weight_sync_epoch;
@@ -887,6 +1133,10 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.is_cuda());
     int64_t* local_master_fc1_weight_ptrs = local_master_fc1_weight_ptr_tensor.data_ptr<int64_t>();
     int64_t* local_master_fc2_weight_ptrs = local_master_fc2_weight_ptr_tensor.data_ptr<int64_t>();
+    int64_t* local_master_fc1_weight_scale_ptrs =
+        expert_weight_scale_total_numel > 0 ? local_master_fc1_weight_scale_ptr_tensor.data_ptr<int64_t>() : nullptr;
+    int64_t* local_master_fc2_weight_scale_ptrs =
+        expert_weight_scale_total_numel > 0 ? local_master_fc2_weight_scale_ptr_tensor.data_ptr<int64_t>() : nullptr;
 
     auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
         placement.get_device_ptrs(layer_id);
@@ -895,9 +1145,13 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                           logical_to_physical_map,
                                           logical_replica_counts,
                                           _remote_weight_ptrs,
+                                          _remote_weight_scale_ptrs,
                                           local_master_fc1_weight_ptrs,
                                           local_master_fc2_weight_ptrs,
-                                          reinterpret_cast<__nv_bfloat16*>(local_replica_weight_buffer),
+                                          local_master_fc1_weight_scale_ptrs,
+                                          local_master_fc2_weight_scale_ptrs,
+                                          reinterpret_cast<uint8_t*>(local_replica_weight_buffer),
+                                          reinterpret_cast<uint8_t*>(local_replica_weight_scale_buffer),
                                           _weight_sync_tasks,
                                           _task_tile_offsets,
                                           _task_metadata,

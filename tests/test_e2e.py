@@ -66,6 +66,24 @@ def deterministic_tensor(global_id: int | torch.Tensor, numel: int, dtype: torch
     return values.to(dtype)
 
 
+def dtype_for_element_bytes(num_bytes: int) -> torch.dtype:
+    mapping = {
+        1: torch.uint8,
+        2: torch.bfloat16,
+        4: torch.float32,
+        8: torch.float64,
+    }
+    if num_bytes not in mapping:
+        raise ValueError("Supported test element byte sizes are: 1, 2, 4, 8")
+    return mapping[num_bytes]
+
+
+def randomize_tensor(tensor: torch.Tensor):
+    if tensor.numel() == 0:
+        return
+    tensor.view(torch.uint8).random_(0, 256)
+
+
 def setup_dist():
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
@@ -86,6 +104,11 @@ def create_manager(args, group):
         num_local_redundant_experts=args.num_redundant_experts_per_rank,
         expert_fc1_numel=args.expert_fc1_numel,
         expert_fc2_numel=args.expert_fc2_numel,
+        weight_data_dtype=args.weight_data_dtype,
+        weight_scale_dtype=args.weight_scale_dtype,
+        expert_fc1_weight_scale_numel=args.expert_fc1_weight_scale_numel,
+        expert_fc2_weight_scale_numel=args.expert_fc2_weight_scale_numel,
+        grad_dtype=args.grad_dtype,
         explicitly_destroy=True,
     )
 
@@ -113,7 +136,9 @@ def make_probs(routing_map: torch.Tensor):
     return probs
 
 
-def expected_replica_weights(manager, args, layer_id, before):
+def expected_replica_weights(
+    manager, args, layer_id, before_data, before_fc1_scales, before_fc2_scales
+):
     rank = dist.get_rank()
     num_local_physical = manager.num_local_physical_experts
     placement_device = manager.physical_to_logical_map.device
@@ -124,22 +149,37 @@ def expected_replica_weights(manager, args, layer_id, before):
     )
     logical = manager.physical_to_logical_map[layer_id, local_replica_phys]
     valid = logical >= 0
-    expected = before.clone()
+    expected_data = before_data.clone()
+    expected_fc1_scales = before_fc1_scales.clone()
+    expected_fc2_scales = before_fc2_scales.clone()
     if not bool(valid.any().item()):
-        return expected
+        return expected_data, expected_fc1_scales, expected_fc2_scales
 
     master_phys = manager.logical_to_physical_map[layer_id, logical.clamp_min(0), 0]
     for local_replica_idx in torch.nonzero(valid, as_tuple=False).flatten().tolist():
         gid = int(master_phys[local_replica_idx].item())
-        expected[local_replica_idx, : args.expert_fc1_numel] = deterministic_tensor(
-            gid, args.expert_fc1_numel, torch.bfloat16
+        expected_data[local_replica_idx, : args.expert_fc1_numel] = (
+            deterministic_tensor(gid, args.expert_fc1_numel, args.weight_data_dtype)
         )
-        expected[local_replica_idx, args.expert_fc1_numel :] = deterministic_tensor(
-            gid + manager.num_global_physical_experts,
-            args.expert_fc2_numel,
-            torch.bfloat16,
+        expected_data[local_replica_idx, args.expert_fc1_numel :] = (
+            deterministic_tensor(
+                gid + manager.num_global_physical_experts,
+                args.expert_fc2_numel,
+                args.weight_data_dtype,
+            )
         )
-    return expected
+        if args.expert_weight_scale_total_numel > 0:
+            expected_fc1_scales[local_replica_idx] = deterministic_tensor(
+                gid + 2 * manager.num_global_physical_experts,
+                args.expert_fc1_weight_scale_numel,
+                args.weight_scale_dtype,
+            )
+            expected_fc2_scales[local_replica_idx] = deterministic_tensor(
+                gid + 3 * manager.num_global_physical_experts,
+                args.expert_fc2_weight_scale_numel,
+                args.weight_scale_dtype,
+            )
+    return expected_data, expected_fc1_scales, expected_fc2_scales
 
 
 def expected_master_grads(manager, args, layer_id, fc1_grads, fc2_grads):
@@ -236,7 +276,7 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
         deterministic_tensor(
             dist.get_rank() * manager.num_local_physical_experts + local_idx,
             args.expert_fc1_numel,
-            torch.bfloat16,
+            args.weight_data_dtype,
         )
         for local_idx in range(args.num_local_master)
     ]
@@ -246,33 +286,85 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
             + local_idx
             + manager.num_global_physical_experts,
             args.expert_fc2_numel,
-            torch.bfloat16,
+            args.weight_data_dtype,
         )
         for local_idx in range(args.num_local_master)
     ]
+    fc1_scales = None
+    fc2_scales = None
+    if args.expert_weight_scale_total_numel > 0:
+        fc1_scales = [
+            deterministic_tensor(
+                dist.get_rank() * manager.num_local_physical_experts
+                + local_idx
+                + 2 * manager.num_global_physical_experts,
+                args.expert_fc1_weight_scale_numel,
+                args.weight_scale_dtype,
+            )
+            for local_idx in range(args.num_local_master)
+        ]
+        fc2_scales = [
+            deterministic_tensor(
+                dist.get_rank() * manager.num_local_physical_experts
+                + local_idx
+                + 3 * manager.num_global_physical_experts,
+                args.expert_fc2_weight_scale_numel,
+                args.weight_scale_dtype,
+            )
+            for local_idx in range(args.num_local_master)
+        ]
     dummy_grads = [
-        torch.empty(0, device="cuda", dtype=torch.float32)
+        torch.empty(0, device="cuda", dtype=args.grad_dtype)
         for _ in range(args.num_local_master)
     ]
     manager.construct_local_master_ptr_pool(
-        layer_id, fc1_weights, fc2_weights, dummy_grads, dummy_grads
+        layer_id,
+        fc1_weights,
+        fc2_weights,
+        dummy_grads,
+        dummy_grads,
+        fc1_weight_scales=fc1_scales,
+        fc2_weight_scales=fc2_scales,
     )
     replica = manager.local_replica_weight_buffer
-    replica.random_(0, 3)
-    expected = expected_replica_weights(manager, args, layer_id, replica.clone())
+    assert bitwise_equal(
+        manager.local_replica_fc1_weight_buffer, replica[:, : args.expert_fc1_numel]
+    )
+    assert bitwise_equal(
+        manager.local_replica_fc2_weight_buffer, replica[:, args.expert_fc1_numel :]
+    )
+    replica_fc1_scales = manager.local_replica_fc1_weight_scale_buffer
+    replica_fc2_scales = manager.local_replica_fc2_weight_scale_buffer
+    randomize_tensor(replica)
+    randomize_tensor(replica_fc1_scales)
+    randomize_tensor(replica_fc2_scales)
+    expected, expected_fc1_scales, expected_fc2_scales = expected_replica_weights(
+        manager,
+        args,
+        layer_id,
+        replica.clone(),
+        replica_fc1_scales.clone(),
+        replica_fc2_scales.clone(),
+    )
     dist.barrier()
     manager.weight_sync(layer_id, async_finish=False)
     torch.cuda.synchronize()
     dist.barrier()
-    assert bitwise_equal(
-        replica, expected
+    data_ok = bitwise_equal(replica, expected)
+    scales_ok = bitwise_equal(
+        replica_fc1_scales, expected_fc1_scales
+    ) and bitwise_equal(replica_fc2_scales, expected_fc2_scales)
+    assert (
+        data_ok and scales_ok
     ), f"weight_sync bitwise mismatch on rank {dist.get_rank()}"
 
     def sync_once():
         manager.weight_sync(layer_id, async_finish=False)
 
     def randomize_replica():
-        replica.random_(0, 3)
+        randomize_tensor(replica)
+        randomize_tensor(replica_fc1_scales)
+        randomize_tensor(replica_fc2_scales)
 
     avg, _, _ = bench(
         sync_once,
@@ -289,11 +381,14 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
         suppress_kineto_output=True,
     )
     kernel = sum(kernel_parts)
+    detail = f"{args.weight_data_bytes}B data bitwise PASS"
+    if args.expert_weight_scale_total_numel > 0:
+        detail += f", {args.weight_scale_bytes}B scales bitwise PASS"
     print_metric(
         f"weight_sync/{plan_mode}",
         avg * 1000,
         kernel * 1000,
-        "bitwise PASS",
+        detail,
         print_fn=print_rank0,
     )
 
@@ -301,13 +396,23 @@ def run_weight_sync(manager, args, layer_id, plan_mode: str):
 def run_grad_reduce(manager, args, layer_id, deterministic: bool):
     manager.set_grad_reduce_deterministic(deterministic)
     fc1_weights = [
-        torch.empty(0, device="cuda", dtype=torch.bfloat16)
+        torch.empty(0, device="cuda", dtype=args.weight_data_dtype)
         for _ in range(args.num_local_master)
     ]
     fc2_weights = [
-        torch.empty(0, device="cuda", dtype=torch.bfloat16)
+        torch.empty(0, device="cuda", dtype=args.weight_data_dtype)
         for _ in range(args.num_local_master)
     ]
+    fc1_scales = fc2_scales = None
+    if args.expert_weight_scale_total_numel > 0:
+        fc1_scales = [
+            torch.empty(0, device="cuda", dtype=args.weight_scale_dtype)
+            for _ in range(args.num_local_master)
+        ]
+        fc2_scales = [
+            torch.empty(0, device="cuda", dtype=args.weight_scale_dtype)
+            for _ in range(args.num_local_master)
+        ]
     fc1_grads = [
         deterministic_tensor(
             dist.get_rank() * manager.num_local_physical_experts + local_idx,
@@ -327,9 +432,21 @@ def run_grad_reduce(manager, args, layer_id, deterministic: bool):
         for local_idx in range(args.num_local_master)
     ]
     manager.construct_local_master_ptr_pool(
-        layer_id, fc1_weights, fc2_weights, fc1_grads, fc2_grads
+        layer_id,
+        fc1_weights,
+        fc2_weights,
+        fc1_grads,
+        fc2_grads,
+        fc1_weight_scales=fc1_scales,
+        fc2_weight_scales=fc2_scales,
     )
     replica = manager.local_replica_grad_buffer
+    assert bitwise_equal(
+        manager.local_replica_fc1_grad_buffer, replica[:, : args.expert_fc1_numel]
+    )
+    assert bitwise_equal(
+        manager.local_replica_fc2_grad_buffer, replica[:, args.expert_fc1_numel :]
+    )
     replica_ref = torch.empty_like(replica)
     replica_base = (
         dist.get_rank() * manager.num_local_physical_experts + args.num_local_master
@@ -583,6 +700,20 @@ def main():
     )
     parser.add_argument("--expert-fc1-numel", type=int, default=3072 * 4096)
     parser.add_argument("--expert-fc2-numel", type=int, default=1536 * 4096)
+    parser.add_argument(
+        "--weight-data-bytes",
+        type=int,
+        default=2,
+        help="Expert weight data element bytes used by the byte-copy test.",
+    )
+    parser.add_argument(
+        "--weight-scale-bytes",
+        type=int,
+        default=4,
+        help="Expert weight scale element bytes used when scale numel is non-zero.",
+    )
+    parser.add_argument("--expert-fc1-weight-scale-numel", type=int, default=0)
+    parser.add_argument("--expert-fc2-weight-scale-numel", type=int, default=0)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--include-token-a2a", action="store_true")
     parser.add_argument(
@@ -600,6 +731,14 @@ def main():
     args = parser.parse_args()
     if any(ratio < 1.0 for ratio in args.imbalance_ratios):
         raise ValueError("--imbalance-ratios entries must be >= 1")
+    if args.expert_fc1_weight_scale_numel < 0 or args.expert_fc2_weight_scale_numel < 0:
+        raise ValueError("expert weight scale numel must be non-negative")
+    args.weight_data_dtype = dtype_for_element_bytes(args.weight_data_bytes)
+    args.weight_scale_dtype = dtype_for_element_bytes(args.weight_scale_bytes)
+    args.grad_dtype = torch.float32
+    args.expert_weight_scale_total_numel = (
+        args.expert_fc1_weight_scale_numel + args.expert_fc2_weight_scale_numel
+    )
 
     group = setup_dist()
     manager = create_manager(args, group)
@@ -608,7 +747,9 @@ def main():
         f"world={dist.get_world_size()} experts={args.num_experts} "
         f"local_master/rank={args.num_local_master} "
         f"redundant/rank={args.num_redundant_experts_per_rank} topk={args.topk} "
-        f"tokens/rank<= {args.tokens_per_rank}",
+        f"tokens/rank<= {args.tokens_per_rank} "
+        f"weight_data_bytes={args.weight_data_bytes} "
+        f"scales={args.expert_weight_scale_total_numel}x{args.weight_scale_bytes}B",
         print_fn=print_rank0,
     )
 
