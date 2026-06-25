@@ -40,13 +40,13 @@ def load_tuning_from_env() -> UltraEPTuning:
     weight_sync_plan_mode = _normalize_weight_sync_plan_mode(
         read_str_env("ULTRA_EP_WEIGHT_SYNC_PLAN_MODE", "adaptive")
     )
-    grad_reduce_num_sms = read_int_env("ULTRA_EP_GRAD_REDUCE_NUM_SMS", 24)
+    grad_reduce_num_sms = read_int_env("ULTRA_EP_GRAD_REDUCE_NUM_SMS", 42)
     if grad_reduce_num_sms <= 0:
         raise ValueError("ULTRA_EP_GRAD_REDUCE_NUM_SMS must be positive")
     if grad_reduce_num_sms % 2 != 0:
         raise ValueError("ULTRA_EP_GRAD_REDUCE_NUM_SMS must be even")
     grad_reduce_deterministic = read_bool_env(
-        "ULTRA_EP_GRAD_REDUCE_DETERMINISTIC", False
+        "ULTRA_EP_GRAD_REDUCE_DETERMINISTIC", True
     )
 
     quota_kernel_stage = read_int_env("ULTRA_EP_QUOTA_KERNEL_STAGE", 1)

@@ -215,11 +215,11 @@ python -m ultra_ep.load_viewer --path <path/to/ultra_ep_traces> --host 0.0.0.0 -
 ### Communication Planning
 
 - `ULTRA_EP_GRAD_REDUCE_NUM_SMS`  
-  Default: `24`  
+  Default: `42`  
   Number of SMs reserved for the persistent grad-reduce kernel. Must be positive and even.
 
 - `ULTRA_EP_GRAD_REDUCE_DETERMINISTIC`
-  Default: `0`
+  Default: `1`
   Enables the deterministic non-atomic grad-reduce path. Use more SMs to alleviate performance drop.
 
 - `ULTRA_EP_WEIGHT_SYNC_PLAN_MODE`  
