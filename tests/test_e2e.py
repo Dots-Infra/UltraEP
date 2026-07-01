@@ -264,7 +264,7 @@ def run_update_and_reroute(manager, args, layer_id, routing_map, probs):
         reroute_kernel * 1000,
         f"rank max/mean {max_mean(rank_load_before).item():.3f} -> "
         f"{max_mean(rank_load_after).item():.3f} "
-        f"(lower bound {physical_lower_bound.item():.3f})",
+        f"(LB: {physical_lower_bound.item():.3f})",
         print_fn=print_rank0,
     )
     return expanded_probs, expanded_routing
@@ -676,8 +676,7 @@ def run_case(manager, args, ratio: float):
     )
     for plan_mode in args.weight_sync_plan_modes:
         run_weight_sync(manager, args, layer_id, plan_mode)
-    for deterministic in (False, True):
-        run_grad_reduce(manager, args, layer_id, deterministic)
+    run_grad_reduce(manager, args, layer_id, manager.grad_reduce_deterministic)
     if args.include_token_a2a:
         run_hybridep_a2a(args, expanded_routing)
 
@@ -743,14 +742,15 @@ def main():
     group = setup_dist()
     manager = create_manager(args, group)
     print_section(
-        "UltraEP E2E Test | "
+        "UltraEP E2E Test\n"
         f"world={dist.get_world_size()} experts={args.num_experts} "
         f"local_master/rank={args.num_local_master} "
         f"redundant/rank={args.num_redundant_experts_per_rank} topk={args.topk} "
-        f"tokens/rank<= {args.tokens_per_rank} "
+        f"tokens/rank<= {args.tokens_per_rank}\n"
         f"weight_data_bytes={args.weight_data_bytes} "
-        f"scales={args.expert_weight_scale_total_numel}x{args.weight_scale_bytes}B",
+        f"scales={args.expert_weight_scale_total_numel} x {args.weight_scale_bytes}B",
         print_fn=print_rank0,
+        emphasize_title=True,
     )
 
     try:

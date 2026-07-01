@@ -222,6 +222,7 @@ def report_solution(
     args,
     rank_quota_prefixes=None,
     no_locality_rank_quota_prefixes=None,
+    show_e2e: bool = False,
 ):
     p2l, l2p, lcnts, quota, _, _ = solution
     legacy = mode == "legacy"
@@ -261,17 +262,17 @@ def report_solution(
     replica_summary = summarize_vector(replicas)
 
     W = 26  # label column width (right-aligned colon)
-    print(
-        f"  [{mode}] "
-        f"solve e2e {timings['e2e_ms']:>8.3f} ms | "
-        f"placement kernel {timings['quota_kernel_ms']:>8.3f} ms | "
-        f"reroute kernel {timings['reroute_kernel_ms']:>8.3f} ms",
-        flush=True,
+    timing = (
+        f"kernel time: placement {timings['quota_kernel_ms']:>8.3f} ms | "
+        f"reroute {timings['reroute_kernel_ms']:>8.3f} ms"
     )
+    if show_e2e:
+        timing = f"solve e2e time: {timings['e2e_ms']:>8.3f} ms | {timing}"
+    print(f"  [{mode}] {timing}", flush=True)
     print(
         f"    {'rank max/mean':<{W}}: {max_mean(rank_loads_before).item():.3f} -> "
         f"{max_mean(rank_loads_after).item():.3f} "
-        f"(lower bound: {physical_lower_bound.item():.3f})",
+        f"(LB: {physical_lower_bound.item():.3f})",
         flush=True,
     )
     print(
@@ -487,9 +488,11 @@ def main():
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
 
     print_section(
-        f"UltraEP Solving Test | ranks={args.num_ranks} nvl={args.nvl_domain_size} "
-        f"experts={args.num_experts} local_master/rank={args.num_local_master} "
+        "UltraEP Solving Test\n"
+        f"ranks={args.num_ranks} nvl={args.nvl_domain_size} "
+        f"experts={args.num_experts} local_master/rank={args.num_local_master}\n"
         f"redundant/rank={args.num_redundant_experts_per_rank} topk={args.topk}",
+        emphasize_title=True,
     )
     for ratio in args.imbalance_ratios:
         for mode in args.modes:

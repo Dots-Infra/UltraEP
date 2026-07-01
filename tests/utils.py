@@ -21,19 +21,38 @@ def emit_line(msg: str = "", print_fn=None):
         print_fn(msg)
 
 
-def print_section(title: str, sep: str = "=", print_fn=None):
+def print_section(
+    title: str, sep: str = "=", print_fn=None, emphasize_title: bool = False
+):
+    lines = title.splitlines() or [""]
     emit_line("", print_fn)
     emit_line(sep * SECTION_WIDTH, print_fn)
-    emit_line(title, print_fn)
+    if emphasize_title:
+        emit_line(lines[0].center(SECTION_WIDTH), print_fn)
+        if len(lines) > 1:
+            emit_line("-" * SECTION_WIDTH, print_fn)
+            for line in lines[1:]:
+                emit_line(line, print_fn)
+    else:
+        for line in lines:
+            emit_line(line, print_fn)
     emit_line(sep * SECTION_WIDTH, print_fn)
 
 
 def print_metric(
-    name: str, e2e_ms: float, kernel_ms: float, extra: str = "", print_fn=None
+    name: str,
+    e2e_ms: float,
+    kernel_ms: float,
+    extra: str = "",
+    print_fn=None,
+    show_e2e: bool = False,
 ):
     suffix = f" | {extra}" if extra else ""
+    timing = f"kernel time: {kernel_ms:>9.3f} ms"
+    if show_e2e:
+        timing = f"e2e time: {e2e_ms:>9.3f} ms | {timing}"
     emit_line(
-        f"  {name:<28} e2e {e2e_ms:>9.3f} ms | kernel {kernel_ms:>9.3f} ms{suffix}",
+        f"  {name:<28} {timing}{suffix}",
         print_fn,
     )
 
