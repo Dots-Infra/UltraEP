@@ -72,7 +72,7 @@ def load_tuning_from_env() -> UltraEPTuning:
         weight_sync_plan_mode=weight_sync_plan_mode,
         weight_sync_plan_mode_id=_WEIGHT_SYNC_PLAN_MODE_IDS[weight_sync_plan_mode],
         weight_sync_relay_min_replicas=read_int_env(
-            "ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_REPLICAS", 6
+            "ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_REPLICAS", 4
         ),
         weight_sync_relay_max_relays=read_int_env(
             "ULTRA_EP_WEIGHT_SYNC_RELAY_MAX_RELAYS", 8

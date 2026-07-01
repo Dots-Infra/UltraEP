@@ -220,14 +220,14 @@ python -m ultra_ep.load_viewer --path <path/to/ultra_ep_traces> --host 0.0.0.0 -
 
 - `ULTRA_EP_GRAD_REDUCE_DETERMINISTIC`
   Default: `1`
-  Enables the deterministic non-atomic grad-reduce path. Use more SMs to alleviate performance drop.
+  Enables the deterministic non-atomic grad-reduce path.
 
 - `ULTRA_EP_WEIGHT_SYNC_PLAN_MODE`  
   Default: `adaptive`  
   Supported values: `direct`, `adaptive`, `force_relay`.
 
 - `ULTRA_EP_WEIGHT_SYNC_RELAY_MIN_REPLICAS`  
-  Default: `6`  
+  Default: `4`
   Minimum replica count before adaptive relay becomes eligible.
 
 - `ULTRA_EP_WEIGHT_SYNC_RELAY_MAX_RELAYS`  

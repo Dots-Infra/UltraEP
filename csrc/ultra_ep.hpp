@@ -230,9 +230,9 @@ public:
             const int& quota_kernel_stage = 1,
             const bool& quota_reroute_interleave = true,
             const int& grad_reduce_num_sms = 24,
-            const bool& grad_reduce_deterministic = false,
+            const bool& grad_reduce_deterministic = true,
             const int& weight_sync_plan_mode = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
-            const int& weight_sync_relay_min_replicas = 6,
+            const int& weight_sync_relay_min_replicas = 4,
             const int& weight_sync_relay_max_relays = 8,
             const int& weight_sync_relay_min_fanout_gain = 2);
     ~Manager() noexcept(false);
@@ -374,9 +374,9 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("quota_kernel_stage") = 1,
              pybind11::arg("quota_reroute_interleave") = true,
              pybind11::arg("grad_reduce_num_sms") = 24,
-             pybind11::arg("grad_reduce_deterministic") = false,
+             pybind11::arg("grad_reduce_deterministic") = true,
              pybind11::arg("weight_sync_plan_mode") = static_cast<int>(kernels::WeightSyncPlanMode::kAdaptive),
-             pybind11::arg("weight_sync_relay_min_replicas") = 6,
+             pybind11::arg("weight_sync_relay_min_replicas") = 4,
              pybind11::arg("weight_sync_relay_max_relays") = 8,
              pybind11::arg("weight_sync_relay_min_fanout_gain") = 2)
         .def("destroy", &Manager::destroy)
