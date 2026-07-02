@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="{{ page.lang | default: site.lang | default: 'en' }}" data-theme="light">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% if page.title %}{{ page.title }} | {% endif %}{{ site.title }}</title>
+    {% if page.description or site.description %}
+    <meta name="description" content="{{ page.description | default: site.description }}">
+    {% endif %}
+    <base href="{{ '/' | relative_url }}">
+    <script>
+      (function () {
+        try {
+          var theme = localStorage.getItem("ultraep-blog-theme");
+          if (theme === "dark" || theme === "light") {
+            document.documentElement.setAttribute("data-theme", theme);
+          }
+        } catch (error) {
+          document.documentElement.setAttribute("data-theme", "light");
+        }
+      })();
+    </script>
+    {% if page.redirect_to %}
+    <meta http-equiv="refresh" content="0; url={{ page.redirect_to | relative_url }}">
+    <link rel="canonical" href="{{ page.redirect_to | absolute_url }}">
+    <script>
+      window.location.replace("{{ page.redirect_to | relative_url }}");
+    </script>
+    {% endif %}
+    <link rel="stylesheet" href="{{ '/assets/blog.css' | relative_url }}">
+  </head>
+  <body>
+    <header class="blog-topbar" aria-label="Site controls">
+      <div class="blog-topbar__inner">
+        <a class="blog-brand" href="{{ '/en/' | relative_url }}">UltraEP</a>
+        <div class="blog-actions">
+          <nav class="blog-language-switch" aria-label="Language switch">
+            <a class="blog-language-switch__link{% if page.lang != 'zh-CN' %} blog-language-switch__link--active{% endif %}" href="{{ '/en/' | relative_url }}"{% if page.lang != 'zh-CN' %} aria-current="page"{% endif %} aria-label="English version">EN</a>
+            <a class="blog-language-switch__link{% if page.lang == 'zh-CN' %} blog-language-switch__link--active{% endif %}" href="{{ '/zh/' | relative_url }}"{% if page.lang == 'zh-CN' %} aria-current="page"{% endif %} aria-label="中文版本">中</a>
+          </nav>
+          <button class="blog-theme-toggle" type="button" aria-label="Switch color theme" aria-pressed="false" data-theme-toggle>
+            <svg class="blog-theme-toggle__icon blog-theme-toggle__icon--light" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 4.75V3m0 18v-1.75M4.75 12H3m18 0h-1.75M6.7 6.7 5.46 5.46m13.08 13.08-1.24-1.24M17.3 6.7l1.24-1.24M5.46 18.54l1.24-1.24M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z"/>
+            </svg>
+            <svg class="blog-theme-toggle__icon blog-theme-toggle__icon--dark" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20.2 14.4A7.5 7.5 0 0 1 9.6 3.8a8.5 8.5 0 1 0 10.6 10.6Z"/>
+            </svg>
+            <span class="blog-theme-toggle__label blog-visually-hidden">Light</span>
+          </button>
+          <a class="blog-github-link" href="{{ site.github_url | default: 'https://github.com/' }}" target="_blank" rel="noopener noreferrer" aria-label="GitHub repository placeholder">
+            <svg class="blog-github-link__icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.6 7.6 0 0 1 8 3.86c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>
+            </svg>
+            <span class="blog-github-link__label blog-visually-hidden">GitHub</span>
+          </a>
+        </div>
+      </div>
+    </header>
+    <main class="{% if page.redirect_to %}blog-redirect{% else %}blog-page{% endif %}">
+      {{ content }}
+    </main>
+    <script>
+      (function () {
+        var button = document.querySelector("[data-theme-toggle]");
+        var label = button && button.querySelector(".blog-theme-toggle__label");
+        function applyTheme(theme) {
+          document.documentElement.setAttribute("data-theme", theme);
+          if (button) {
+            button.setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+          }
+          if (label) {
+            label.textContent = theme === "dark" ? "Dark" : "Light";
+          }
+          try {
+            localStorage.setItem("ultraep-blog-theme", theme);
+          } catch (error) {}
+        }
+        if (!button) {
+          return;
+        }
+        applyTheme(document.documentElement.getAttribute("data-theme") || "light");
+        button.addEventListener("click", function () {
+          var current = document.documentElement.getAttribute("data-theme") || "light";
+          applyTheme(current === "dark" ? "light" : "dark");
+        });
+      })();
+    </script>
+  </body>
+</html>

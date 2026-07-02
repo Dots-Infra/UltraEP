@@ -19,11 +19,11 @@ build/
 *.so
 *.egg-info/
 dist/
+docs/_site/
+docs/.jekyll-cache/
+docs/.sass-cache/
+docs/.bundle/
+docs/vendor/
 
-# Bench artifacts
-bench_result/
+# Logging
 *.log
-
-# Docs and local notes
-*.md
-!README.md

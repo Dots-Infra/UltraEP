@@ -1,0 +1,10 @@
+source "https://rubygems.org"
+
+# Use modern Jekyll for local preview on Homebrew Ruby 4.
+# The site only uses core Jekyll features, so this stays close enough for the
+# simple two-page GitHub Pages deployment planned here.
+gem "jekyll", "~> 4.4"
+gem "liquid", ">= 4.0.4", "< 5.0"
+gem "bigdecimal", "~> 3.2"
+gem "csv", "~> 3.3"
+gem "webrick", "~> 1.8"
