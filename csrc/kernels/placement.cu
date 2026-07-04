@@ -38,19 +38,6 @@ struct ExportPlanEntry {
     int quota;
 };
 
-struct V4OracleTask {
-    int source_rank_local;
-    int expert_local;
-    int expert_pos;
-    int need;
-    int available;
-    int min_tokens;
-    int target_1;
-    int quota_1;
-    int target_2;
-    int quota_2;
-};
-
 __device__ __forceinline__ bool occ_has(uint64_t low, uint64_t high, int rank_local) {
     if (rank_local < 64) {
         return ((low >> rank_local) & 1ULL) != 0ULL;
