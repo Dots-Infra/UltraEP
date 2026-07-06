@@ -1,15 +1,12 @@
 title: UltraEP Blog
 description: UltraEP blog in Chinese and English.
 lang: en
-github_url: "https://github.com/"
+github_url: "https://github.com/Dots-Infra/UltraEP"
 markdown: kramdown
 permalink: pretty
 
-# Keep this empty for local preview and custom-domain deployment.
-# TODO: If this is deployed as a GitHub project page, set baseurl to the
-# repository path, for example "/UltraEP".
-baseurl: ""
-url: ""
+baseurl: "/UltraEP"
+url: "https://Dots-Infra.github.io"
 
 exclude:
   - .bundle

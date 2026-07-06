@@ -1,12 +1,12 @@
 ---
 layout: default
-title: UltraEP Blog
-description: UltraEP blog in Chinese and English.
+title: UltraEP English Blog
+description: Redirecting to the canonical UltraEP English blog.
 lang: en
-permalink: /
-redirect_to: /en/
+permalink: /en/
+redirect_to: /
 ---
 
-Redirecting to the English blog.
+Redirecting to the canonical English blog.
 
-[English]({{ '/en/' | relative_url }}) · [中文]({{ '/zh/' | relative_url }})
+[English]({{ '/' | relative_url }}) · [中文]({{ '/zh/' | relative_url }})

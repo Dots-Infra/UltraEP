@@ -222,7 +222,8 @@ html[data-theme="dark"] .blog-theme-toggle__icon--dark {
   width: 100%;
 }
 
-.blog-figure img {
+.blog-figure img,
+.blog-figure video {
   background: #ffffff;
   display: block;
   height: auto;
@@ -234,7 +235,8 @@ html[data-theme="dark"] .blog-theme-toggle__icon--dark {
   max-width: var(--blog-content-width);
 }
 
-.blog-figure-full img {
+.blog-figure-full img,
+.blog-figure-full video {
   width: 100%;
 }
 
@@ -243,7 +245,8 @@ html[data-theme="dark"] .blog-theme-toggle__icon--dark {
   max-width: 540px;
 }
 
-.blog-figure-narrow img {
+.blog-figure-narrow img,
+.blog-figure-narrow video {
   width: 100%;
 }
 
