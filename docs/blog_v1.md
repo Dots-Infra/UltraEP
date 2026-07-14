@@ -15,7 +15,7 @@ permalink: /
   <p>On mainstream MoE models from 106B to 671B parameters, UltraEP reaches <strong>94.3%</strong> of the force-balanced ideal performance on average, a <strong>1.49×</strong> improvement over state-of-the-art training and inference frameworks, and reduces inter-rank load imbalance (max : mean) from 1.30–4.01 to <strong>1.01–1.04</strong>. UltraEP has also been deployed in production-scale training.</p>
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-eval_highlights.png" alt="EP overview" width="2737" height="1093" loading="eager" decoding="async" fetchpriority="high">
+  <img src="assets/images/blog-eval_highlights.webp" alt="EP overview" width="1560" height="623" loading="eager" decoding="async" fetchpriority="high">
   <figcaption>UltraEP substantially improves the training and inference throughput of mainstream MoE models, approaching near-ideal performance.</figcaption>
 </figure>
 </section>
@@ -29,7 +29,7 @@ To exploit this architecture, **expert parallelism** (EP) is widely adopted for 
 **Expert load imbalance** is the key factor limiting the real-world performance of expert parallelism. Because of routing dynamics, the instantaneous load on different experts and devices—the total number of tokens received—is inherently uneven. This causes expert computation stragglers, token all-to-all bottlenecks, and activation memory spikes. For a fixed total expert count, the number of experts placed on each rank shrinks as EP grows, making imbalance harder to smooth out; large-scale expert parallelism therefore amplifies the problem further.
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-bg-ep.png" alt="EP overview" width="3134" height="1022" loading="lazy" decoding="async">
+  <img src="assets/images/blog-bg-ep.webp" alt="EP overview" width="1560" height="509" loading="eager" decoding="async">
   <figcaption>MoE expert parallelism (EP) and load imbalance: 4 experts, EP2, top-k = 2.</figcaption>
 </figure>
 
@@ -44,7 +44,7 @@ UltraEP takes a seemingly aggressive but most direct approach: based on the **ex
 This approach obviously eliminates prediction-induced error, but its challenge is equally obvious: predictive methods can hide or amortize the overhead of balancing operations ahead of time, whereas UltraEP exposes this overhead on **critical path** and rebalances at the finest **microbatch** granularity.
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-overview.png" alt="UltraEP overview" width="1690" height="924" loading="lazy" decoding="async">
+  <img src="assets/images/blog-overview.webp" alt="UltraEP overview" width="1560" height="853" loading="eager" decoding="async">
   <figcaption>UltraEP versus predictive balancing schemes such as EPLB, along three axes: load fidelity, decision timing, and balancing frequency.</figcaption>
 </figure>
 
@@ -72,7 +72,7 @@ On top of the framework's original expert layout, UltraEP reserves a fixed numbe
 For redundant-expert weight and gradient buffers, UltraEP adopts **cross-layer reuse**, which saves memory dramatically. On Qwen3-235B, for example, the extra memory introduced by a single redundant-expert slot on each EP rank drops from 9.9 GB to 108 MB. This cross-layer reuse is also consistent with UltraEP's per-layer real-time operation.
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-expert-layout.png" alt="Expert layout" width="1382" height="628" loading="lazy" decoding="async">
+  <img src="assets/images/blog-expert-layout.webp" alt="Expert layout" width="1382" height="628" loading="lazy" decoding="async">
   <figcaption>UltraEP expert memory management: 8 main experts, EP4, one redundant-expert slot per rank.</figcaption>
 </figure>
 
@@ -85,12 +85,12 @@ In the forward pass, due to data dependency, UltraEP can only perform **replicat
 Optimizations for replication planning (control plane) and weight distribution (data plane) are covered in the next section; these two hot-path operations saturate GPU SM resources to maximize hardware utilization. Overall, based on the EP64 results, UltraEP keeps its extra critical-path overhead within 300 µs, only 1%–2% of the end-to-end time.
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-timeline-fwd.png" alt="FWD timeline" width="1232" height="392" loading="lazy" decoding="async">
+  <img src="assets/images/blog-timeline-fwd.webp" alt="FWD timeline" width="1232" height="392" loading="lazy" decoding="async">
   <figcaption>In the forward pass, replication planning and the actual weight transfer fall on the critical path.</figcaption>
 </figure>
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-nsys-fwd.png" alt="FWD nsys timeline" width="2761" height="434" loading="lazy" decoding="async">
+  <img src="assets/images/blog-nsys-fwd.webp" alt="FWD nsys timeline" width="1560" height="246" loading="lazy" decoding="async">
   <figcaption>On Qwen3-235B, the total critical-path overhead stays largely within 300 µs.</figcaption>
 </figure>
 
@@ -99,12 +99,12 @@ In the backward pass, dual to the forward, UltraEP must restore the redundant-ex
 Users can flexibly control the number of SMs these communication operations occupy via environment variables, ensuring they are fully hidden behind computation. The next section explains how we prevent these communications from slowing down the compute-intensive backward pass, and how we guarantee the determinism of gradient reduction.
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-timeline-bwd.png" alt="BWD timeline" width="1368" height="392" loading="lazy" decoding="async">
+  <img src="assets/images/blog-timeline-bwd.webp" alt="BWD timeline" width="1368" height="392" loading="lazy" decoding="async">
   <figcaption>In the backward pass, expert-weight redistribution<sup id="backward-overlap-ref"><a href="{{ page.url | relative_url }}#backward-overlap-note">1</a></sup> and expert-replica gradient reduction can overlap with other backward computation.</figcaption>
 </figure>
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-nsys-bwd.png" alt="BWD nsys timeline" width="2359" height="456" loading="lazy" decoding="async">
+  <img src="assets/images/blog-nsys-bwd.webp" alt="BWD nsys timeline" width="1560" height="302" loading="lazy" decoding="async">
   <figcaption>On Qwen3-235B with EP64, the gradient-reduction communication is fully hidden behind the backward computation of the router and attention, without slowing down that computation.</figcaption>
 </figure>
 
@@ -125,7 +125,7 @@ To fully utilize the physical scale-up bandwidth, UltraEP first builds on **pers
 To eliminate communication hotspots, UltraEP designs a **chunk streaming relay** communication strategy that builds a two-stage relay tree in real time based on the traffic distribution, letting low-traffic ranks share and forward the outbound traffic of hot ranks. By streaming chunks (groups of consecutive tiles) forward instead of waiting for an entire expert transfer to complete, this strategy avoids expensive global barriers and communication bubbles.
 
 <figure class="blog-figure blog-figure-narrow">
-  <img src="assets/images/blog-tech-relay.png" alt="Relay tech" width="1348" height="1254" loading="lazy" decoding="async">
+  <img src="assets/images/blog-tech-relay.webp" alt="Relay tech" width="1348" height="1254" loading="lazy" decoding="async">
   <figcaption>Relay scheme for hot-expert multicast: one expert on rank 0 is replicated to ranks 1–9, with ranks 2, 5, and 8 selected as relays. The figure shows the send/receive channel states of the source and relay ranks along the timeline.</figcaption>
 </figure>
 
@@ -153,12 +153,12 @@ Together, this profiler and visualization toolchain let users comprehensively as
 We evaluate UltraEP on realistic training and inference scenarios with representative MoE models. Training uses EP64, further scaled by DP or PP at the outer level. Inference focuses on prefill, using EP64 or EP40 depending on the model's expert count. For training, we first fully pretrain three models—GLM4.5-106B, Qwen3-235B, and DeepSeek-V3—then load mid-to-late training checkpoints and continue training under different balancing strategies. For inference, we construct requests from datasets such as LongBench, Codeforces, and DAPO-Math-17K. Training and inference are built on Megatron-LM and SGLang, respectively.
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-eval_train_e2e.png" alt="Results training" width="3296" height="1839" loading="lazy" decoding="async">
+  <img src="assets/images/blog-eval_train_e2e.webp" alt="Results training" width="1560" height="871" loading="lazy" decoding="async">
   <figcaption>Training results, including throughput (TFLOPS/GPU) and overall balancing degree.</figcaption>
 </figure>
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-eval_serving_e2e.png" alt="Results serving" width="4139" height="1771" loading="lazy" decoding="async">
+  <img src="assets/images/blog-eval_serving_e2e.webp" alt="Results serving" width="1560" height="668" loading="lazy" decoding="async">
   <figcaption>Inference results, including TTFT as a function of requests per second (RPS), and overall balancing degree.</figcaption>
 </figure>
 
@@ -167,7 +167,7 @@ In training, UltraEP reaches 94.6% of ideal throughput on average, a 42% improve
 UltraEP steadily compresses inter-rank imbalance to 1.01–1.04 in both training and inference. Because UltraEP addresses overall inter-rank load imbalance rather than inter-expert imbalance, the remaining gap to the force-balanced performance ceiling comes mainly from the non-uniform load that real routing places on individual experts in MoE communication and computation, plus the extra control overhead of adding redundant experts—not from residual imbalance or critical-path overhead.
 
 <figure class="blog-figure blog-figure-full">
-  <img src="assets/images/blog-eval_prod.png" alt="Results production" width="1553" height="478" loading="lazy" decoding="async">
+  <img src="assets/images/blog-eval_prod.webp" alt="Results production" width="1553" height="478" loading="lazy" decoding="async">
   <figcaption>In a production task, the loss and throughput over the pretraining of a 288B-parameter MoE model.</figcaption>
 </figure>
 
@@ -202,8 +202,7 @@ If UltraEP helps your research or development, please cite:
   title={UltraEP: Unleash MoE Training and Inference on Rack-Scale Nodes with Near-Optimal Load Balancing},
   author={Xinming Wei and Chao Jin and Tuo Dai and Yinmin Zhong and Shan Yu and Chengxu Yang and Bingyang Wu and Zili Zhang and Jing Mai and Qianchao Zhu and Zhouyang Li and Yuliang Liu and Guojie Luo},
   journal={arXiv preprint arXiv:2606.04101},
-  year={2026},
-  doi={10.48550/arXiv.2606.04101}
+  year={2026}
 }
 ```
 

@@ -20,7 +20,7 @@ For more design and evaluation details, see our [paper](https://arxiv.org/abs/26
 
 We provide a fork of [Megatron-LM](https://github.com/Dots-Infra/Megatron-LM-UltraEP) as a reference integration of UltraEP. For a quick start, the [Megatron-LM Training with UltraEP](examples/README.md) guide includes an **8×Hopper runnable demo** with reproducible balancing gains under real training load, plus a Qwen3-235B recipe. SGLang inference integration is currently experimental and will be released once production-ready.
 
-<p align="center"><img src="docs/assets/images/blog-eval_highlights.png" alt="UltraEP evaluation highlights" width="90%"></p>
+<p align="center"><img src="docs/assets/images/blog-eval_highlights.webp" alt="UltraEP evaluation highlights" width="90%"></p>
 
 We display the overall performance on representative MoE models. Training uses EP64 (scaled by DP/PP); serving prefill uses EP40/EP64. UltraEP shows significant improvements and stays close to the force-balanced ceiling. Check our [paper](https://arxiv.org/abs/2606.04101) for detailed evaluation results.
 
@@ -216,7 +216,7 @@ Launch the HTML viewer to browse balancing statistics and drill into rank- and e
 python -m ultra_ep.load_viewer --path <trace_dir> --host 0.0.0.0 --port 8765
 ```
 
-<p align="center"><img src="images/load_viewer_static.png" alt="UltraEP load viewer" width="90%"></p>
+<p align="center"><img src="images/load_viewer_static.webp" alt="UltraEP load viewer" width="90%"></p>
 
 ## Acknowledgement
 
@@ -227,7 +227,7 @@ UltraEP draws on low-level implementations of communication kernels from [DeepEP
 ```bibtex
 @article{wei2026ultraep,
   title={UltraEP: Unleash MoE Training and Inference on Rack-Scale Nodes with Near-Optimal Load Balancing},
-  author={Wei, Xinming and Jin, Chao and Dai, Tuo and Zhong, Yinmin and Yu, Shan and Yang, Chengxu and Wu, Bingyang and Zhang, Zili and Mai, Jing and Zhu, Qianchao and others},
+  author={Xinming Wei and Chao Jin and Tuo Dai and Yinmin Zhong and Shan Yu and Chengxu Yang and Bingyang Wu and Zili Zhang and Jing Mai and Qianchao Zhu and Zhouyang Li and Yuliang Liu and Guojie Luo},
   journal={arXiv preprint arXiv:2606.04101},
   year={2026}
 }

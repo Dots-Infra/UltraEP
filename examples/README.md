@@ -91,13 +91,13 @@ For a quick run without data, set `MOCK_DATA=1`; it uses near-uniform random tok
 
 On the 8×Hopper demo, UltraEP holds throughput close to the ideal (92%+):
 
-<p align="center"><img src="images/demo_train_tput.png" alt="Demo throughput: UltraEP vs Megatron-LM baseline" width="80%"></p>
+<p align="center"><img src="images/demo_train_tput.webp" alt="Demo throughput: UltraEP vs Megatron-LM baseline" width="80%"></p>
 
 The load viewer shows per-microbatch load among ranks before and after UltraEP balancing:
 
 <p align="center">
-  <img src="images/demo_load_stack_layer12_before.png" alt="Per-rank load before balancing" width="48%">
-  <img src="images/demo_load_stack_layer12_after.png" alt="Per-rank load after balancing" width="48%">
+  <img src="images/demo_load_stack_layer12_before.webp" alt="Per-rank load before balancing" width="48%">
+  <img src="images/demo_load_stack_layer12_after.webp" alt="Per-rank load after balancing" width="48%">
 </p>
 
 ## Scaling up: Qwen3-235B
