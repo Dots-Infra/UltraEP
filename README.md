@@ -1,20 +1,24 @@
 # UltraEP
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2606.04101)
+[![Blog](https://img.shields.io/badge/Blog-v1.0.0-0A84FF)](https://dots-infra.github.io/UltraEP)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 UltraEP is a lightweight yet high-performance expert load balancing library for large-scale MoE training and inference. In expert parallelism (EP), load imbalance across GPUs creates a significant gap between ideal (perfect balancing) and achievable throughput. Instead of relying on stale load history, UltraEP rebalances on the **exact** post-gating load in **real time**: it replicates hot experts and reroutes tokens within every layer of every microbatch, to achieve **near-optimal** end-to-end performance.
 
-UltraEP is a production-ready, full-stack solution rather than a standalone algorithm. It is built on the following design principles:
+UltraEP is a production-ready, full-stack solution built on the following principles:
 
 - **Self-contained codebase.** As an independent Python/CUDA runtime, UltraEP is decoupled from token dispatcher (e.g., DeepEP) or grouped GEMM. Integrating it into a training or inference framework takes only a few hundred lines.
 - **Topology-aware replication.** Confining expert replication to the scale-up fabric, UltraEP adapts to available NVLink domain size automatically. When the NVLink domain is smaller than the EP group, the achievable imbalance floor sits slightly above the ideal 1.0.
 - **Efficient, GPU-native kernels.** Highly optimized GPU-resident kernels for balancing plan solving and expert communication. Exposed overhead is under 300 µs at large-scale EP, typically 1%–2% of end-to-end step time.
-- **Broad compatibility.** Works out of the box with DP/PP/VPP, activation checkpointing, FP8 weights, and CUDA graph.
+- **Broad compatibility.** Supports DP/PP/VPP, activation checkpointing, low precision, and CUDA graph.
 - **Memory-efficient.** Cross-layer reuse of replica weight/gradient buffers minimizes additional VRAM usage, with no dynamic allocation at runtime.
 
-For more design and evaluation details, see our [paper](https://arxiv.org/abs/2606.04101) and [technical report](https://Dots-Infra.github.io/UltraEP)
+For more design and evaluation details, see our [paper](https://arxiv.org/abs/2606.04101) and [technical report](https://dots-infra.github.io/UltraEP).
 
 ## News
 
-- [2026/07] ✨ Released UltraEP v1.0.0, which has been deployed in our production MoE training.
+- [2026/07/15] ✨ Released UltraEP v1.0.0, which has been deployed in our production MoE training.
 
 ## End-to-End Integration & Performance
 
@@ -29,7 +33,7 @@ We display the overall performance on representative MoE models. Training uses E
 The requirements are:
 
 - NVIDIA GPUs with SM90 or SM100
-- Python >=3.10 and PyTorch >= 2.10
+- Python >= 3.10 and PyTorch >= 2.10
 - Compiler with C++17 support
 - CUDA Toolkit:
     - CUDA 12.3 or higher for SM90

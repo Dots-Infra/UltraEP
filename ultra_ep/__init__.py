@@ -8,4 +8,4 @@ from .event import EventHandle
 
 __all__ = ["Manager", "init_runtime", "EventHandle"]
 
-__version__ = "0.1.2"
+__version__ = "1.0.0"
