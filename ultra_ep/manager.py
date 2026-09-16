@@ -432,6 +432,10 @@ class Manager:
         layer_id: int,
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
+        *,
+        physical_to_logical_map: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_counts: Optional[torch.Tensor] = None,
     ):
         """Aggregate replica gradients to masters.
 
@@ -441,6 +445,9 @@ class Manager:
                 pools are looked up by the real layer ID derived from this.
 
         Notes:
+            Supply all three placement tensors or omit all of them. Explicit
+            placement has the same contract as ``weight_sync`` and must match
+            the placement used by the corresponding forward pass.
             The grad-reduce SM budget is controlled globally via the
             ``ULTRA_EP_GRAD_REDUCE_NUM_SMS`` environment variable.
             Set ``ULTRA_EP_GRAD_REDUCE_DETERMINISTIC=1`` to use the deterministic
@@ -458,6 +465,9 @@ class Manager:
             self.local_master_fc2_grad_ptr_pool[real_lid],
             getattr(previous_event, "event", None),
             async_finish,
+            physical_to_logical_map,
+            logical_to_physical_map,
+            logical_replica_counts,
         )
         return EventHandle(event)
 
@@ -466,6 +476,10 @@ class Manager:
         layer_id: int,
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
+        *,
+        physical_to_logical_map: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_counts: Optional[torch.Tensor] = None,
     ):
         """
         Synchronize master weights to replicas.
@@ -479,6 +493,21 @@ class Manager:
                 Master pointer pools are looked up by the derived real layer ID.
             previous_event: Optional event to wait for before starting.
             async_finish: If True, return immediately with an event handle.
+            physical_to_logical_map: Optional CUDA int32 [P] placement.
+            logical_to_physical_map: Optional CUDA int32 [L, EP] inverse map.
+            logical_replica_counts: Optional CUDA int32 [L] counts including masters.
+
+        Notes:
+            Supply all three contiguous tensors on the manager's device, or omit
+            all three to use the internal placement for layer_id. Explicit maps
+            are used without modifying internal placement or reroute state.
+            They must agree across ranks, preserve fixed master slots (first in
+            each inverse-map row), and place at most one instance per rank within
+            the master's NVLink domain. Unused map entries are -1. Shape, dtype,
+            device and contiguity are checked; map contents are the caller's
+            responsibility. Keep inputs unmodified until communication completes.
+            A previous_event must cover both weights and placement readiness;
+            otherwise the communication stream waits for the calling stream.
 
         Returns:
             EventHandle if async_finish=True, else None.
@@ -500,6 +529,9 @@ class Manager:
                 self.local_master_fc2_weight_scale_ptr_pool[real_lid],
                 getattr(previous_event, "event", None),
                 async_finish,
+                physical_to_logical_map,
+                logical_to_physical_map,
+                logical_replica_counts,
             )
             return EventHandle(event)
 

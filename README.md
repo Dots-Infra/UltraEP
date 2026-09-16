@@ -160,6 +160,38 @@ The views are ready for subsequent work on the calling stream; treat them as
 read-only and keep the manager alive. Updating the same virtual slot overwrites
 its views, so retain the slot through backward or clone the maps when needed.
 
+To use an external planner, pass all three maps together to `weight_sync` and
+`grad_reduce` using the keyword arguments `physical_to_logical_map`,
+`logical_to_physical_map`, and `logical_replica_counts`. Omitting all three keeps
+the existing internal-placement path. Explicit maps do not update internal
+placement or rerouting state; `layer_id` still selects the registered master
+pointers. No placement solving or token rerouting runs as part of communication.
+For example:
+
+```python
+placement = dict(
+    physical_to_logical_map=p2l,
+    logical_to_physical_map=l2p,
+    logical_replica_counts=counts,
+)
+event = manager.weight_sync(vid, async_finish=True, **placement)
+# Use the same placement for backward weight restoration and gradient reduction.
+```
+
+Explicit maps must be contiguous CUDA int32 tensors with the shapes above on
+the manager's device. Their contents must agree across ranks, retain fixed
+masters at the start of each rank's physical slots and each inverse-map row,
+and place at most one instance of an expert per rank within its master's NVLink
+domain. Inverse-map entries before `counts[l]` must enumerate exactly the slots
+mapped to expert `l`; unused map entries are `-1`. Shape, dtype, device and
+contiguity are checked without reading data back to the CPU; callers are
+responsible for map contents and existing communication capacity limits.
+Keep inputs unmodified while communication uses them, and keep the same
+placement through backward. A supplied `previous_event` must cover readiness of
+both placement and weights/gradients; otherwise the calling stream supplies
+that dependency. Communication completion and shared-buffer reuse retain their
+existing synchronization requirements.
+
 ## Tests
 
 UltraEP provides two test entrypoints. `test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness.

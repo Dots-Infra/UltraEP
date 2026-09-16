@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <c10/cuda/CUDACachingAllocator.h>
 
 namespace ultra_ep {
 
@@ -1033,12 +1034,50 @@ void Manager::set_grad_reduce_deterministic(const bool& deterministic, const int
     grad_reduce_num_sms_ = std::min(grad_reduce_num_sms, runtime::num_device_sms);
 }
 
+std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_ptrs(
+    int layer_id,
+    const std::optional<torch::Tensor>& physical_to_logical_map,
+    const std::optional<torch::Tensor>& logical_to_physical_map,
+    const std::optional<torch::Tensor>& logical_replica_counts) const {
+    TORCH_CHECK(layer_id >= 0 && layer_id < num_layers, "Invalid virtual layer_id");
+    const bool external = physical_to_logical_map.has_value();
+    TORCH_CHECK(external == logical_to_physical_map.has_value() &&
+                    external == logical_replica_counts.has_value(),
+                "Supply all three placement tensors or omit all three");
+    if (!external) {
+        return placement.get_device_ptrs(layer_id);
+    }
+
+    auto checked_ptr = [&](const torch::Tensor& map, at::IntArrayRef shape, const char* name) {
+        TORCH_CHECK(map.is_cuda() && map.get_device() == runtime::device_id,
+                    name, " must be on the manager's CUDA device");
+        TORCH_CHECK(map.scalar_type() == torch::kInt32, name, " must have dtype int32");
+        TORCH_CHECK(map.sizes() == shape, name, " must have shape ", shape);
+        TORCH_CHECK(map.is_contiguous(), name, " must be contiguous");
+        // External tensors may be released before the asynchronous task build completes.
+        c10::cuda::CUDACachingAllocator::recordStream(map.storage().data_ptr(), comm_stream);
+        return map.data_ptr<int32_t>();
+    };
+    return std::make_tuple(
+        checked_ptr(*physical_to_logical_map, {num_global_physical_experts}, "physical_to_logical_map"),
+        checked_ptr(*logical_to_physical_map, {num_global_logical_experts, runtime::num_ranks}, "logical_to_physical_map"),
+        checked_ptr(*logical_replica_counts, {num_global_logical_experts}, "logical_replica_counts"));
+}
+
 std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                                 std::optional<EventHandle>& previous_event,
-                                                bool async) {
+                                                bool async,
+                                                const std::optional<torch::Tensor>& physical_to_logical_map_tensor,
+                                                const std::optional<torch::Tensor>& logical_to_physical_map_tensor,
+                                                const std::optional<torch::Tensor>& logical_replica_counts_tensor) {
     EP_HOST_ASSERT(is_available());
+    auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
+        get_placement_ptrs(layer_id,
+                          physical_to_logical_map_tensor,
+                          logical_to_physical_map_tensor,
+                          logical_replica_counts_tensor);
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     std::optional<EventHandle> event;
@@ -1059,8 +1098,6 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
     int64_t* local_master_fc1_grad_ptrs = local_master_fc1_grad_ptr_tensor.data_ptr<int64_t>();
     int64_t* local_master_fc2_grad_ptrs = local_master_fc2_grad_ptr_tensor.data_ptr<int64_t>();
 
-    auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
-        placement.get_device_ptrs(layer_id);
     kernels::build_grad_reduce_tasks(_task_build_config,
                                      physical_to_logical_map,
                                      logical_to_physical_map,
@@ -1098,8 +1135,16 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_weight_scale_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_weight_scale_ptr_tensor,
                                                 std::optional<EventHandle>& previous_event,
-                                                bool async) {
+                                                bool async,
+                                                const std::optional<torch::Tensor>& physical_to_logical_map_tensor,
+                                                const std::optional<torch::Tensor>& logical_to_physical_map_tensor,
+                                                const std::optional<torch::Tensor>& logical_replica_counts_tensor) {
     EP_HOST_ASSERT(is_available());
+    auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
+        get_placement_ptrs(layer_id,
+                          physical_to_logical_map_tensor,
+                          logical_to_physical_map_tensor,
+                          logical_replica_counts_tensor);
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     std::optional<EventHandle> event;
@@ -1138,8 +1183,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     int64_t* local_master_fc2_weight_scale_ptrs =
         expert_weight_scale_total_numel > 0 ? local_master_fc2_weight_scale_ptr_tensor.data_ptr<int64_t>() : nullptr;
 
-    auto [physical_to_logical_map, logical_to_physical_map, logical_replica_counts] =
-        placement.get_device_ptrs(layer_id);
     kernels::build_weight_sync_task_lists(_task_build_config,
                                           physical_to_logical_map,
                                           logical_to_physical_map,
