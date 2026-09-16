@@ -498,16 +498,12 @@ class Manager:
             logical_replica_counts: Optional CUDA int32 [L] counts including masters.
 
         Notes:
-            Supply all three contiguous tensors on the manager's device, or omit
-            all three to use the internal placement for layer_id. Explicit maps
-            are used without modifying internal placement or reroute state.
-            They must agree across ranks, preserve fixed master slots (first in
-            each inverse-map row), and place at most one instance per rank within
-            the master's NVLink domain. Unused map entries are -1. Shape, dtype,
-            device and contiguity are checked; map contents are the caller's
-            responsibility. Keep inputs unmodified until communication completes.
-            A previous_event must cover both weights and placement readiness;
-            otherwise the communication stream waits for the calling stream.
+            Supply all three maps or omit all to use internal placement.
+            External maps must be contiguous on the manager's device and agree
+            across ranks: fixed masters first, at most one instance per rank,
+            replicas within the master's NVLink domain, and -1 for unused entries.
+            Keep inputs unchanged until completion; previous_event or the calling
+            stream must cover both weight and placement readiness.
 
         Returns:
             EventHandle if async_finish=True, else None.

@@ -152,45 +152,15 @@ def transformer_layer(hidden, manager, layer_id):
 ```
 
 `update_placement` and `update_placement_sparse` return
-`(physical_to_logical_map, logical_to_physical_map, logical_replica_counts)` for
-the requested virtual layer. These are CUDA int32 views with shapes `[P]`,
-`[L, EP]`, and `[L]`, where `P` and `L` are the global physical and logical expert
-counts. Counts include the master, stored first in each logical-to-physical row.
-The views are ready for subsequent work on the calling stream; treat them as
-read-only and keep the manager alive. Updating the same virtual slot overwrites
-its views, so retain the slot through backward or clone the maps when needed.
+`(physical_to_logical_map, logical_to_physical_map, logical_replica_counts)` as
+read-only CUDA int32 views with shapes `[P]`, `[L, EP]`, and `[L]`, where `P` and
+`L` are the global physical and logical expert counts. Keep the manager alive
+and retain the virtual slot through backward; updating it overwrites these views.
 
-To use an external planner, pass all three maps together to `weight_sync` and
-`grad_reduce` using the keyword arguments `physical_to_logical_map`,
-`logical_to_physical_map`, and `logical_replica_counts`. Omitting all three keeps
-the existing internal-placement path. Explicit maps do not update internal
-placement or rerouting state; `layer_id` still selects the registered master
-pointers. No placement solving or token rerouting runs as part of communication.
-For example:
-
-```python
-placement = dict(
-    physical_to_logical_map=p2l,
-    logical_to_physical_map=l2p,
-    logical_replica_counts=counts,
-)
-event = manager.weight_sync(vid, async_finish=True, **placement)
-# Use the same placement for backward weight restoration and gradient reduction.
-```
-
-Explicit maps must be contiguous CUDA int32 tensors with the shapes above on
-the manager's device. Their contents must agree across ranks, retain fixed
-masters at the start of each rank's physical slots and each inverse-map row,
-and place at most one instance of an expert per rank within its master's NVLink
-domain. Inverse-map entries before `counts[l]` must enumerate exactly the slots
-mapped to expert `l`; unused map entries are `-1`. Shape, dtype, device and
-contiguity are checked without reading data back to the CPU; callers are
-responsible for map contents and existing communication capacity limits.
-Keep inputs unmodified while communication uses them, and keep the same
-placement through backward. A supplied `previous_event` must cover readiness of
-both placement and weights/gradients; otherwise the calling stream supplies
-that dependency. Communication completion and shared-buffer reuse retain their
-existing synchronization requirements.
+For external placement, pass all three tensors as keyword arguments to
+`weight_sync` and `grad_reduce`. Omitting all three uses the internal placement;
+explicit inputs leave it unchanged. See the [API docstrings](ultra_ep/manager.py)
+for tensor, topology, and lifetime requirements.
 
 ## Tests
 
