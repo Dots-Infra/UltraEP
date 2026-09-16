@@ -151,6 +151,15 @@ def transformer_layer(hidden, manager, layer_id):
     return residual + out
 ```
 
+`update_placement` and `update_placement_sparse` return
+`(physical_to_logical_map, logical_to_physical_map, logical_replica_counts)` for
+the requested virtual layer. These are CUDA int32 views with shapes `[P]`,
+`[L, EP]`, and `[L]`, where `P` and `L` are the global physical and logical expert
+counts. Counts include the master, stored first in each logical-to-physical row.
+The views are ready for subsequent work on the calling stream; treat them as
+read-only and keep the manager alive. Updating the same virtual slot overwrites
+its views, so retain the slot through backward or clone the maps when needed.
+
 ## Tests
 
 UltraEP provides two test entrypoints. `test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness.

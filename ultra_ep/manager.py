@@ -1,6 +1,6 @@
 import torch
 import torch.distributed as dist
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import ultra_ep._C as _C
 from .config import load_tuning_from_env
@@ -524,7 +524,7 @@ class Manager:
         layer_id: int,
         routing_map: torch.Tensor,
         verify_reduced_loads: bool = False,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Update expert placement for a single layer based on real-time load statistics.
 
@@ -540,6 +540,11 @@ class Manager:
         Args:
             layer_id: The MoE layer index to update.
             routing_map: [num_tokens, num_global_logical_experts] bool tensor, logical routing map.
+
+        Returns:
+            CUDA int32 views of (physical_to_logical_map, logical_to_physical_map,
+            logical_replica_counts) for this virtual layer. Treat them as read-only;
+            they remain valid until this slot is updated or the manager is destroyed.
         """
         assert layer_id < self.num_alloc_layers
         with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
@@ -556,12 +561,22 @@ class Manager:
                 global_logical_expert_loads,
                 self.runtime.get_global_logical_expert_loads_tensor(),
             )
+        return (
+            self._physical_to_logical_map[layer_id],
+            self._logical_to_physical_map[layer_id],
+            self._logical_replica_counts[layer_id],
+        )
 
     def update_placement_sparse(
         self,
         layer_id: int,
         topk_ids: torch.Tensor,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Plan from topk IDs and return the same views as ``update_placement``.
+
+        The calling stream waits for the placement to be ready, without blocking
+        the CPU. Other consumer streams must establish their own dependency.
+        """
         assert layer_id < self.num_alloc_layers
         self.runtime.update_placement_sparse(layer_id, topk_ids)
         with torch.cuda.stream(self.get_comm_stream()):
@@ -570,6 +585,12 @@ class Manager:
                 self._real_layer_id(layer_id),
                 self.runtime.get_global_logical_expert_loads_tensor(),
             )
+        torch.cuda.current_stream().wait_stream(self.get_comm_stream())
+        return (
+            self._physical_to_logical_map[layer_id],
+            self._logical_to_physical_map[layer_id],
+            self._logical_replica_counts[layer_id],
+        )
 
     def reroute(
         self,
