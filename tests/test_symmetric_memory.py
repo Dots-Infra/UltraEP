@@ -9,9 +9,11 @@ import argparse
 import faulthandler
 import gc
 import os
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 
 import ultra_ep
 from ultra_ep.symmetric_memory import allocate_region
@@ -34,8 +36,19 @@ def check_placement(manager, graph=False):
     source_stream.wait_stream(torch.cuda.current_stream())
 
     def update():
-        manager.update_placement(0, dense)
-        manager.update_placement_sparse(1, ids)
+        for layer, method, data in (
+            (0, manager.update_placement, dense),
+            (1, manager.update_placement_sparse, ids),
+        ):
+            with (
+                patch.object(dist, "all_reduce", wraps=dist.all_reduce) as reduce,
+                patch.object(dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor) as gather,
+            ):
+                method(layer, data)
+            assert reduce.call_count == int(manager.legacy_placement)
+            assert gather.call_count == int(not manager.legacy_placement)
+            collective = reduce if manager.legacy_placement else gather
+            assert collective.call_args.kwargs["group"] is group
         torch.cuda.current_stream().wait_stream(manager.get_comm_stream())
 
     with torch.cuda.stream(source_stream):
@@ -146,6 +159,10 @@ def main():
                 groups.append(candidate)
 
     ultra_ep.init_runtime(group)  # Public pre-initialization must not acquire a manager reference.
+    backend = os.getenv("ULTRA_EP_SYMMETRIC_MEMORY_BACKEND", "").strip().upper() or "CUDA"
+    assert symm_mem.get_backend("cuda") == backend
+    if backend == "CUDA" and get_symmetric_group().size() == group.size():
+        assert get_symmetric_group() is group
     first = make_manager(group)
     second = make_manager(group)
     if group.rank() == 0:

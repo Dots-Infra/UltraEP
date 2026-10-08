@@ -149,14 +149,6 @@ class Manager {
     torch::Tensor local_replica_fc1_grad_buffer_tensor;
     torch::Tensor local_replica_fc2_grad_buffer_tensor;
 
-    // Host-side remote memory pointers obtained from Symmetric Memory handles
-    // for NVLink-domain-local ranks.
-    // Shape: [num_nvl_ranks,]
-    void* global_replica_weight_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
-    void* global_replica_weight_scale_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
-    void* global_replica_grad_buffer_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
-    uint64_t* global_weight_sync_ready_flag_ptrs[kernels::kMaxNvlDomainSize] = {nullptr};
-
     // Intermediate buffers for grad reduce tasks
     kernels::GradReduceTask* _grad_reduce_tasks = nullptr;
     int* _global_task_or_tile_counter = nullptr;

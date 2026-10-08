@@ -19,6 +19,20 @@ int64_t align_up_bytes(const int64_t value, const int64_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
+template <typename T>
+void copy_remote_pointer_table(const torch::Tensor& table, T**& device_table) {
+    EP_HOST_ASSERT(table.defined() && !table.is_cuda() && table.dtype() == torch::kInt64 &&
+                   table.is_contiguous() && table.dim() == 1 && table.numel() == runtime::num_nvl_ranks);
+    T* host_table[kernels::kMaxNvlDomainSize] = {};
+    const auto* values = table.data_ptr<int64_t>();
+    for (int rank = 0; rank < runtime::num_nvl_ranks; ++rank) {
+        EP_HOST_ASSERT(values[rank] != 0 && "Symmetric Memory returned a null peer pointer");
+        host_table[rank] = reinterpret_cast<T*>(static_cast<uintptr_t>(values[rank]));
+    }
+    CUDA_RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_table), sizeof(host_table)));
+    CUDA_RUNTIME_CHECK(cudaMemcpy(device_table, host_table, sizeof(host_table), cudaMemcpyHostToDevice));
+}
+
 void fill_task_build_config(kernels::TaskBuildConfig& config,
                             int num_local_master_experts,
                             int num_local_physical_experts,
@@ -383,71 +397,15 @@ Manager::Manager(const int& num_layers,
                                                                torch::Device(torch::kCUDA, device_id)));
     }
 
-    auto copy_remote_pointer_table = [&](const torch::Tensor& table,
-                                          void** host_table,
-                                          void**& device_table,
-                                          const char* name,
-                                          bool required) {
-        if (!required) {
-            return;
-        }
-        EP_HOST_ASSERT(table.defined() && !table.is_cuda() && table.dtype() == torch::kInt64 &&
-                       table.is_contiguous() && table.dim() == 1 && table.numel() == runtime::num_nvl_ranks);
-        const auto* values = table.data_ptr<int64_t>();
-        for (int rank = 0; rank < runtime::num_nvl_ranks; ++rank) {
-            EP_HOST_ASSERT(values[rank] != 0 && "Symmetric Memory returned a null peer pointer");
-            host_table[rank] = reinterpret_cast<void*>(static_cast<uintptr_t>(values[rank]));
-        }
-        void* allocation = nullptr;
-        CUDA_RUNTIME_CHECK(cudaMalloc(&allocation, kernels::kMaxNvlDomainSize * sizeof(void*)));
-        device_table = reinterpret_cast<void**>(allocation);
-        CUDA_RUNTIME_CHECK(cudaMemset(device_table, 0, kernels::kMaxNvlDomainSize * sizeof(void*)));
-        CUDA_RUNTIME_CHECK(cudaMemcpy(device_table,
-                                      host_table,
-                                      runtime::num_nvl_ranks * sizeof(void*),
-                                      cudaMemcpyHostToDevice));
-        (void)name;
-    };
-
-    copy_remote_pointer_table(remote_weight_ptrs_external,
-                              global_replica_weight_buffer_ptrs,
-                              _remote_weight_ptrs,
-                              "weight",
-                              true);
-    copy_remote_pointer_table(remote_weight_scale_ptrs_external,
-                              global_replica_weight_scale_buffer_ptrs,
-                              _remote_weight_scale_ptrs,
-                              "weight scale",
-                              expert_weight_scale_total_numel > 0);
-    copy_remote_pointer_table(remote_grad_ptrs_external,
-                              global_replica_grad_buffer_ptrs,
-                              _remote_grad_ptrs,
-                              "grad",
-                              is_train);
-    // Ready flags use the same 64-bit pointer representation as the other
-    // tables, but are consumed as uint64_t** by the CUDA kernels.
+    copy_remote_pointer_table(remote_weight_ptrs_external, _remote_weight_ptrs);
+    if (expert_weight_scale_total_numel > 0) {
+        copy_remote_pointer_table(remote_weight_scale_ptrs_external, _remote_weight_scale_ptrs);
+    }
+    if (is_train) {
+        copy_remote_pointer_table(remote_grad_ptrs_external, _remote_grad_ptrs);
+    }
     if (local_weight_sync_ready_flags_external.defined()) {
-        EP_HOST_ASSERT(remote_ready_ptrs_external.defined() && !remote_ready_ptrs_external.is_cuda() &&
-                       remote_ready_ptrs_external.dtype() == torch::kInt64 &&
-                       remote_ready_ptrs_external.is_contiguous() &&
-                       remote_ready_ptrs_external.dim() == 1 &&
-                       remote_ready_ptrs_external.numel() == runtime::num_nvl_ranks);
-        const auto* values = remote_ready_ptrs_external.data_ptr<int64_t>();
-        for (int rank = 0; rank < runtime::num_nvl_ranks; ++rank) {
-            EP_HOST_ASSERT(values[rank] != 0 && "Symmetric Memory returned a null ready pointer");
-            global_weight_sync_ready_flag_ptrs[rank] =
-                reinterpret_cast<uint64_t*>(static_cast<uintptr_t>(values[rank]));
-        }
-        void* allocation = nullptr;
-        CUDA_RUNTIME_CHECK(cudaMalloc(&allocation, kernels::kMaxNvlDomainSize * sizeof(uint64_t*)));
-        _remote_ready_flag_ptrs = reinterpret_cast<uint64_t**>(allocation);
-        CUDA_RUNTIME_CHECK(cudaMemset(_remote_ready_flag_ptrs,
-                                      0,
-                                      kernels::kMaxNvlDomainSize * sizeof(uint64_t*)));
-        CUDA_RUNTIME_CHECK(cudaMemcpy(_remote_ready_flag_ptrs,
-                                      global_weight_sync_ready_flag_ptrs,
-                                      runtime::num_nvl_ranks * sizeof(uint64_t*),
-                                      cudaMemcpyHostToDevice));
+        copy_remote_pointer_table(remote_ready_ptrs_external, _remote_ready_flag_ptrs);
     }
 
     // Allocate intermediate buffers for task-build and persistent kernels.
@@ -566,14 +524,6 @@ void Manager::destroy() {
     global_logical_expert_loads_tensor = torch::Tensor();
     local_expert_loads_tensor = torch::Tensor();
     expert_loads_per_rank_tensor = torch::Tensor();
-
-    // Clear remote pointers
-    for (int i = 0; i < runtime::num_nvl_ranks; ++i) {
-        global_replica_weight_buffer_ptrs[i] = nullptr;
-        global_replica_weight_scale_buffer_ptrs[i] = nullptr;
-        global_replica_grad_buffer_ptrs[i] = nullptr;
-        global_weight_sync_ready_flag_ptrs[i] = nullptr;
-    }
 
     // Free intermediate CUDA buffers
     CUDA_RUNTIME_CHECK(cudaFree(_grad_reduce_tasks));

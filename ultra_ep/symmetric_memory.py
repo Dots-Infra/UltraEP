@@ -118,43 +118,17 @@ def allocate_region(
     return SymmetricRegion(storage, handle, logical, remote_ptrs)
 
 
-def set_cuda_backend_once() -> str:
-    """Select a non-NVSHMEM Symmetric Memory backend before allocation.
-
-    CUDA is the preferred backend for direct NVLink mappings.  Some PyTorch
-    builds ship the CUDA implementation but do not register its allocator;
-    those builds can still use the Symmetric Memory NCCL allocator, which
-    keeps ownership and peer-pointer discovery in PyTorch and does not add an
-    NVSHMEM dependency.
-    """
-
-    global _backend_selected, _backend_name
-    if _backend_selected:
-        return _backend_name
-
-    requested = os.getenv("ULTRA_EP_SYMMETRIC_MEMORY_BACKEND", "").strip().upper()
-    if requested and requested not in {"CUDA", "NCCL"}:
+def select_backend() -> str:
+    """Use CUDA by default; NCCL requires an explicit opt-in before allocation."""
+    requested = (
+        os.getenv("ULTRA_EP_SYMMETRIC_MEMORY_BACKEND", "").strip().upper() or "CUDA"
+    )
+    if requested not in {"CUDA", "NCCL"}:
         raise ValueError(
             f"ULTRA_EP_SYMMETRIC_MEMORY_BACKEND must be CUDA or NCCL; got {requested!r}"
         )
-
-    errors: list[Exception] = []
-    backends = (requested,) if requested else ("CUDA", "NCCL")
-    for backend in backends:
-        try:
-            symm_mem.set_backend(backend)
-            _backend_name = backend
-            _backend_selected = True
-            return backend
-        except (RuntimeError, ValueError) as exc:
-            errors.append(exc)
-
-    details = "; ".join(f"{type(error).__name__}: {error}" for error in errors)
-    raise RuntimeError(
-        "No usable non-NVSHMEM Symmetric Memory backend is registered "
-        f"(tried {', '.join(backends)}): {details}"
-    ) from errors[-1]
-
-
-_backend_selected = False
-_backend_name = ""
+    # Some Torch versions register the default allocator separately from the
+    # set_backend() candidates. Keep an already selected backend as-is.
+    if symm_mem.get_backend("cuda") != requested:
+        symm_mem.set_backend(requested)
+    return requested

@@ -434,18 +434,12 @@ class Manager:
 
         if hasattr(self, "_load_profiler"):
             self._load_profiler.close()
-        if self.runtime is not None:
-            # Teardown is collective for symmetric mappings.  First drain all
-            # local streams, then make every EP rank reach a handle barrier,
-            # and wait for that barrier before C++ drops its peer pointers.
-            torch.cuda.synchronize(device=self.device)
-            self._symmetric_lifetime_barrier(
-                torch.cuda.current_stream(device=self.device),
-                self._weight_lifetime_barrier_handle,
-                channel=2,
-            )
-            torch.cuda.synchronize(device=self.device)
-            self.runtime.destroy()
+        # Wait for all peers before C++ drops pointers to their shared buffers.
+        torch.cuda.synchronize(device=self.device)
+        with torch.cuda.stream(torch.cuda.current_stream(device=self.device)):
+            self._weight_lifetime_barrier_handle.barrier(channel=2)
+        torch.cuda.synchronize(device=self.device)
+        self.runtime.destroy()
         self.runtime = None
         # ``get_*_tensor`` returns aliases of the external symmetric
         # allocations, so the Python-side views keep their allocator handles
@@ -672,11 +666,6 @@ class Manager:
             )
             return EventHandle(event)
 
-    @staticmethod
-    def _symmetric_lifetime_barrier(stream, handle, *, channel):
-        with torch.cuda.stream(stream):
-            handle.barrier(channel=channel)
-
     def set_weight_sync_plan_mode(self, plan_mode: str):
         normalized = plan_mode.lower().replace("_", "")
         mode_ids = {"direct": 0, "adaptive": 1, "adaptiverelay": 1, "forcerelay": 2}
@@ -691,6 +680,26 @@ class Manager:
         self.grad_reduce_deterministic = bool(deterministic)
         self.runtime.set_grad_reduce_deterministic(
             self.grad_reduce_deterministic, self.grad_reduce_num_sms
+        )
+
+    def _solve_placement_from_local_loads(self, layer_id: int):
+        """Gather EP-wide metadata and solve on the current communication stream."""
+        if self.legacy_placement:
+            global_loads = self.runtime.get_global_logical_expert_loads_tensor()
+            global_loads.copy_(self._local_expert_loads)
+            dist.all_reduce(global_loads, group=self.group)
+            self.runtime.solve_placement_legacy(layer_id, global_loads)
+        else:
+            dist.all_gather_into_tensor(
+                self._expert_loads_per_rank,
+                self._local_expert_loads,
+                group=self.group,
+            )
+            self.runtime.solve_placement(layer_id, self._expert_loads_per_rank)
+        self._load_profiler.stage_pre(
+            layer_id,
+            self._real_layer_id(layer_id),
+            self.runtime.get_global_logical_expert_loads_tensor(),
         )
 
     def update_placement(
@@ -727,24 +736,7 @@ class Manager:
                 # ``contiguous()`` may have created a temporary tensor. Keep
                 # its storage alive until the communication stream consumes it.
                 routing_map.record_stream(comm_stream)
-                if self.legacy_placement:
-                    global_loads = self.runtime.get_global_logical_expert_loads_tensor()
-                    global_loads.copy_(self._local_expert_loads)
-                    dist.all_reduce(global_loads, group=self.group, async_op=False)
-                    self.runtime.solve_placement_legacy(layer_id, global_loads)
-                else:
-                    dist.all_gather_into_tensor(
-                        self._expert_loads_per_rank,
-                        self._local_expert_loads,
-                        group=self.group,
-                        async_op=False,
-                    )
-                    self.runtime.solve_placement(layer_id, self._expert_loads_per_rank)
-                self._load_profiler.stage_pre(
-                    layer_id,
-                    self._real_layer_id(layer_id),
-                    self.runtime.get_global_logical_expert_loads_tensor(),
-                )
+                self._solve_placement_from_local_loads(layer_id)
         if verify_reduced_loads:
             compute_stream.wait_stream(comm_stream)
             with torch.cuda.stream(compute_stream):
@@ -771,25 +763,7 @@ class Manager:
         with torch.cuda.stream(comm_stream):
             self.runtime.compute_local_loads_sparse(topk_ids)
             topk_ids.record_stream(comm_stream)
-            if self.legacy_placement:
-                global_loads = self.runtime.get_global_logical_expert_loads_tensor()
-                global_loads.copy_(self._local_expert_loads)
-                dist.all_reduce(global_loads, group=self.group, async_op=False)
-                self.runtime.solve_placement_legacy(layer_id, global_loads)
-            else:
-                dist.all_gather_into_tensor(
-                    self._expert_loads_per_rank,
-                    self._local_expert_loads,
-                    group=self.group,
-                    async_op=False,
-                )
-                self.runtime.solve_placement(layer_id, self._expert_loads_per_rank)
-        with torch.cuda.stream(comm_stream):
-            self._load_profiler.stage_pre(
-                layer_id,
-                self._real_layer_id(layer_id),
-                self.runtime.get_global_logical_expert_loads_tensor(),
-            )
+            self._solve_placement_from_local_loads(layer_id)
 
     def reroute(
         self,

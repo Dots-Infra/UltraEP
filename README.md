@@ -39,10 +39,10 @@ The requirements are:
     - CUDA 12.3 or higher for SM90
     - CUDA 12.9 or higher for SM100
 - NVLink/P2P access among the GPUs within each NVLink domain
-- A PyTorch build exposing `torch.distributed._symmetric_memory` with either
-  the CUDA or NCCL Symmetric Memory allocator enabled. UltraEP prefers CUDA and
-  falls back to the Symmetric Memory NCCL allocator when a build does not
-  register the CUDA allocator; neither path depends on NVSHMEM
+- A PyTorch build exposing `torch.distributed._symmetric_memory` with
+  the CUDA Symmetric Memory allocator enabled. The NCCL allocator is an explicit
+  alternative via `ULTRA_EP_SYMMETRIC_MEMORY_BACKEND=NCCL`; neither path depends
+  on NVSHMEM
 
 Then build and install. The builder can auto-detect CUDA compute capability; if failed, explicitly set `TORCH_CUDA_ARCH_LIST` to `9.0` (SM90) or `10.0` (SM100).
 
@@ -219,14 +219,16 @@ Algorithm and kernel behaviors are controlled entirely through `ULTRA_EP_*` envi
 
 **Symmetric Memory and placement metadata**
 
-- `torch.distributed._symmetric_memory.set_backend("CUDA")` is selected once
-  before the first replica-buffer allocation, with a fallback to the
-  Symmetric Memory `"NCCL"` allocator for PyTorch builds where the CUDA
-  allocator is not registered. Set `ULTRA_EP_SYMMETRIC_MEMORY_BACKEND` to
-  `CUDA` or `NCCL` to make the choice explicit. The `empty`/`rendezvous` calls
-  are initialization-time collectives and must occur in the same order on every
-  EP rank. UltraEP creates an eagerly initialized NCCL subgroup for each
-  NVLink domain, including when the caller supplies a lazily initialized group.
+- CUDA is the default Symmetric Memory backend. UltraEP checks the current
+  backend before calling `set_backend`, since some Torch versions register the
+  default allocator separately from the selectable alternatives. Selection
+  errors are reported directly; there is no automatic fallback to NCCL. Set
+  `ULTRA_EP_SYMMETRIC_MEMORY_BACKEND=NCCL` before initialization to opt in.
+  The `empty`/`rendezvous` calls are initialization-time collectives and must
+  occur in the same order on every EP rank. With CUDA, a single NVLink domain
+  reuses the caller's EP group; multiple domains need separate subgroups without
+  forced eager NCCL initialization. The opt-in NCCL allocator retains eagerly
+  initialized domain subgroups to support lazily initialized caller groups.
 - Replica weights, gradients, and relay flags use Symmetric Memory; C++ keeps
   only tensor views and device-side peer-pointer tables. Python owns the
   handles and allocation lifetime.
