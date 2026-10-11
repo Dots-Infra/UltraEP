@@ -3,7 +3,6 @@
 
 #include "runtime.hpp"
 #include "ultra_ep.hpp"
-#include "utils/ipc_manager.cuh"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -15,6 +14,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Register UltraEP APIs
     ultra_ep::register_apis(m);
     ultra_ep::runtime::register_apis(m);
-    ultra_ep::ipc::register_apis(m);
     ultra_ep::event::register_apis(m);
 }

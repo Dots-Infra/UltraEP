@@ -1,9 +1,12 @@
 import os
+from collections import Counter
+from ctypes import byref
 
+import pynvml
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 
-from .symmetric_memory import select_backend
 from .util import print_rank_0
 import ultra_ep._C as _C
 
@@ -14,13 +17,46 @@ _manager_count = 0
 _symmetric_groups = {}
 
 
-def init_runtime(group: dist.ProcessGroup):
-    """Keep placement on the EP group and peer mappings within each NVLink domain.
+def _nvlink_domain_key():
+    """Identify the current GPU's fabric clique or fully connected local NVLink domain."""
+    uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+    pynvml.nvmlInit()
+    try:
+        device = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+        info = pynvml.c_nvmlGpuFabricInfoV_t()
+        try:
+            pynvml.nvmlDeviceGetGpuFabricInfoV(device, byref(info))
+        except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_FunctionNotFound):
+            pass
+        if any(info.clusterUuid):
+            if (
+                info.state != pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+                or info.status != pynvml.NVML_SUCCESS
+            ):
+                raise RuntimeError("GPU fabric registration is not ready")
+            return ("fabric", bytes(info.clusterUuid).hex(), info.cliqueId)
 
-    Equally sized domains occupy contiguous blocks of EP-group ranks.
-    MAX_NUM_NVL_PEERS can restrict the detected domain size. All EP ranks must
-    construct and destroy managers in the same order.
-    """
+        # NVML enumerates physical GPUs independently of CUDA_VISIBLE_DEVICES.
+        # Including our own UUID gives every GPU in a local clique the same key.
+        peers = [uuid]
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            peer = pynvml.nvmlDeviceGetHandleByIndex(index)
+            peer_uuid = pynvml.nvmlDeviceGetUUID(peer)
+            if (
+                peer_uuid != uuid
+                and pynvml.nvmlDeviceGetP2PStatus(
+                    device, peer, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                )
+                == pynvml.NVML_P2P_STATUS_OK
+            ):
+                peers.append(peer_uuid)
+        return ("nvlink", tuple(sorted(peers)))
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def init_runtime(group: dist.ProcessGroup):
+    """Use NCCL across EP ranks and symmetric memory within each NVLink domain."""
     global _group, _symmetric_group, _nvl_domain_size
     if _C.is_runtime_initialized():
         if group != _group:
@@ -28,47 +64,50 @@ def init_runtime(group: dist.ProcessGroup):
         return _nvl_domain_size
     if group is None or group.size() <= 0 or group.rank() < 0:
         raise ValueError("UltraEP requires membership in a non-empty EP process group")
+    if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 11):
+        raise RuntimeError(
+            "UltraEP requires PyTorch >= 2.11 for NVLink-domain barriers"
+        )
+    if dist.get_backend(group) != "nccl":
+        raise ValueError("UltraEP requires an NCCL EP process group")
+    if symm_mem.get_backend("cuda") != "CUDA":
+        symm_mem.set_backend("CUDA")
 
-    backend = select_backend()
-    ipc_manager = _C.IpcManager()
-    detected = ipc_manager.detect_accessible_ranks(group)
-    del ipc_manager
+    domains = [None] * group.size()
+    dist.all_gather_object(domains, _nvlink_domain_key(), group=group)
+    counts = Counter(domains)
+    detected = counts[domains[group.rank()]]
     domain_size = int(os.getenv("MAX_NUM_NVL_PEERS", detected))
-    if domain_size <= 0 or domain_size > detected or group.size() % domain_size:
+    if (
+        len(set(counts.values())) != 1
+        or domain_size <= 0
+        or detected % domain_size != 0
+        or any(
+            domains[i] != domains[i // domain_size * domain_size]
+            for i in range(group.size())
+        )
+    ):
         raise ValueError(
-            f"MAX_NUM_NVL_PEERS={domain_size} must divide EP size {group.size()} "
-            f"and be between 1 and the detected peer count {detected}"
+            "NVLink domains must form equal contiguous EP-rank blocks; "
+            f"MAX_NUM_NVL_PEERS={domain_size} must divide the detected size {detected}"
         )
 
-    # CUDA Symmetric Memory can use the existing EP group when it is one
-    # NVLink domain. Only the opt-in NCCL allocator requires an eager comm.
     symmetric_group = group
-    if domain_size < group.size() or backend == "NCCL":
-        key = (group, domain_size, backend)
-        symmetric_group = _symmetric_groups.get(key)
-        if symmetric_group is None:
+    if domain_size < group.size():
+        key = (group, domain_size)
+        if key not in _symmetric_groups:
             ranks = dist.get_process_group_ranks(group)
             first = group.rank() // domain_size * domain_size
-            symmetric_group = dist.new_group(
+            _symmetric_groups[key] = dist.new_group(
                 ranks=ranks[first : first + domain_size],
                 backend="nccl",
                 use_local_synchronization=True,
-                device_id=(
-                    torch.device("cuda", torch.cuda.current_device())
-                    if backend == "NCCL"
-                    else None
-                ),
             )
-            # Cache subgroups until global teardown: recreating the same rank
-            # hash can reuse stale NCCL bootstrap keys in some Torch versions.
-            _symmetric_groups[key] = symmetric_group
+        symmetric_group = _symmetric_groups[key]
+
     _C.init_runtime(group.rank(), group.size(), domain_size)
-    _group = group
-    _symmetric_group = symmetric_group
-    _nvl_domain_size = domain_size
-    print_rank_0(
-        f"UltraEP: Torch symmetric memory backend={backend}, NVLink domain size={domain_size}"
-    )
+    _group, _symmetric_group, _nvl_domain_size = group, symmetric_group, domain_size
+    print_rank_0(f"UltraEP: CUDA symmetric memory, NVLink domain size={domain_size}")
     return domain_size
 
 
@@ -82,7 +121,6 @@ def retain_runtime():
 
 
 def release_runtime():
-    """Reset native topology after the last manager releases its allocations."""
     global _group, _symmetric_group, _nvl_domain_size, _manager_count
     _manager_count -= 1
     if _manager_count == 0:

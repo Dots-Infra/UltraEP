@@ -129,44 +129,19 @@ class Manager:
         )
         self.reroute_mode = "round_robin" if legacy_placement else "quota"
 
-        # Symmetric Memory allocations are initialized once per EP group.  Keep
-        # the logical views and handles alive on the Python side; C++ only holds
-        # tensor references and consumes the mapped peer pointer tables.
-        def _align16(value: int) -> int:
-            return (int(value) + 15) // 16 * 16
-
-        expert_fc1_weight_bytes = (
-            self.expert_fc1_numel * self.weight_data_element_bytes
-        )
-        expert_fc2_weight_bytes = (
-            self.expert_fc2_numel * self.weight_data_element_bytes
-        )
+        # Allocation layout comes from the same native helper used by the kernels.
         expert_total_weight_bytes = (
             self.expert_total_numel * self.weight_data_element_bytes
         )
-        scale_fc1_bytes = (
-            self.expert_fc1_weight_scale_numel * self.weight_scale_element_bytes
+        _, scale_stride_bytes, ready_flags_per_expert = _C.get_replica_buffer_layout(
+            expert_fc1_numel,
+            expert_fc2_numel,
+            self.weight_data_element_bytes,
+            expert_fc1_weight_scale_numel,
+            expert_fc2_weight_scale_numel,
+            self.weight_scale_element_bytes,
         )
-        scale_fc2_bytes = (
-            self.expert_fc2_weight_scale_numel * self.weight_scale_element_bytes
-        )
-        scale_fc2_offset_bytes = _align16(scale_fc1_bytes)
-        scale_stride_bytes = _align16(scale_fc2_offset_bytes + scale_fc2_bytes)
-
-        def _num_chunks(num_bytes: int) -> int:
-            tiles = (int(num_bytes) + 32 * 1024 - 1) // (32 * 1024)
-            return (tiles + 8 - 1) // 8
-
-        max_relay_chunks = max(
-            _num_chunks(expert_fc1_weight_bytes),
-            _num_chunks(expert_fc2_weight_bytes),
-            _num_chunks(scale_fc1_bytes),
-            _num_chunks(scale_fc2_bytes),
-        )
-        num_ready_shards = 4 if self.expert_weight_scale_total_numel > 0 else 2
-        ready_flag_count = (
-            self.num_local_redundant_experts * num_ready_shards * max_relay_chunks
-        )
+        ready_flag_count = self.num_local_redundant_experts * ready_flags_per_expert
 
         self._symm_regions = []
         weight_region = allocate_region(
@@ -203,12 +178,7 @@ class Manager:
             group=get_symmetric_group(),
         )
         self._symm_regions.append(ready_region)
-        # Use dedicated Symmetric Memory signal pads for the buffer lifetime
-        # barriers.  The barrier is issued on the same CUDA stream as the
-        # corresponding kernel sequence, so it remains CUDA-graph capturable
-        # and does not consume a host-side dist.barrier rendezvous.
         self._weight_lifetime_barrier_handle = weight_region.handle
-        self._grad_lifetime_barrier_handle = ready_region.handle
 
         if is_train:
             grad_region = allocate_region(
@@ -265,10 +235,6 @@ class Manager:
         )
         assert self.runtime.is_available()
         retain_runtime()
-        self.runtime.set_lifetime_barriers(
-            self._weight_lifetime_barrier_handle.barrier,
-            self._grad_lifetime_barrier_handle.barrier,
-        )
 
         # Symmetric rendezvous makes the mapped addresses visible, but the C++
         # constructor also initializes local relay flags and placement state.
@@ -441,13 +407,8 @@ class Manager:
         torch.cuda.synchronize(device=self.device)
         self.runtime.destroy()
         self.runtime = None
-        # ``get_*_tensor`` returns aliases of the external symmetric
-        # allocations, so the Python-side views keep their allocator handles
-        # alive even after C++ has dropped its own Tensor references.  Release
-        # every such alias before clearing the owning regions; otherwise the
-        # NCCL Symmetric Memory destructor can run after the process group has
-        # already been torn down and report ``ncclCommWindowDeregister``
-        # errors.
+        # Release local aliases before the owning regions. User-held aliases and
+        # captured graphs must no longer be in use when collectively destroying.
         self.local_replica_weight_buffer = None
         self.local_replica_fc1_weight_buffer = None
         self.local_replica_fc2_weight_buffer = None
@@ -461,7 +422,6 @@ class Manager:
         # all local tensor views and asynchronous kernels have been synchronized.
         self._symm_regions.clear()
         self._weight_lifetime_barrier_handle = None
-        self._grad_lifetime_barrier_handle = None
         release_runtime()
 
     def __del__(self):
@@ -599,7 +559,6 @@ class Manager:
         layer_id: int,
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
-        use_current_stream: bool = False,
         *,
         physical_to_logical_map: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
@@ -611,18 +570,11 @@ class Manager:
             layer_id: Virtual layer ID (encodes both real layer and micro-batch
                 slot).  Used for placement map lookup in C++.  Master pointer
                 pools are looked up by the real layer ID derived from this.
-            use_current_stream: Launch task construction, cross-PE barriers, and
-                gradient reduction on the caller's current CUDA stream instead of
-                UltraEP's private communication stream.  Existing callers retain
-                the private-stream behavior by default.
 
         Notes:
             Supply all three placement tensors or omit all of them. Explicit
-            placement must match the corresponding forward pass and agree
-            across ranks. Keep the maps unchanged until completion.
-            This is collective within each NVLink domain, including ranks with
-            no local tasks. Completion covers remote reads and buffer clearing;
-            wait on the returned event before reuse when async_finish=True.
+            placement has the same contract as ``weight_sync`` and must match
+            the placement used by the corresponding forward pass.
             The grad-reduce SM budget is controlled globally via the
             ``ULTRA_EP_GRAD_REDUCE_NUM_SMS`` environment variable.
             Set ``ULTRA_EP_GRAD_REDUCE_DETERMINISTIC=1`` to use the deterministic
@@ -640,7 +592,6 @@ class Manager:
             self.local_master_fc2_grad_ptr_pool[real_lid],
             getattr(previous_event, "event", None),
             async_finish,
-            use_current_stream,
             physical_to_logical_map,
             logical_to_physical_map,
             logical_replica_counts,
@@ -659,15 +610,29 @@ class Manager:
     ):
         """Collectively copy master weights to replicas within each NVLink domain.
 
-        All ranks, including those with no local tasks, must call in the same
-        order. Completion covers incoming peer writes and protects reuse of
-        the shared replica buffers. In asynchronous mode the caller must wait
-        on the returned event before accessing the buffers again.
+        The runtime derives a deterministic communication plan from the current
+        placement. Mild cases stay on the flat direct fan-out path; extreme hot
+        masters may use a staged relay plan to reduce source-side bottlenecks.
+
+        Args:
+            layer_id: Virtual layer ID.  Used for placement map lookup in C++.
+                Master pointer pools are looked up by the derived real layer ID.
+            previous_event: Optional event to wait for before starting.
+            async_finish: If True, return immediately with an event handle.
+            physical_to_logical_map: Optional CUDA int32 [P] placement.
+            logical_to_physical_map: Optional CUDA int32 [L, EP] inverse map.
+            logical_replica_counts: Optional CUDA int32 [L] counts including masters.
 
         Notes:
-            Supply all three placement tensors or omit all of them. Explicit
-            placement must match the corresponding forward pass and agree
-            across ranks. Keep the maps unchanged until completion.
+            Supply all three maps or omit all to use internal placement.
+            External maps must be contiguous on the manager's device and agree
+            across ranks: fixed masters first, at most one instance per rank,
+            replicas within the master's NVLink domain, and -1 for unused entries.
+            Keep inputs unchanged until completion; previous_event or the calling
+            stream must cover both weight and placement readiness.
+
+        Returns:
+            EventHandle if async_finish=True, else None.
         """
         assert 0 <= layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
@@ -745,6 +710,11 @@ class Manager:
         Args:
             layer_id: The MoE layer index to update.
             routing_map: [num_tokens, num_global_logical_experts] bool tensor, logical routing map.
+
+        Returns:
+            CUDA int32 views of (physical_to_logical_map, logical_to_physical_map,
+            logical_replica_counts) for this virtual layer. Treat them as read-only;
+            they remain valid until this slot is updated or the manager is destroyed.
         """
         assert layer_id < self.num_alloc_layers
         routing_map = routing_map.contiguous()
@@ -759,19 +729,14 @@ class Manager:
                 # its storage alive until the communication stream consumes it.
                 routing_map.record_stream(comm_stream)
                 self._solve_placement_from_local_loads(layer_id)
-        if verify_reduced_loads:
-            compute_stream.wait_stream(comm_stream)
-            with torch.cuda.stream(compute_stream):
-                global_logical_expert_loads = routing_map.sum(
-                    dim=0, dtype=torch.int32
-                )
-                dist.all_reduce(global_logical_expert_loads, group=self.group)
-                assert torch.equal(
-                    global_logical_expert_loads,
-                    self.runtime.get_global_logical_expert_loads_tensor(),
-                )
-
         compute_stream.wait_stream(comm_stream)
+        if verify_reduced_loads:
+            global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
+            dist.all_reduce(global_logical_expert_loads, group=self.group)
+            assert torch.equal(
+                global_logical_expert_loads,
+                self.runtime.get_global_logical_expert_loads_tensor(),
+            )
         return (
             self._physical_to_logical_map[layer_id],
             self._logical_to_physical_map[layer_id],
@@ -783,17 +748,20 @@ class Manager:
         layer_id: int,
         topk_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Plan from topk IDs and return the same views as ``update_placement``.
+
+        The calling stream waits for the placement to be ready, without blocking
+        the CPU. Other consumer streams must establish their own dependency.
+        """
         assert layer_id < self.num_alloc_layers
         topk_ids = topk_ids.contiguous()
         comm_stream = self.get_comm_stream()
         compute_stream = torch.cuda.current_stream(device=self.device)
-        if compute_stream.stream_id != comm_stream.stream_id:
-            comm_stream.wait_stream(compute_stream)
+        comm_stream.wait_stream(compute_stream)
         with torch.cuda.stream(comm_stream):
             self.runtime.compute_local_loads_sparse(topk_ids)
             topk_ids.record_stream(comm_stream)
             self._solve_placement_from_local_loads(layer_id)
-
         compute_stream.wait_stream(comm_stream)
         return (
             self._physical_to_logical_map[layer_id],

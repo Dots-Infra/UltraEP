@@ -132,6 +132,18 @@ int max_weight_sync_chunks_per_shard(int64_t expert_fc1_numel,
 
 }  // namespace
 
+std::tuple<int64_t, int64_t, int64_t> get_replica_buffer_layout(
+    int64_t fc1_numel, int64_t fc2_numel, int weight_bytes,
+    int64_t fc1_scale_numel, int64_t fc2_scale_numel, int scale_bytes) {
+    const auto fc1_bytes = checked_num_bytes(fc1_scale_numel, scale_bytes);
+    const auto fc2_bytes = checked_num_bytes(fc2_scale_numel, scale_bytes);
+    const auto fc2_offset = align_up_bytes(fc1_bytes, kernels::kNumTMAAlignBytes);
+    const auto scale_stride = align_up_bytes(fc2_offset + fc2_bytes, kernels::kNumTMAAlignBytes);
+    const auto flags_per_expert = static_cast<int64_t>(weight_sync_num_shards(fc1_scale_numel + fc2_scale_numel)) *
+        max_weight_sync_chunks_per_shard(fc1_numel, fc2_numel, fc1_bytes, fc2_bytes, weight_bytes);
+    return {fc2_offset, scale_stride, flags_per_expert};
+}
+
 // ============================================================================
 // GlobalExpertPlacement
 // ============================================================================
@@ -296,9 +308,11 @@ Manager::Manager(const int& num_layers,
                    "fc2 weight shard bytes must be 16-byte aligned for TMA weight_sync");
     expert_fc1_weight_scale_bytes = checked_num_bytes(expert_fc1_weight_scale_numel, weight_scale_element_bytes);
     expert_fc2_weight_scale_bytes = checked_num_bytes(expert_fc2_weight_scale_numel, weight_scale_element_bytes);
-    expert_weight_scale_fc2_offset_bytes = align_up_bytes(expert_fc1_weight_scale_bytes, kernels::kNumTMAAlignBytes);
-    expert_weight_scale_stride_bytes = align_up_bytes(
-        expert_weight_scale_fc2_offset_bytes + expert_fc2_weight_scale_bytes, kernels::kNumTMAAlignBytes);
+    int64_t ready_flags_per_expert;
+    std::tie(expert_weight_scale_fc2_offset_bytes, expert_weight_scale_stride_bytes, ready_flags_per_expert) =
+        get_replica_buffer_layout(expert_fc1_numel, expert_fc2_numel, weight_data_element_bytes,
+                                  expert_fc1_weight_scale_numel, expert_fc2_weight_scale_numel,
+                                  weight_scale_element_bytes);
     EP_HOST_ASSERT(weight_sync_plan_mode_ >= static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
                    weight_sync_plan_mode_ <= static_cast<int>(kernels::WeightSyncPlanMode::kForceRelay));
     EP_HOST_ASSERT(weight_sync_relay_min_replicas_ >= 0);
@@ -366,13 +380,7 @@ Manager::Manager(const int& num_layers,
         local_replica_fc2_weight_scale_buffer_tensor = local_replica_weight_scale_buffer_tensor;
     }
 
-    const int max_relay_chunks_per_shard = max_weight_sync_chunks_per_shard(expert_fc1_numel,
-                                                                            expert_fc2_numel,
-                                                                            expert_fc1_weight_scale_bytes,
-                                                                            expert_fc2_weight_scale_bytes,
-                                                                            weight_data_element_bytes);
-    const int64_t local_ready_flag_count = static_cast<int64_t>(num_local_redundant_experts) *
-        weight_sync_num_shards(expert_weight_scale_total_numel) * max_relay_chunks_per_shard;
+    const int64_t local_ready_flag_count = num_local_redundant_experts * ready_flags_per_expert;
     validate_cuda_tensor(local_weight_sync_ready_flags_external, torch::kUInt64, "ready-flag buffer");
     EP_HOST_ASSERT(local_weight_sync_ready_flags_external.dim() == 1 &&
                    local_weight_sync_ready_flags_external.numel() >= std::max<int64_t>(local_ready_flag_count, 1));
@@ -582,11 +590,6 @@ void Manager::destroy() {
 
     // Free contiguous placement buffers (CPU pinned + GPU)
     placement.cleanup();
-
-    // Bound barrier methods retain the symmetric handles too. Release them
-    // before Python frees the owning regions and tears down process groups.
-    weight_lifetime_barrier_ = pybind11::function();
-    grad_lifetime_barrier_ = pybind11::function();
 
     // Ready to destroy
     _available = false;
@@ -956,19 +959,11 @@ std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_ptrs(
         checked_ptr(*logical_replica_counts, {num_global_logical_experts}, "logical_replica_counts"));
 }
 
-void Manager::set_lifetime_barriers(pybind11::function weight_barrier, pybind11::function grad_barrier) {
-    EP_HOST_ASSERT(is_available());
-    EP_HOST_ASSERT(!weight_lifetime_barrier_ && !grad_lifetime_barrier_);
-    weight_lifetime_barrier_ = std::move(weight_barrier);
-    grad_lifetime_barrier_ = std::move(grad_barrier);
-}
-
 std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                                 torch::Tensor& local_master_fc1_grad_ptr_tensor,
                                                 torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                                 std::optional<EventHandle>& previous_event,
                                                 bool async,
-                                                bool use_current_stream,
                                                 const std::optional<torch::Tensor>& physical_to_logical_map_tensor,
                                                 const std::optional<torch::Tensor>& logical_to_physical_map_tensor,
                                                 const std::optional<torch::Tensor>& logical_replica_counts_tensor) {
@@ -980,21 +975,14 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                           logical_replica_counts_tensor);
 
     const auto caller_stream = at::cuda::getCurrentCUDAStream();
-    // Combined 1F1B can place GR directly on its communication stream.  This removes
-    // UltraEP's otherwise-private third stream from the full-layer CUDA graph while
-    // preserving the default private-stream behavior for all existing callers.
-    const auto launch_stream = use_current_stream ? caller_stream : comm_stream;
-    const c10::cuda::CUDAStreamGuard stream_guard(launch_stream);
-    EP_HOST_ASSERT(grad_lifetime_barrier_);
+    const c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
     std::optional<EventHandle> event;
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
-        stream_wait(launch_stream, previous_event.value());
-    } else if (launch_stream.id() != caller_stream.id()) {
-        stream_wait(launch_stream, caller_stream);
+        stream_wait(comm_stream, previous_event.value());
+    } else if (comm_stream.id() != caller_stream.id()) {
+        stream_wait(comm_stream, caller_stream);
     }
-
-    grad_lifetime_barrier_(0);
 
     EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.dtype() == torch::kInt64);
@@ -1017,24 +1005,21 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                                      _task_tile_offsets,
                                      _task_metadata,
                                      _global_task_or_tile_counter,
-                                     launch_stream);
+                                     comm_stream);
 
     kernels::run_grad_reduce(_grad_reduce_tasks,
                              _task_tile_offsets,
                              _task_metadata,
                              _global_task_or_tile_counter,
-                             launch_stream,
+                             comm_stream,
                              grad_reduce_num_sms_,
                              grad_reduce_deterministic_);
 
-    // Completion includes remote reads and clears before shared-buffer reuse.
-    grad_lifetime_barrier_(1);
-
     // Wait streams
     if (async) {
-        event = EventHandle(launch_stream);
-    } else if (launch_stream.id() != caller_stream.id()) {
-        stream_wait(caller_stream, launch_stream);
+        event = EventHandle(comm_stream);
+    } else if (comm_stream.id() != caller_stream.id()) {
+        stream_wait(caller_stream, comm_stream);
     }
 
     return event;
@@ -1059,7 +1044,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
 
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     const c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
-    EP_HOST_ASSERT(weight_lifetime_barrier_);
     std::optional<EventHandle> event;
     // Wait for previous event to be finished
     if (previous_event.has_value()) {
@@ -1067,8 +1051,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     } else if (comm_stream.id() != compute_stream.id()) {
         stream_wait(comm_stream, compute_stream);
     }
-
-    weight_lifetime_barrier_(0);
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.dtype() == torch::kInt64);
@@ -1157,9 +1139,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     if (launched_stage2) {
         stream_wait(comm_stream, relay_stream);
     }
-
-    // Record/return a single completion event after incoming writes are ready.
-    weight_lifetime_barrier_(1);
 
     // Wait streams
     if (async) {

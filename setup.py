@@ -55,8 +55,6 @@ if __name__ == "__main__":
 
     sources = find_cpp_cuda_sources("csrc")
     include_dirs = ["csrc/"]
-    library_dirs = []
-    extra_link_args = ["-lcuda"]
 
     # Auto-detect CUDA arch if not explicitly set
     if "TORCH_CUDA_ARCH_LIST" not in os.environ:
@@ -98,9 +96,7 @@ if __name__ == "__main__":
     print("Build summary:")
     print(f" > Sources: {sources}")
     print(f" > Includes: {include_dirs}")
-    print(f" > Libraries: {library_dirs}")
     print(f" > Compilation flags: {extra_compile_args}")
-    print(f" > Link flags: {extra_link_args}")
     print(f' > Arch list: {os.environ["TORCH_CUDA_ARCH_LIST"]}')
     print()
 
@@ -108,14 +104,13 @@ if __name__ == "__main__":
         name="ultra_ep",
         version=get_package_version(),
         packages=setuptools.find_packages(include=["ultra_ep", "ultra_ep.*"]),
+        install_requires=["torch>=2.11", "nvidia-ml-py>=12.570"],
         ext_modules=[
             CUDAExtension(
                 name="ultra_ep._C",
                 include_dirs=include_dirs,
-                library_dirs=library_dirs,
                 sources=sources,
                 extra_compile_args=extra_compile_args,
-                extra_link_args=extra_link_args,
             )
         ],
         cmdclass={

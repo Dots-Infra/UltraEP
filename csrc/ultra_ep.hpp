@@ -17,6 +17,10 @@
 
 namespace ultra_ep {
 
+std::tuple<int64_t, int64_t, int64_t> get_replica_buffer_layout(
+    int64_t fc1_numel, int64_t fc2_numel, int weight_bytes,
+    int64_t fc1_scale_numel, int64_t fc2_scale_numel, int scale_bytes);
+
 /* Describes the placement of global experts across all ranks.
 
 Attributes:
@@ -124,10 +128,6 @@ class Manager {
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
     at::cuda::CUDAStream relay_stream;
-    // Cache the bound Torch handle methods without depending on private
-    // Symmetric Memory C++ headers. Pybind entry points keep the GIL held.
-    pybind11::function weight_lifetime_barrier_;
-    pybind11::function grad_lifetime_barrier_;
     // Completion event for the latest placement update / forward-buffer pre-zero.
     // Train mode tracks one slot per layer; inference mode uses slot 0 as the shared buffer.
     std::vector<std::optional<EventHandle>> placement_ready_events_;
@@ -250,7 +250,6 @@ public:
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
-    void set_lifetime_barriers(pybind11::function weight_barrier, pybind11::function grad_barrier);
 
     // Aggregate grad from remote replicas to local master
     // then zero-out replica grad buffers
@@ -262,7 +261,6 @@ public:
                                            torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                            std::optional<EventHandle>& previous_event,
                                            bool async,
-                                           bool use_current_stream = false,
                                            const std::optional<torch::Tensor>& physical_to_logical_map = std::nullopt,
                                            const std::optional<torch::Tensor>& logical_to_physical_map = std::nullopt,
                                            const std::optional<torch::Tensor>& logical_replica_counts = std::nullopt);
@@ -347,6 +345,7 @@ public:
 };
 
 static void register_apis(pybind11::module_& m) {
+    m.def("get_replica_buffer_layout", &get_replica_buffer_layout);
     pybind11::class_<Manager>(m, "Manager")
         .def(pybind11::init<int,
                             int,
@@ -418,7 +417,6 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("remote_ready_ptrs_external") = torch::Tensor())
         .def("destroy", &Manager::destroy)
         .def("is_available", &Manager::is_available)
-        .def("set_lifetime_barriers", &Manager::set_lifetime_barriers)
         .def("compute_local_loads", &Manager::compute_local_loads)
         .def("compute_local_loads_sparse", &Manager::compute_local_loads_sparse)
         .def("solve_placement", &Manager::solve_placement)
@@ -433,7 +431,6 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("local_master_fc2_grad_ptr_tensor"),
              pybind11::arg("previous_event"),
              pybind11::arg("async_finish"),
-             pybind11::arg("use_current_stream") = false,
              pybind11::arg("physical_to_logical_map") = pybind11::none(),
              pybind11::arg("logical_to_physical_map") = pybind11::none(),
              pybind11::arg("logical_replica_counts") = pybind11::none())

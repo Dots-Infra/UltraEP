@@ -33,16 +33,14 @@ We display the overall performance on representative MoE models. Training uses E
 The requirements are:
 
 - NVIDIA GPUs with SM90 or SM100
-- Python >= 3.10 and PyTorch >= 2.10
+- Python >= 3.10 and PyTorch >= 2.11
 - Compiler with C++17 support
 - CUDA Toolkit:
     - CUDA 12.3 or higher for SM90
     - CUDA 12.9 or higher for SM100
 - NVLink/P2P access among the GPUs within each NVLink domain
-- A PyTorch build exposing `torch.distributed._symmetric_memory` with
-  the CUDA Symmetric Memory allocator enabled. The NCCL allocator is an explicit
-  alternative via `ULTRA_EP_SYMMETRIC_MEMORY_BACKEND=NCCL`; neither path depends
-  on NVSHMEM
+- PyTorch's CUDA Symmetric Memory allocator
+- `nvidia-ml-py` (`pynvml`) for NVLink topology detection, installed automatically
 
 Then build and install. The builder can auto-detect CUDA compute capability; if failed, explicitly set `TORCH_CUDA_ARCH_LIST` to `9.0` (SM90) or `10.0` (SM100).
 
@@ -182,16 +180,6 @@ torchrun --nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK
     tests/test_e2e.py --num-experts 256
 ```
 
-Symmetric-memory and synchronization regressions can be run on two or four GPUs:
-
-```bash
-torchrun --standalone --nproc_per_node=2 tests/test_buffer_sync.py --graph
-torchrun --standalone --nproc_per_node=2 tests/test_buffer_sync.py --sync --non-deterministic
-torchrun --standalone --nproc_per_node=2 tests/test_buffer_sync.py --graph --previous-event --current-stream
-torchrun --standalone --nproc_per_node=4 tests/test_symmetric_memory.py --subgroups
-MAX_NUM_NVL_PEERS=2 torchrun --standalone --nproc_per_node=4 tests/test_symmetric_memory.py
-```
-
 The table below reports an original NVSHMEM-based EP64, 256-expert `test_e2e.py` run (4 master + 2 redundant experts/rank, topk = 8, tokens/rank = 8k, bf16 weights, 42 SMs for grad-reduce). The 1.01 final imbalance corresponds to the default balancing tolerance (`ULTRA_EP_QUOTA_ORACLE_EPS=0.01`):
 
 | Initial imbalance (max/mean) | **1.51** | **2.01** | **3.03** |
@@ -230,34 +218,19 @@ Algorithm and kernel behaviors are controlled entirely through `ULTRA_EP_*` envi
 
 **Symmetric Memory and placement metadata**
 
-- CUDA is the default Symmetric Memory backend. UltraEP checks the current
-  backend before calling `set_backend`, since some Torch versions register the
-  default allocator separately from the selectable alternatives. Selection
-  errors are reported directly; there is no automatic fallback to NCCL. Set
-  `ULTRA_EP_SYMMETRIC_MEMORY_BACKEND=NCCL` before initialization to opt in.
-  The `empty`/`rendezvous` calls are initialization-time collectives and must
-  occur in the same order on every EP rank. With CUDA, a single NVLink domain
-  reuses the caller's EP group; multiple domains need separate subgroups without
-  forced eager NCCL initialization. The opt-in NCCL allocator retains eagerly
-  initialized domain subgroups to support lazily initialized caller groups.
-- Replica weights, gradients, and relay flags use Symmetric Memory; C++ keeps
-  only tensor views and device-side peer-pointer tables. Python owns the
-  handles and allocation lifetime.
-- Placement metadata uses ordinary CUDA tensors. Each rank computes local
-  expert loads, then the EP group runs `dist.all_reduce` (legacy mode) or
-  `dist.all_gather_into_tensor` (quota mode), all on UltraEP's communication
-  stream before the placement solver is launched.
-- Weight-sync and grad-reduce always issue stream-ordered Symmetric Memory
-  barriers before and after remote buffer access. All ranks in each domain,
-  including ranks without local tasks, must call in the same order. The returned
-  event (or caller-stream wait) includes incoming writes and remote reads/clears.
-  These barriers support CUDA graph capture. Relay graph replay retains the
-  existing host-epoch limitation; use direct mode for captured weight-sync.
-- Call `manager.destroy()` collectively before destroying the EP process group.
-  Release captured graphs and user-held replica-buffer views first. Multiple
-  managers can share an EP group. Buffers are released by `destroy()`; domain
-  communicators are reused across managers and released by the final global
-  `torch.distributed.destroy_process_group()` call.
+- Replica weights, gradients, and relay flags use PyTorch's CUDA Symmetric
+  Memory allocator. No NVSHMEM installation or backend selection is needed.
+- NVML identifies fabric cliques (including multi-host NVLink) or local NVLink
+  peers. Domains must form equal contiguous blocks of EP-group ranks.
+  `MAX_NUM_NVL_PEERS` may split them into smaller equal domains.
+- Placement metadata always uses the full NCCL EP group: all-gather for quota
+  placement, or all-reduce for legacy placement. Planning returns read-only
+  placement views ready on the calling CUDA stream.
+- Construct managers in the same order on all EP ranks. Call `manager.destroy()`
+  collectively before process-group teardown, after outstanding work and CUDA
+  graphs have finished. The default automatic cleanup remains available.
+- CUDA graph weight synchronization currently requires direct mode. Relay uses
+  a host-side epoch that is not advanced by graph replay.
 
 ### Load profiler and viewer
 
