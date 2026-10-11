@@ -350,16 +350,15 @@ Manager::Manager(const int& num_layers,
 
     const int64_t expert_total_weight_bytes = checked_num_bytes(expert_total_numel, weight_data_element_bytes);
     auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id));
-    auto validate_cuda_tensor = [&](const torch::Tensor& tensor, torch::ScalarType dtype, const char* name) {
+    auto validate_cuda_tensor = [&](const torch::Tensor& tensor, torch::ScalarType dtype) {
         EP_HOST_ASSERT(tensor.defined() && tensor.is_cuda() && tensor.dtype() == dtype && tensor.is_contiguous());
         EP_HOST_ASSERT(tensor.device().index() == device_id && "Symmetric buffers must use the runtime CUDA device");
-        (void)name;
     };
 
     // The Python side allocates and rendezvouses these buffers with
     // torch.distributed._symmetric_memory.  C++ only keeps tensor references and
     // extracts local/remote addresses; it never owns or frees the allocations.
-    validate_cuda_tensor(local_replica_weight_buffer_external, torch::kUInt8, "weight buffer");
+    validate_cuda_tensor(local_replica_weight_buffer_external, torch::kUInt8);
     EP_HOST_ASSERT(local_replica_weight_buffer_external.dim() == 2 &&
                    local_replica_weight_buffer_external.size(0) == num_local_redundant_experts &&
                    local_replica_weight_buffer_external.size(1) == expert_total_weight_bytes);
@@ -370,7 +369,7 @@ Manager::Manager(const int& num_layers,
         local_replica_weight_buffer_tensor.narrow(1, expert_fc1_weight_bytes, expert_fc2_weight_bytes);
 
     if (expert_weight_scale_total_numel > 0) {
-        validate_cuda_tensor(local_replica_weight_scale_buffer_external, torch::kUInt8, "weight-scale buffer");
+        validate_cuda_tensor(local_replica_weight_scale_buffer_external, torch::kUInt8);
         EP_HOST_ASSERT(local_replica_weight_scale_buffer_external.dim() == 2 &&
                        local_replica_weight_scale_buffer_external.size(0) == num_local_redundant_experts &&
                        local_replica_weight_scale_buffer_external.size(1) == expert_weight_scale_stride_bytes);
@@ -387,7 +386,7 @@ Manager::Manager(const int& num_layers,
     }
 
     const int64_t local_ready_flag_count = num_local_redundant_experts * ready_flags_per_expert;
-    validate_cuda_tensor(local_weight_sync_ready_flags_external, torch::kUInt64, "ready-flag buffer");
+    validate_cuda_tensor(local_weight_sync_ready_flags_external, torch::kUInt64);
     EP_HOST_ASSERT(local_weight_sync_ready_flags_external.dim() == 1 &&
                    local_weight_sync_ready_flags_external.numel() >= std::max<int64_t>(local_ready_flag_count, 1));
     local_weight_sync_ready_flags = local_weight_sync_ready_flags_external.data_ptr<uint64_t>();
@@ -396,12 +395,11 @@ Manager::Manager(const int& num_layers,
 
     // Grad buffer only needed for training
     if (is_train) {
-        validate_cuda_tensor(local_replica_grad_buffer_external, torch::kFloat32, "grad buffer");
+        validate_cuda_tensor(local_replica_grad_buffer_external, torch::kFloat32);
         EP_HOST_ASSERT(local_replica_grad_buffer_external.dim() == 2 &&
                        local_replica_grad_buffer_external.size(0) == num_local_redundant_experts &&
                        local_replica_grad_buffer_external.size(1) == expert_total_numel);
         local_replica_grad_buffer_tensor = local_replica_grad_buffer_external;
-        local_replica_grad_buffer = local_replica_grad_buffer_tensor.data_ptr();
         local_replica_fc1_grad_buffer_tensor = local_replica_grad_buffer_tensor.narrow(1, 0, expert_fc1_numel);
         local_replica_fc2_grad_buffer_tensor =
             local_replica_grad_buffer_tensor.narrow(1, expert_fc1_numel, expert_fc2_numel);
@@ -418,9 +416,7 @@ Manager::Manager(const int& num_layers,
     if (is_train) {
         copy_remote_pointer_table(remote_grad_ptrs_external, _remote_grad_ptrs);
     }
-    if (local_weight_sync_ready_flags_external.defined()) {
-        copy_remote_pointer_table(remote_ready_ptrs_external, _remote_ready_flag_ptrs);
-    }
+    copy_remote_pointer_table(remote_ready_ptrs_external, _remote_ready_flag_ptrs);
 
     // Allocate intermediate buffers for task-build and persistent kernels.
     CUDA_RUNTIME_CHECK(
@@ -524,7 +520,6 @@ void Manager::destroy() {
     local_replica_weight_buffer = nullptr;
     local_replica_weight_scale_buffer = nullptr;
     local_weight_sync_ready_flags = nullptr;
-    local_replica_grad_buffer = nullptr;
     local_replica_weight_buffer_tensor = torch::Tensor();
     local_replica_fc1_weight_buffer_tensor = torch::Tensor();
     local_replica_fc2_weight_buffer_tensor = torch::Tensor();
@@ -592,7 +587,7 @@ void Manager::destroy() {
     CUDA_RUNTIME_CHECK(cudaFree(_reroute_sparse_counters));
     _reroute_sparse_counters = nullptr;
 
-    // Free contiguous placement buffers (CPU pinned + GPU)
+    // Free placement buffers.
     placement.cleanup();
 
     weight_lifetime_barrier_ = pybind11::function();
@@ -1081,7 +1076,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     const bool enable_relay_stages = weight_sync_plan_mode_ != static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
         num_local_redundant_experts > 0 && runtime::num_nvl_ranks > 2;
     const uint64_t current_epoch = ++_weight_sync_epoch;
-    bool launched_stage2 = false;
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.is_cuda());
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.is_cuda());
@@ -1147,10 +1141,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                  runtime::num_nvl_ranks,
                                  _max_ws_total_tiles,
                                  1);
-        launched_stage2 = true;
-    }
-
-    if (launched_stage2) {
         stream_wait(comm_stream, relay_stream);
     }
 

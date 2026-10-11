@@ -14,7 +14,6 @@
 #include "runtime.hpp"
 #include "utils/event.hpp"
 #include "utils/exception.cuh"
-#include "utils/utils.hpp"
 
 namespace ultra_ep {
 
@@ -144,7 +143,6 @@ class Manager {
     // tensors; these Tensor members keep them alive for the C++ manager.
     void* local_replica_weight_buffer = nullptr;
     void* local_replica_weight_scale_buffer = nullptr;
-    void* local_replica_grad_buffer = nullptr;
     torch::Tensor local_replica_weight_buffer_tensor;
     torch::Tensor local_replica_fc1_weight_buffer_tensor;
     torch::Tensor local_replica_fc2_weight_buffer_tensor;

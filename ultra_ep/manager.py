@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 import ultra_ep._C as _C
 from .config import load_tuning_from_env
 from .runtime import init_runtime, get_symmetric_group, retain_runtime, release_runtime
-from .symmetric_memory import allocate_region
+from .symm_mem import symm_alloc
 from .event import EventHandle
 from .profiling import ExpertLoadProfiler, load_profile_config
 from .reroute import _DenseRerouteFunction
@@ -143,72 +143,59 @@ class Manager:
         )
         ready_flag_count = self.num_local_redundant_experts * ready_flags_per_expert
 
+        device = torch.device("cuda", self.device)
+        symmetric_group = get_symmetric_group()
         self._symm_regions = []
+
+        def alloc(shape, dtype):
+            region = symm_alloc(
+                shape, dtype=dtype, device=device, group=symmetric_group
+            )
+            self._symm_regions.append(region)
+            return region
+
         self._nvl_load_peer_ptrs = None
         if not legacy_placement and self.num_ranks == self.nvl_domain_size:
             # One reusable load vector and two peer handshakes, independent of
             # layer IDs and graph replay counts. Placement calls are serialized.
-            load_region = allocate_region(
+            load_region = alloc(
                 self.num_global_logical_experts + 2 * self.num_ranks,
                 dtype=torch.int32,
-                device=torch.device("cuda", self.device),
-                group=get_symmetric_group(),
             )
-            load_region.storage.zero_()
-            self._symm_regions.append(load_region)
+            load_region.tensor.zero_()
             self._nvl_load_peer_ptrs = load_region.remote_ptrs.to(self.device)
 
-        weight_region = allocate_region(
-            self.num_local_redundant_experts * expert_total_weight_bytes,
+        weight_region = alloc(
+            (self.num_local_redundant_experts, expert_total_weight_bytes),
             dtype=torch.uint8,
-            device=torch.device("cuda", self.device),
-            group=get_symmetric_group(),
-            local_shape=(self.num_local_redundant_experts, expert_total_weight_bytes),
         )
-        self._symm_regions.append(weight_region)
         if self.expert_weight_scale_total_numel > 0:
-            scale_region = allocate_region(
-                self.num_local_redundant_experts * scale_stride_bytes,
+            scale_region = alloc(
+                (self.num_local_redundant_experts, scale_stride_bytes),
                 dtype=torch.uint8,
-                device=torch.device("cuda", self.device),
-                group=get_symmetric_group(),
-                local_shape=(self.num_local_redundant_experts, scale_stride_bytes),
             )
-            self._symm_regions.append(scale_region)
-            local_scale_buffer = scale_region.local
+            local_scale_buffer = scale_region.tensor
             remote_scale_ptrs = scale_region.remote_ptrs
         else:
             local_scale_buffer = torch.empty(
                 (self.num_local_redundant_experts, 0),
                 dtype=torch.uint8,
-                device=torch.device("cuda", self.device),
+                device=device,
             )
             remote_scale_ptrs = torch.empty(0, dtype=torch.int64)
 
-        ready_region = allocate_region(
-            ready_flag_count,
-            dtype=torch.uint64,
-            device=torch.device("cuda", self.device),
-            group=get_symmetric_group(),
-        )
-        self._symm_regions.append(ready_region)
+        ready_region = alloc(max(ready_flag_count, 1), dtype=torch.uint64)
         self._weight_lifetime_barrier_handle = weight_region.handle
 
         if is_train:
-            grad_region = allocate_region(
-                self.num_local_redundant_experts * self.expert_total_numel,
+            grad_region = alloc(
+                (self.num_local_redundant_experts, self.expert_total_numel),
                 dtype=torch.float32,
-                device=torch.device("cuda", self.device),
-                group=get_symmetric_group(),
-                local_shape=(self.num_local_redundant_experts, self.expert_total_numel),
             )
-            self._symm_regions.append(grad_region)
-            local_grad_buffer = grad_region.local
+            local_grad_buffer = grad_region.tensor
             remote_grad_ptrs = grad_region.remote_ptrs
         else:
-            local_grad_buffer = torch.empty(
-                0, dtype=torch.float32, device=torch.device("cuda", self.device)
-            )
+            local_grad_buffer = torch.empty(0, dtype=torch.float32, device=device)
             remote_grad_ptrs = torch.empty(0, dtype=torch.int64)
 
         self.runtime = _C.Manager(
@@ -238,9 +225,9 @@ class Manager:
             tuning.weight_sync_relay_min_replicas,
             tuning.weight_sync_relay_max_relays,
             tuning.weight_sync_relay_min_fanout_gain,
-            weight_region.local,
+            weight_region.tensor,
             local_scale_buffer,
-            ready_region.storage,
+            ready_region.tensor,
             local_grad_buffer,
             weight_region.remote_ptrs,
             remote_scale_ptrs,

@@ -1,7 +1,5 @@
 #include "runtime.hpp"
 
-#include <cstdint>
-
 namespace ultra_ep::runtime {
 
 bool is_runtime_initialized = false;
