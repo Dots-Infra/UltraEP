@@ -1,6 +1,6 @@
 import torch
 import torch.distributed as dist
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import ultra_ep._C as _C
 from .config import load_tuning_from_env
@@ -600,6 +600,10 @@ class Manager:
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
         use_current_stream: bool = False,
+        *,
+        physical_to_logical_map: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_counts: Optional[torch.Tensor] = None,
     ):
         """Aggregate replica gradients to masters.
 
@@ -613,6 +617,9 @@ class Manager:
                 the private-stream behavior by default.
 
         Notes:
+            Supply all three placement tensors or omit all of them. Explicit
+            placement must match the corresponding forward pass and agree
+            across ranks. Keep the maps unchanged until completion.
             This is collective within each NVLink domain, including ranks with
             no local tasks. Completion covers remote reads and buffer clearing;
             wait on the returned event before reuse when async_finish=True.
@@ -634,6 +641,9 @@ class Manager:
             getattr(previous_event, "event", None),
             async_finish,
             use_current_stream,
+            physical_to_logical_map,
+            logical_to_physical_map,
+            logical_replica_counts,
         )
         return EventHandle(event)
 
@@ -642,6 +652,10 @@ class Manager:
         layer_id: int,
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
+        *,
+        physical_to_logical_map: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_counts: Optional[torch.Tensor] = None,
     ):
         """Collectively copy master weights to replicas within each NVLink domain.
 
@@ -649,6 +663,11 @@ class Manager:
         order. Completion covers incoming peer writes and protects reuse of
         the shared replica buffers. In asynchronous mode the caller must wait
         on the returned event before accessing the buffers again.
+
+        Notes:
+            Supply all three placement tensors or omit all of them. Explicit
+            placement must match the corresponding forward pass and agree
+            across ranks. Keep the maps unchanged until completion.
         """
         assert 0 <= layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
@@ -663,6 +682,9 @@ class Manager:
                 self.local_master_fc2_weight_scale_ptr_pool[real_lid],
                 getattr(previous_event, "event", None),
                 async_finish,
+                physical_to_logical_map,
+                logical_to_physical_map,
+                logical_replica_counts,
             )
             return EventHandle(event)
 
@@ -707,7 +729,7 @@ class Manager:
         layer_id: int,
         routing_map: torch.Tensor,
         verify_reduced_loads: bool = False,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Update expert placement for a single layer based on real-time load statistics.
 
@@ -749,11 +771,18 @@ class Manager:
                     self.runtime.get_global_logical_expert_loads_tensor(),
                 )
 
+        compute_stream.wait_stream(comm_stream)
+        return (
+            self._physical_to_logical_map[layer_id],
+            self._logical_to_physical_map[layer_id],
+            self._logical_replica_counts[layer_id],
+        )
+
     def update_placement_sparse(
         self,
         layer_id: int,
         topk_ids: torch.Tensor,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert layer_id < self.num_alloc_layers
         topk_ids = topk_ids.contiguous()
         comm_stream = self.get_comm_stream()
@@ -764,6 +793,13 @@ class Manager:
             self.runtime.compute_local_loads_sparse(topk_ids)
             topk_ids.record_stream(comm_stream)
             self._solve_placement_from_local_loads(layer_id)
+
+        compute_stream.wait_stream(comm_stream)
+        return (
+            self._physical_to_logical_map[layer_id],
+            self._logical_to_physical_map[layer_id],
+            self._logical_replica_counts[layer_id],
+        )
 
     def reroute(
         self,

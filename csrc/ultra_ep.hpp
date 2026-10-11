@@ -206,6 +206,11 @@ class Manager {
     int placement_sync_slot(const int layer_id) const { return is_train ? layer_id : 0; }
     void record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream);
     void wait_for_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream) const;
+    std::tuple<int32_t*, int32_t*, int32_t*> get_placement_ptrs(
+        int layer_id,
+        const std::optional<torch::Tensor>& physical_to_logical_map,
+        const std::optional<torch::Tensor>& logical_to_physical_map,
+        const std::optional<torch::Tensor>& logical_replica_counts) const;
 
 public:
     Manager(const int& num_layers,
@@ -257,7 +262,10 @@ public:
                                            torch::Tensor& local_master_fc2_grad_ptr_tensor,
                                            std::optional<EventHandle>& previous_event,
                                            bool async,
-                                           bool use_current_stream);
+                                           bool use_current_stream = false,
+                                           const std::optional<torch::Tensor>& physical_to_logical_map = std::nullopt,
+                                           const std::optional<torch::Tensor>& logical_to_physical_map = std::nullopt,
+                                           const std::optional<torch::Tensor>& logical_replica_counts = std::nullopt);
     // Sync replica weights with masters
     // Parameters (ptr tensor of local master weight buffers, for the current layer):
     // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
@@ -268,7 +276,10 @@ public:
                                            torch::Tensor& local_master_fc1_weight_scale_ptr_tensor,
                                            torch::Tensor& local_master_fc2_weight_scale_ptr_tensor,
                                            std::optional<EventHandle>& previous_event,
-                                           bool async);
+                                           bool async,
+                                           const std::optional<torch::Tensor>& physical_to_logical_map = std::nullopt,
+                                           const std::optional<torch::Tensor>& logical_to_physical_map = std::nullopt,
+                                           const std::optional<torch::Tensor>& logical_replica_counts = std::nullopt);
 
     // Placement is split around the Python torch.distributed collective:
     //   compute_*_local_loads -> all_reduce/all_gather -> solve_placement.
@@ -422,7 +433,10 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("local_master_fc2_grad_ptr_tensor"),
              pybind11::arg("previous_event"),
              pybind11::arg("async_finish"),
-             pybind11::arg("use_current_stream") = false)
+             pybind11::arg("use_current_stream") = false,
+             pybind11::arg("physical_to_logical_map") = pybind11::none(),
+             pybind11::arg("logical_to_physical_map") = pybind11::none(),
+             pybind11::arg("logical_replica_counts") = pybind11::none())
         .def("weight_sync",
              &Manager::weight_sync,
              pybind11::arg("layer_id"),
@@ -431,7 +445,10 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("local_master_fc1_weight_scale_ptr_tensor"),
              pybind11::arg("local_master_fc2_weight_scale_ptr_tensor"),
              pybind11::arg("previous_event"),
-             pybind11::arg("async_finish"))
+             pybind11::arg("async_finish"),
+             pybind11::arg("physical_to_logical_map") = pybind11::none(),
+             pybind11::arg("logical_to_physical_map") = pybind11::none(),
+             pybind11::arg("logical_replica_counts") = pybind11::none())
         .def("set_weight_sync_plan_mode", &Manager::set_weight_sync_plan_mode)
         .def("set_grad_reduce_deterministic", &Manager::set_grad_reduce_deterministic)
         .def("get_comm_stream", &Manager::get_comm_stream)
