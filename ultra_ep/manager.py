@@ -815,7 +815,7 @@ class Manager:
             expanded_probs, expanded_routing_map = _DenseRerouteFunction.apply(
                 probs,
                 routing_map,
-                self.runtime,
+                self,
                 layer_id,
             )
         else:
