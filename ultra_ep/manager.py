@@ -681,7 +681,7 @@ class Manager:
         )
 
     def _solve_placement_from_local_loads(self, layer_id: int):
-        """Gather EP-wide metadata and solve on the current communication stream."""
+        """Gather EP-wide metadata and solve on the calling CUDA stream."""
         if self.legacy_placement:
             global_loads = self.runtime.get_global_logical_expert_loads_tensor()
             global_loads.copy_(self._local_expert_loads)
@@ -729,18 +729,9 @@ class Manager:
         """
         assert layer_id < self.num_alloc_layers
         routing_map = routing_map.contiguous()
-        comm_stream = self.get_comm_stream()
-        compute_stream = torch.cuda.current_stream(device=self.device)
-        if compute_stream.stream_id != comm_stream.stream_id:
-            comm_stream.wait_stream(compute_stream)
         with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
-            with torch.cuda.stream(comm_stream):
-                self.runtime.compute_local_loads(routing_map)
-                # ``contiguous()`` may have created a temporary tensor. Keep
-                # its storage alive until the communication stream consumes it.
-                routing_map.record_stream(comm_stream)
-                self._solve_placement_from_local_loads(layer_id)
-        compute_stream.wait_stream(comm_stream)
+            self.runtime.compute_local_loads(routing_map)
+            self._solve_placement_from_local_loads(layer_id)
         if verify_reduced_loads:
             global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
             dist.all_reduce(global_logical_expert_loads, group=self.group)
@@ -761,19 +752,13 @@ class Manager:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Plan from topk IDs and return the same views as ``update_placement``.
 
-        The calling stream waits for the placement to be ready, without blocking
-        the CPU. Other consumer streams must establish their own dependency.
+        Planning runs on the calling CUDA stream without blocking the CPU.
+        Other consumer streams must establish their own dependency.
         """
         assert layer_id < self.num_alloc_layers
         topk_ids = topk_ids.contiguous()
-        comm_stream = self.get_comm_stream()
-        compute_stream = torch.cuda.current_stream(device=self.device)
-        comm_stream.wait_stream(compute_stream)
-        with torch.cuda.stream(comm_stream):
-            self.runtime.compute_local_loads_sparse(topk_ids)
-            topk_ids.record_stream(comm_stream)
-            self._solve_placement_from_local_loads(layer_id)
-        compute_stream.wait_stream(comm_stream)
+        self.runtime.compute_local_loads_sparse(topk_ids)
+        self._solve_placement_from_local_loads(layer_id)
         return (
             self._physical_to_logical_map[layer_id],
             self._logical_to_physical_map[layer_id],
