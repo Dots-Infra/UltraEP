@@ -1,6 +1,6 @@
 import torch
 import torch.distributed as dist
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import ultra_ep._C as _C
 from .config import load_tuning_from_env
@@ -432,6 +432,10 @@ class Manager:
         layer_id: int,
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
+        *,
+        physical_to_logical_map: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_counts: Optional[torch.Tensor] = None,
     ):
         """Aggregate replica gradients to masters.
 
@@ -441,6 +445,9 @@ class Manager:
                 pools are looked up by the real layer ID derived from this.
 
         Notes:
+            Supply all three placement tensors or omit all of them. Explicit
+            placement has the same contract as ``weight_sync`` and must match
+            the placement used by the corresponding forward pass.
             The grad-reduce SM budget is controlled globally via the
             ``ULTRA_EP_GRAD_REDUCE_NUM_SMS`` environment variable.
             Set ``ULTRA_EP_GRAD_REDUCE_DETERMINISTIC=1`` to use the deterministic
@@ -458,6 +465,9 @@ class Manager:
             self.local_master_fc2_grad_ptr_pool[real_lid],
             getattr(previous_event, "event", None),
             async_finish,
+            physical_to_logical_map,
+            logical_to_physical_map,
+            logical_replica_counts,
         )
         return EventHandle(event)
 
@@ -466,6 +476,10 @@ class Manager:
         layer_id: int,
         previous_event: Optional[EventHandle] = None,
         async_finish: bool = False,
+        *,
+        physical_to_logical_map: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_counts: Optional[torch.Tensor] = None,
     ):
         """
         Synchronize master weights to replicas.
@@ -479,6 +493,17 @@ class Manager:
                 Master pointer pools are looked up by the derived real layer ID.
             previous_event: Optional event to wait for before starting.
             async_finish: If True, return immediately with an event handle.
+            physical_to_logical_map: Optional CUDA int32 [P] placement.
+            logical_to_physical_map: Optional CUDA int32 [L, EP] inverse map.
+            logical_replica_counts: Optional CUDA int32 [L] counts including masters.
+
+        Notes:
+            Supply all three maps or omit all to use internal placement.
+            External maps must be contiguous on the manager's device and agree
+            across ranks: fixed masters first, at most one instance per rank,
+            replicas within the master's NVLink domain, and -1 for unused entries.
+            Keep inputs unchanged until completion; previous_event or the calling
+            stream must cover both weight and placement readiness.
 
         Returns:
             EventHandle if async_finish=True, else None.
@@ -500,6 +525,9 @@ class Manager:
                 self.local_master_fc2_weight_scale_ptr_pool[real_lid],
                 getattr(previous_event, "event", None),
                 async_finish,
+                physical_to_logical_map,
+                logical_to_physical_map,
+                logical_replica_counts,
             )
             return EventHandle(event)
 
@@ -524,7 +552,7 @@ class Manager:
         layer_id: int,
         routing_map: torch.Tensor,
         verify_reduced_loads: bool = False,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Update expert placement for a single layer based on real-time load statistics.
 
@@ -540,6 +568,11 @@ class Manager:
         Args:
             layer_id: The MoE layer index to update.
             routing_map: [num_tokens, num_global_logical_experts] bool tensor, logical routing map.
+
+        Returns:
+            CUDA int32 views of (physical_to_logical_map, logical_to_physical_map,
+            logical_replica_counts) for this virtual layer. Treat them as read-only;
+            they remain valid until this slot is updated or the manager is destroyed.
         """
         assert layer_id < self.num_alloc_layers
         with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
@@ -556,12 +589,22 @@ class Manager:
                 global_logical_expert_loads,
                 self.runtime.get_global_logical_expert_loads_tensor(),
             )
+        return (
+            self._physical_to_logical_map[layer_id],
+            self._logical_to_physical_map[layer_id],
+            self._logical_replica_counts[layer_id],
+        )
 
     def update_placement_sparse(
         self,
         layer_id: int,
         topk_ids: torch.Tensor,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Plan from topk IDs and return the same views as ``update_placement``.
+
+        The calling stream waits for the placement to be ready, without blocking
+        the CPU. Other consumer streams must establish their own dependency.
+        """
         assert layer_id < self.num_alloc_layers
         self.runtime.update_placement_sparse(layer_id, topk_ids)
         with torch.cuda.stream(self.get_comm_stream()):
@@ -570,6 +613,12 @@ class Manager:
                 self._real_layer_id(layer_id),
                 self.runtime.get_global_logical_expert_loads_tensor(),
             )
+        torch.cuda.current_stream().wait_stream(self.get_comm_stream())
+        return (
+            self._physical_to_logical_map[layer_id],
+            self._logical_to_physical_map[layer_id],
+            self._logical_replica_counts[layer_id],
+        )
 
     def reroute(
         self,

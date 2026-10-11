@@ -151,6 +151,17 @@ def transformer_layer(hidden, manager, layer_id):
     return residual + out
 ```
 
+`update_placement` and `update_placement_sparse` return
+`(physical_to_logical_map, logical_to_physical_map, logical_replica_counts)` as
+read-only CUDA int32 views with shapes `[P]`, `[L, EP]`, and `[L]`, where `P` and
+`L` are the global physical and logical expert counts. Keep the manager alive
+and retain the virtual slot through backward; updating it overwrites these views.
+
+For external placement, pass all three tensors as keyword arguments to
+`weight_sync` and `grad_reduce`. Omitting all three uses the internal placement;
+explicit inputs leave it unchanged. See the [API docstrings](ultra_ep/manager.py)
+for tensor, topology, and lifetime requirements.
+
 ## Tests
 
 UltraEP provides two test entrypoints. `test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness.
