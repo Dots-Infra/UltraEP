@@ -29,5 +29,5 @@ def allocate_region(numel, *, dtype, device, group, local_shape=None):
     if local_shape is not None:
         local = local.view(local_shape)
     return SymmetricRegion(
-        storage, handle, local, torch.tensor(pointers, dtype=torch.int64)
+        storage, handle, local, torch.tensor(pointers, dtype=torch.int64, device="cpu")
     )

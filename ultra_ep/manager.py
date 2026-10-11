@@ -235,7 +235,9 @@ class Manager:
         )
         assert self.runtime.is_available()
         retain_runtime()
-        self.runtime.set_lifetime_barriers(weight_region.handle.barrier, ready_region.handle.barrier)
+        self.runtime.set_lifetime_barriers(
+            weight_region.handle.barrier, ready_region.handle.barrier
+        )
 
         # Symmetric rendezvous makes the mapped addresses visible, but the C++
         # constructor also initializes local relay flags and placement state.
