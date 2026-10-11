@@ -235,6 +235,7 @@ class Manager:
         )
         assert self.runtime.is_available()
         retain_runtime()
+        self.runtime.set_lifetime_barriers(weight_region.handle.barrier, ready_region.handle.barrier)
 
         # Symmetric rendezvous makes the mapped addresses visible, but the C++
         # constructor also initializes local relay flags and placement state.
@@ -572,6 +573,10 @@ class Manager:
                 pools are looked up by the real layer ID derived from this.
 
         Notes:
+            All domain ranks must participate, including ranks without tasks.
+            The calling stream or previous_event must cover local Wgrad producers.
+            Completion covers remote reads and clearing of replica gradients.
+            Wait on the returned event before reuse when async_finish=True.
             Supply all three placement tensors or omit all of them. Explicit
             placement has the same contract as ``weight_sync`` and must match
             the placement used by the corresponding forward pass.
@@ -624,6 +629,10 @@ class Manager:
             logical_replica_counts: Optional CUDA int32 [L] counts including masters.
 
         Notes:
+            All domain ranks must participate, including ranks without tasks.
+            The calling stream or previous_event must cover previous replica consumers.
+            Completion covers incoming peer writes; wait on the returned event
+            before consuming replica weights when async_finish=True.
             Supply all three maps or omit all to use internal placement.
             External maps must be contiguous on the manager's device and agree
             across ranks: fixed masters first, at most one instance per rank,

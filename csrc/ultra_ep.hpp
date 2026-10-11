@@ -17,9 +17,12 @@
 
 namespace ultra_ep {
 
-std::tuple<int64_t, int64_t, int64_t> get_replica_buffer_layout(
-    int64_t fc1_numel, int64_t fc2_numel, int weight_bytes,
-    int64_t fc1_scale_numel, int64_t fc2_scale_numel, int scale_bytes);
+std::tuple<int64_t, int64_t, int64_t> get_replica_buffer_layout(int64_t fc1_numel,
+                                                                int64_t fc2_numel,
+                                                                int weight_bytes,
+                                                                int64_t fc1_scale_numel,
+                                                                int64_t fc2_scale_numel,
+                                                                int scale_bytes);
 
 /* Describes the placement of global experts across all ranks.
 
@@ -128,6 +131,8 @@ class Manager {
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
     at::cuda::CUDAStream relay_stream;
+    // Bound handle methods keep Torch's synchronization implementation outside our ABI.
+    pybind11::function weight_lifetime_barrier_, grad_lifetime_barrier_;
     // Completion event for the latest placement update / forward-buffer pre-zero.
     // Train mode tracks one slot per layer; inference mode uses slot 0 as the shared buffer.
     std::vector<std::optional<EventHandle>> placement_ready_events_;
@@ -264,6 +269,7 @@ public:
                                            const std::optional<torch::Tensor>& physical_to_logical_map = std::nullopt,
                                            const std::optional<torch::Tensor>& logical_to_physical_map = std::nullopt,
                                            const std::optional<torch::Tensor>& logical_replica_counts = std::nullopt);
+    void set_lifetime_barriers(pybind11::function weight_barrier, pybind11::function grad_barrier);
     // Sync replica weights with masters
     // Parameters (ptr tensor of local master weight buffers, for the current layer):
     // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
@@ -334,14 +340,10 @@ public:
     torch::Tensor get_logical_instance_quota_tensor() const { return placement.logical_instance_quota; }
     torch::Tensor get_logical_instance_quota_prefix_tensor() const { return placement.logical_instance_quota_prefix; }
     torch::Tensor get_rank_quota_prefix_tensor() const { return placement.rank_quota_prefix; }
-    torch::Tensor get_global_logical_expert_loads_tensor() const {
-        return global_logical_expert_loads_tensor;
-    };
+    torch::Tensor get_global_logical_expert_loads_tensor() const { return global_logical_expert_loads_tensor; };
 
     torch::Tensor get_local_expert_loads_tensor() const { return local_expert_loads_tensor; }
     torch::Tensor get_expert_loads_per_rank_tensor() const { return expert_loads_per_rank_tensor; }
-
-
 };
 
 static void register_apis(pybind11::module_& m) {
@@ -416,6 +418,7 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("remote_grad_ptrs_external") = torch::Tensor(),
              pybind11::arg("remote_ready_ptrs_external") = torch::Tensor())
         .def("destroy", &Manager::destroy)
+        .def("set_lifetime_barriers", &Manager::set_lifetime_barriers)
         .def("is_available", &Manager::is_available)
         .def("compute_local_loads", &Manager::compute_local_loads)
         .def("compute_local_loads_sparse", &Manager::compute_local_loads_sparse)

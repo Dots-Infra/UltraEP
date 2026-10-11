@@ -229,6 +229,10 @@ Algorithm and kernel behaviors are controlled entirely through `ULTRA_EP_*` envi
 - Construct managers in the same order on all EP ranks. Call `manager.destroy()`
   collectively before process-group teardown, after outstanding work and CUDA
   graphs have finished. The default automatic cleanup remains available.
+- Weight-sync and grad-reduce synchronize their NVLink domain before and after
+  communication. All ranks participate, including those without local tasks.
+  Completion events cover incoming writes and remote reads/clears; wait on them
+  before consuming or reusing replica buffers in asynchronous mode.
 - CUDA graph weight synchronization currently requires direct mode. Relay uses
   a host-side epoch that is not advanced by graph replay.
 
