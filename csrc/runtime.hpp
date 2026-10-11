@@ -11,14 +11,11 @@ namespace ultra_ep::runtime {
 
 extern bool is_runtime_initialized;
 
-extern int rank_idx, nvl_rank_idx, rdma_rank_idx;
-extern int num_ranks, num_nvl_ranks, num_rdma_ranks;
+extern int rank_idx, nvl_rank_idx;
+extern int num_ranks, num_nvl_ranks;
 extern int device_id, num_device_sms;
 
-at::cuda::CUDAStream get_global_comm_stream();
-
-void init_runtime(const int& rank_idx_,
-                  const int& num_ranks_, const int& num_nvl_ranks_);
+void init_runtime(const int& rank_idx_, const int& num_ranks_, const int& num_nvl_ranks_);
 
 void destroy();
 
