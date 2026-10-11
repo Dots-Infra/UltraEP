@@ -167,7 +167,7 @@ for tensor, topology, and lifetime requirements.
 
 ## Tests
 
-`test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness.
+`test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness. It also reports standalone load all-gather latency (`load_ag/nvl` and the NCCL reference) using CUDA graph replay; across NVLink domains it tests the NCCL path only.
 
 ```bash
 # Single-GPU placement/reroute simulation

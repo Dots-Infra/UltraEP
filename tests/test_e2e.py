@@ -11,6 +11,7 @@ if REPO_ROOT in sys.path:
 if "" in sys.path and os.path.abspath(os.getcwd()) == REPO_ROOT:
     sys.path.remove("")
 import ultra_ep
+import ultra_ep._C as _C
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import (
@@ -134,6 +135,50 @@ def make_probs(routing_map: torch.Tensor):
         int(routing_map.sum().item()), device=routing_map.device
     )
     return probs
+
+
+def run_load_ag(manager, args):
+    """Measure just the load collective, with NCCL as the reference path."""
+    local = manager._local_expert_loads
+    gathered = manager._expert_loads_per_rank
+    experts = torch.arange(args.num_experts, dtype=torch.int32, device="cuda")
+    local.copy_(experts + manager.rank * args.num_experts)
+    expected = (
+        experts[None, :]
+        + args.num_experts
+        * torch.arange(manager.num_ranks, dtype=torch.int32, device="cuda")[:, None]
+    )
+
+    collectives = {}
+    if manager._nvl_load_peer_ptrs is not None:
+        collectives["nvl"] = lambda: _C.nvl_all_gather_loads(
+            gathered, local, manager._nvl_load_peer_ptrs, manager.rank
+        )
+    collectives["nccl"] = lambda: dist.all_gather_into_tensor(
+        gathered, local, group=manager.group
+    )
+    for name, gather in collectives.items():
+        gather()
+        assert bitwise_equal(gathered, expected), f"load_ag/{name} mismatch"
+        # Amortize graph launch overhead without timing an unrelated barrier.
+        repeats = 32
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(repeats):
+                gather()
+        local.add_(1)
+        expected.add_(1)
+        graph.replay()
+        assert bitwise_equal(gathered, expected), f"load_ag/{name} replay mismatch"
+        avg, _, _ = bench(
+            graph.replay, args.warmup_iters, args.bench_iters, use_barrier=False
+        )
+        latency = torch.tensor(avg * 1e6 / repeats, device="cuda")
+        dist.all_reduce(latency, op=dist.ReduceOp.MAX, group=manager.group)
+        print_rank0(
+            f"  {'load_ag/' + name:<28} graph time: {latency.item():>9.3f} us"
+            f" | {local.numel() * local.element_size()} B/rank | bitwise PASS"
+        )
 
 
 def expected_replica_weights(
@@ -754,6 +799,7 @@ def main():
     )
 
     try:
+        run_load_ag(manager, args)
         for ratio in args.imbalance_ratios:
             run_case(manager, args, ratio)
     finally:
