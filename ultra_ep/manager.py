@@ -144,6 +144,20 @@ class Manager:
         ready_flag_count = self.num_local_redundant_experts * ready_flags_per_expert
 
         self._symm_regions = []
+        self._nvl_load_peer_ptrs = None
+        if not legacy_placement and self.num_ranks == self.nvl_domain_size:
+            # One reusable load vector and two peer handshakes, independent of
+            # layer IDs and graph replay counts. Placement calls are serialized.
+            load_region = allocate_region(
+                self.num_global_logical_experts + 2 * self.num_ranks,
+                dtype=torch.int32,
+                device=torch.device("cuda", self.device),
+                group=get_symmetric_group(),
+            )
+            load_region.storage.zero_()
+            self._symm_regions.append(load_region)
+            self._nvl_load_peer_ptrs = load_region.remote_ptrs.to(self.device)
+
         weight_region = allocate_region(
             self.num_local_redundant_experts * expert_total_weight_bytes,
             dtype=torch.uint8,
@@ -424,6 +438,7 @@ class Manager:
         # Drop the Python Symmetric Memory handles only after C++ has released
         # all local tensor views and asynchronous kernels have been synchronized.
         self._symm_regions.clear()
+        self._nvl_load_peer_ptrs = None
         self._weight_lifetime_barrier_handle = None
         release_runtime()
 
@@ -688,11 +703,19 @@ class Manager:
             dist.all_reduce(global_loads, group=self.group)
             self.runtime.solve_placement_legacy(layer_id, global_loads)
         else:
-            dist.all_gather_into_tensor(
-                self._expert_loads_per_rank,
-                self._local_expert_loads,
-                group=self.group,
-            )
+            if self._nvl_load_peer_ptrs is not None:
+                _C.nvl_all_gather_loads(
+                    self._expert_loads_per_rank,
+                    self._local_expert_loads,
+                    self._nvl_load_peer_ptrs,
+                    self.rank,
+                )
+            else:
+                dist.all_gather_into_tensor(
+                    self._expert_loads_per_rank,
+                    self._local_expert_loads,
+                    group=self.group,
+                )
             self.runtime.solve_placement(layer_id, self._expert_loads_per_rank)
         self._load_profiler.stage_pre(
             layer_id,

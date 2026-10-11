@@ -290,6 +290,10 @@ void topk_local_sum(const int64_t* topk_ids_ptr,
 
 void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads, int G, int L, cudaStream_t stream);
 
+// Single-domain small-message gather. Each peer owns [L loads | 2 * G signals].
+void nvl_all_gather_loads(
+    int32_t* output, const int32_t* input, int32_t** peers, int rank, int G, int L, cudaStream_t stream);
+
 // In-place remap topk_ids from logical to physical expert IDs using current
 // placement. The sparse path uses a per-expert local ordinal produced by
 // atomicAdd on `counters`, then:

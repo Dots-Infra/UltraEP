@@ -223,8 +223,9 @@ Algorithm and kernel behaviors are controlled entirely through `ULTRA_EP_*` envi
 - NVML identifies fabric cliques (including multi-host NVLink) or local NVLink
   peers. Domains must form equal contiguous blocks of EP-group ranks.
   `MAX_NUM_NVL_PEERS` may split them into smaller equal domains.
-- Placement metadata always uses the full NCCL EP group: all-gather for quota
-  placement, or all-reduce for legacy placement. Planning returns read-only
+- Quota placement gathers small load vectors directly through symmetric memory
+  when the EP group fits within one NVLink domain; across domains it uses NCCL
+  all-gather. Legacy placement always uses NCCL all-reduce. Planning returns read-only
   placement views ready on the calling CUDA stream.
 - Construct managers in the same order on all EP ranks. Call `manager.destroy()`
   collectively before process-group teardown, after outstanding work and CUDA

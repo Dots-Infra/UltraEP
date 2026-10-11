@@ -1,5 +1,6 @@
 #pragma once
 
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
@@ -348,6 +349,23 @@ public:
 
 static void register_apis(pybind11::module_& m) {
     m.def("get_replica_buffer_layout", &get_replica_buffer_layout);
+    m.def("nvl_all_gather_loads", [](torch::Tensor output, torch::Tensor input, torch::Tensor peers, int rank) {
+        EP_HOST_ASSERT(input.is_cuda() && input.scalar_type() == torch::kInt32 && input.dim() == 1);
+        EP_HOST_ASSERT(output.device() == input.device() && output.scalar_type() == torch::kInt32);
+        EP_HOST_ASSERT(peers.device() == input.device() && peers.scalar_type() == torch::kInt64 && peers.dim() == 1);
+        EP_HOST_ASSERT(input.is_contiguous() && output.is_contiguous() && peers.is_contiguous());
+        EP_HOST_ASSERT(rank >= 0 && rank < peers.numel() && peers.numel() <= 256);
+        EP_HOST_ASSERT(input.numel() > 0 && output.dim() == 2 && output.size(0) == peers.numel() &&
+                       output.size(1) == input.numel());
+        const at::cuda::CUDAGuard guard(input.device());
+        kernels::nvl_all_gather_loads(output.data_ptr<int32_t>(),
+                                      input.data_ptr<int32_t>(),
+                                      reinterpret_cast<int32_t**>(peers.data_ptr<int64_t>()),
+                                      rank,
+                                      peers.numel(),
+                                      input.numel(),
+                                      at::cuda::getCurrentCUDAStream().stream());
+    });
     pybind11::class_<Manager>(m, "Manager")
         .def(pybind11::init<int,
                             int,
