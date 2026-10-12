@@ -39,22 +39,12 @@ The requirements are:
     - CUDA 12.3 or higher for SM90
     - CUDA 12.9 or higher for SM100
 - NVLink/P2P access among the GPUs within each NVLink domain
-- PyTorch's CUDA Symmetric Memory allocator
-- `nvidia-ml-py` (`pynvml`) for NVLink topology detection, installed automatically
 
 Then build and install. The builder can auto-detect CUDA compute capability; if failed, explicitly set `TORCH_CUDA_ARCH_LIST` to `9.0` (SM90) or `10.0` (SM100).
 
 ```bash
 python setup.py install
 ```
-
-UltraEP does not link against or initialize NVSHMEM. At manager construction,
-the Python layer allocates the replica buffers with PyTorch Symmetric Memory,
-rendezvouses them within each detected NVLink domain, and passes the resulting
-peer-pointer tables to the CUDA extension. Placement collectives still span
-the full EP process group. As before, equally sized NVLink domains must occupy
-contiguous EP-rank blocks; `MAX_NUM_NVL_PEERS` can restrict the detected size.
-For an NVL72 host with EP16, pass the EP process group of size 16.
 
 You're all set! Simply import `ultra_ep` in your Python project and get started.
 
@@ -167,7 +157,7 @@ for tensor, topology, and lifetime requirements.
 
 ## Tests
 
-`test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness. It also reports standalone load all-gather latency (`load_ag/nvl` and the NCCL reference) using CUDA graph replay; across NVLink domains it tests the NCCL path only.
+UltraEP provides two test entrypoints. `test_solving.py` runs a single-GPU placement/reroute solving with synthesized Zipf-distributed expert loads at target rank-level imbalance ratios (max/mean). `test_e2e.py` runs the distributed runtime path and further evaluates communication kernels for latency and bitwise correctness.
 
 ```bash
 # Single-GPU placement/reroute simulation
@@ -180,7 +170,7 @@ torchrun --nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK
     tests/test_e2e.py --num-experts 256
 ```
 
-The table below reports an original NVSHMEM-based EP64, 256-expert `test_e2e.py` run (4 master + 2 redundant experts/rank, topk = 8, tokens/rank = 8k, bf16 weights, 42 SMs for grad-reduce). The 1.01 final imbalance corresponds to the default balancing tolerance (`ULTRA_EP_QUOTA_ORACLE_EPS=0.01`):
+The table below reports one EP64, 256-expert `test_e2e.py` run (4 master + 2 redundant experts/rank, topk = 8, tokens/rank = 8k, bf16 weights, 42 SMs for grad-reduce). The 1.01 final imbalance corresponds to the default balancing tolerance (`ULTRA_EP_QUOTA_ORACLE_EPS=0.01`):
 
 | Initial imbalance (max/mean) | **1.51** | **2.01** | **3.03** |
 | :--- | :---: | :---: | :---: |
@@ -215,27 +205,6 @@ Algorithm and kernel behaviors are controlled entirely through `ULTRA_EP_*` envi
 - `ULTRA_EP_QUOTA_ALLOW_ZERO_MASTER_QUOTA` (default `0`): allow zero-load master expert.
 - `ULTRA_EP_QUOTA_KERNEL_STAGE` (default `1`): quota kernel stage (`0` or `1`).
 - `ULTRA_EP_QUOTA_REROUTE_INTERLEAVE` (default `1`): interleave token order to avoid congestion in subsequent dispatch.
-
-**Symmetric Memory and placement metadata**
-
-- Replica weights, gradients, and relay flags use PyTorch's CUDA Symmetric
-  Memory allocator. No NVSHMEM installation or backend selection is needed.
-- NVML identifies fabric cliques (including multi-host NVLink) or local NVLink
-  peers. Domains must form equal contiguous blocks of EP-group ranks.
-  `MAX_NUM_NVL_PEERS` may split them into smaller equal domains.
-- Quota placement gathers small load vectors directly through symmetric memory
-  when the EP group fits within one NVLink domain; across domains it uses NCCL
-  all-gather. Legacy placement always uses NCCL all-reduce. Planning returns read-only
-  placement views ready on the calling CUDA stream.
-- Construct managers in the same order on all EP ranks. Call `manager.destroy()`
-  collectively before process-group teardown, after outstanding work and CUDA
-  graphs have finished. The default automatic cleanup remains available.
-- Weight-sync and grad-reduce synchronize their NVLink domain before and after
-  communication. All ranks participate, including those without local tasks.
-  Completion events cover incoming writes and remote reads/clears; wait on them
-  before consuming or reusing replica buffers in asynchronous mode.
-- CUDA graph weight synchronization currently requires direct mode. Relay uses
-  a host-side epoch that is not advanced by graph replay.
 
 ### Load profiler and viewer
 

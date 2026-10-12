@@ -7,7 +7,6 @@ We provide a [Megatron-LM reference](https://github.com/Dots-Infra/Megatron-LM-U
 ## Setup
 
 Use a CUDA development image with PyTorch >= 2.11 and support for your GPU architecture.
-The image below is a starting point; verify the installed PyTorch version before building.
 
 ```bash
 docker run --gpus all -it --rm \
@@ -17,8 +16,6 @@ docker run --gpus all -it --rm \
     -e TORCH_CUDA_ARCH_LIST= \
     nvcr.io/nvidia/pytorch:26.03-py3
 
-# UltraEP uses PyTorch Symmetric Memory; no NVSHMEM wheel is required.
-# PyTorch >= 2.11 is required for barriers across more than 32 NVLink peers.
 ```
 
 Clone and install UltraEP.

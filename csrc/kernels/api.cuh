@@ -270,7 +270,7 @@ void run_dense_reroute_backward(const void* grad_expanded_probs,
 void rmap_local_sum(int num_tokens,                  // T
                     int num_global_logical_experts,  // L
                     const bool* routing_map_ptr,     // [T, L] bool
-                    int32_t* expert_loads_ptr,       // [L] int32, ordinary CUDA buffer
+                    int32_t* expert_loads_ptr,       // [L] int32
                     cudaStream_t stream);
 
 // ============================================================================
@@ -280,7 +280,7 @@ void rmap_local_sum(int num_tokens,                  // T
 // Compute per-expert token counts from sparse topk_ids
 // Replaces rmap_local_sum for sparse topk format.
 //   topk_ids_ptr: [T, K] int64, device — each entry is a logical expert ID
-//   expert_loads_ptr: [L] int32, ordinary CUDA buffer — output (local loads)
+//   expert_loads_ptr: [L] int32 — output (global loads)
 void topk_local_sum(const int64_t* topk_ids_ptr,
                     const int num_tokens,
                     const int top_k,

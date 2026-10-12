@@ -66,3 +66,17 @@ public:
         }                                                                                                     \
     } while (0)
 #endif
+
+#ifndef CUDA_DRIVER_CHECK
+#define CUDA_DRIVER_CHECK(cmd)                                                \
+    do {                                                                      \
+        const auto e = (cmd);                                                 \
+        if (e != CUDA_SUCCESS) {                                              \
+            std::stringstream ss;                                             \
+            const char *name, *info;                                          \
+            cuGetErrorName(e, &name), cuGetErrorString(e, &info);             \
+            ss << static_cast<int>(e) << " (" << name << ", " << info << ")"; \
+            throw EPException("CUDA driver", __FILE__, __LINE__, ss.str());   \
+        }                                                                     \
+    } while (0)
+#endif
