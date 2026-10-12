@@ -22,12 +22,12 @@ int64_t align_up_bytes(const int64_t value, const int64_t alignment) {
 }
 
 template <typename T>
-void copy_remote_pointer_table(const torch::Tensor& table, T**& device_table) {
+void copy_remote_pointer_table(const torch::Tensor& table, T**& device_table, const int num_nvl_ranks) {
     EP_HOST_ASSERT(table.defined() && !table.is_cuda() && table.dtype() == torch::kInt64 && table.is_contiguous() &&
-                   table.dim() == 1 && table.numel() == runtime::num_nvl_ranks);
+                   table.dim() == 1 && table.numel() == num_nvl_ranks);
     T* host_table[kernels::kMaxNvlDomainSize] = {};
     const auto* values = table.data_ptr<int64_t>();
-    for (int rank = 0; rank < runtime::num_nvl_ranks; ++rank) {
+    for (int rank = 0; rank < num_nvl_ranks; ++rank) {
         EP_HOST_ASSERT(values[rank] != 0 && "Symmetric Memory returned a null peer pointer");
         host_table[rank] = reinterpret_cast<T*>(static_cast<uintptr_t>(values[rank]));
     }
@@ -36,6 +36,10 @@ void copy_remote_pointer_table(const torch::Tensor& table, T**& device_table) {
 }
 
 void fill_task_build_config(kernels::TaskBuildConfig& config,
+                            int rank_idx,
+                            int nvl_rank_idx,
+                            int num_nvl_ranks,
+                            int num_ranks,
                             int num_local_master_experts,
                             int num_local_physical_experts,
                             int num_local_redundant_experts,
@@ -56,9 +60,9 @@ void fill_task_build_config(kernels::TaskBuildConfig& config,
                             int weight_sync_relay_max_relays,
                             int weight_sync_relay_min_fanout_gain) {
     config = {};
-    config.rank_idx = runtime::rank_idx;
-    config.nvl_rank_idx = runtime::nvl_rank_idx;
-    config.num_nvl_ranks = runtime::num_nvl_ranks;
+    config.rank_idx = rank_idx;
+    config.nvl_rank_idx = nvl_rank_idx;
+    config.num_nvl_ranks = num_nvl_ranks;
     config.num_local_master_experts = num_local_master_experts;
     config.num_local_physical_experts = num_local_physical_experts;
     config.num_local_redundant_experts = num_local_redundant_experts;
@@ -74,7 +78,7 @@ void fill_task_build_config(kernels::TaskBuildConfig& config,
     config.expert_weight_scale_stride_bytes = expert_weight_scale_stride_bytes;
     config.weight_data_element_bytes = weight_data_element_bytes;
     config.weight_scale_element_bytes = weight_scale_element_bytes;
-    config.max_replicas_dim = runtime::num_ranks;
+    config.max_replicas_dim = num_ranks;
     config.weight_sync_plan_mode = weight_sync_plan_mode;
     config.weight_sync_relay_min_replicas = weight_sync_relay_min_replicas;
     config.weight_sync_relay_max_relays = weight_sync_relay_max_relays;
@@ -223,7 +227,10 @@ std::tuple<int32_t*, int32_t*, int32_t*> GlobalExpertPlacement::get_quota_ptrs(i
 // Manager
 // ============================================================================
 
-Manager::Manager(const int& num_layers,
+Manager::Manager(const int& rank_idx,
+                 const int& num_ranks,
+                 const int& num_nvl_ranks,
+                 const int& num_layers,
                  const int& num_local_master_experts,
                  const int& num_local_redundant_experts,
                  const int64_t& expert_fc1_numel,
@@ -257,7 +264,10 @@ Manager::Manager(const int& num_layers,
                  const torch::Tensor& remote_weight_scale_ptrs_external,
                  const torch::Tensor& remote_grad_ptrs_external,
                  const torch::Tensor& remote_ready_ptrs_external)
-    : num_layers(num_layers),
+    : rank_idx(rank_idx),
+      num_ranks(num_ranks),
+      num_nvl_ranks(num_nvl_ranks),
+      num_layers(num_layers),
       num_local_master_experts(num_local_master_experts),
       num_local_redundant_experts(num_local_redundant_experts),
       num_local_physical_experts(num_local_master_experts + num_local_redundant_experts),
@@ -296,8 +306,18 @@ Manager::Manager(const int& num_layers,
       placement_ready_stream_ids_(is_train ? num_layers : 1, -1)
 
 {
+    // Topology and device checks
+    EP_HOST_ASSERT(rank_idx >= 0 && rank_idx < num_ranks);
+    EP_HOST_ASSERT(num_ranks > 0 && num_nvl_ranks > 0);
+    EP_HOST_ASSERT(num_nvl_ranks <= kernels::kMaxNvlDomainSize);
+    EP_HOST_ASSERT(num_ranks % num_nvl_ranks == 0);
+    nvl_rank_idx = rank_idx % num_nvl_ranks;
+    device_id = at::cuda::current_device();
+    cudaDeviceProp device_prop = {};
+    CUDA_RUNTIME_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
+    num_device_sms = device_prop.multiProcessorCount;
+
     // Common checks
-    EP_HOST_ASSERT(runtime::is_runtime_initialized and "Runtime must be initialized before creating Manager");
     EP_HOST_ASSERT(weight_data_element_bytes > 0);
     EP_HOST_ASSERT(weight_scale_element_bytes > 0);
     EP_HOST_ASSERT(grad_element_bytes == static_cast<int>(sizeof(float)) &&
@@ -327,11 +347,11 @@ Manager::Manager(const int& num_layers,
     EP_HOST_ASSERT(weight_sync_relay_min_fanout_gain_ >= 0);
     EP_HOST_ASSERT(grad_reduce_num_sms_ > 0);
     EP_HOST_ASSERT(grad_reduce_num_sms_ % 2 == 0 && "grad_reduce_num_sms must be even");
-    grad_reduce_num_sms_ = std::min(grad_reduce_num_sms_, runtime::num_device_sms);
+    grad_reduce_num_sms_ = std::min(grad_reduce_num_sms_, num_device_sms);
     EP_HOST_ASSERT((quota_kernel_stage_ == 0 || quota_kernel_stage_ == 1) &&
                    "quota kernel_stage supports only {0,1}; stage 2/3 has been removed");
-    num_global_physical_experts = num_local_physical_experts * runtime::num_ranks;
-    num_global_logical_experts = num_local_master_experts * runtime::num_ranks;
+    num_global_physical_experts = num_local_physical_experts * num_ranks;
+    num_global_logical_experts = num_local_master_experts * num_ranks;
     _weight_sync_task_capacity = num_local_physical_experts *
         weight_sync_chunks_for_shards(expert_fc1_numel,
                                       expert_fc2_numel,
@@ -340,8 +360,6 @@ Manager::Manager(const int& num_layers,
                                       weight_data_element_bytes);
 
     // Allocate global placement tensors using contiguous per-layer device buffers.
-    int num_ranks = runtime::num_ranks;
-    int device_id = runtime::device_id;
     placement.init(num_layers,
                    num_global_physical_experts,
                    num_global_logical_experts,
@@ -352,7 +370,7 @@ Manager::Manager(const int& num_layers,
     auto byte_opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::Device(torch::kCUDA, device_id));
     auto validate_cuda_tensor = [&](const torch::Tensor& tensor, torch::ScalarType dtype) {
         EP_HOST_ASSERT(tensor.defined() && tensor.is_cuda() && tensor.dtype() == dtype && tensor.is_contiguous());
-        EP_HOST_ASSERT(tensor.device().index() == device_id && "Symmetric buffers must use the runtime CUDA device");
+        EP_HOST_ASSERT(tensor.device().index() == device_id && "Symmetric buffers must use the manager's CUDA device");
     };
 
     // The Python side allocates and rendezvouses these buffers with
@@ -409,14 +427,14 @@ Manager::Manager(const int& num_layers,
             {0}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, device_id)));
     }
 
-    copy_remote_pointer_table(remote_weight_ptrs_external, _remote_weight_ptrs);
+    copy_remote_pointer_table(remote_weight_ptrs_external, _remote_weight_ptrs, num_nvl_ranks);
     if (expert_weight_scale_total_numel > 0) {
-        copy_remote_pointer_table(remote_weight_scale_ptrs_external, _remote_weight_scale_ptrs);
+        copy_remote_pointer_table(remote_weight_scale_ptrs_external, _remote_weight_scale_ptrs, num_nvl_ranks);
     }
     if (is_train) {
-        copy_remote_pointer_table(remote_grad_ptrs_external, _remote_grad_ptrs);
+        copy_remote_pointer_table(remote_grad_ptrs_external, _remote_grad_ptrs, num_nvl_ranks);
     }
-    copy_remote_pointer_table(remote_ready_ptrs_external, _remote_ready_flag_ptrs);
+    copy_remote_pointer_table(remote_ready_ptrs_external, _remote_ready_flag_ptrs, num_nvl_ranks);
 
     // Allocate intermediate buffers for task-build and persistent kernels.
     CUDA_RUNTIME_CHECK(
@@ -438,6 +456,10 @@ Manager::Manager(const int& num_layers,
 
     kernels::TaskBuildConfig config_cpu = {};
     fill_task_build_config(config_cpu,
+                           rank_idx,
+                           nvl_rank_idx,
+                           num_nvl_ranks,
+                           num_ranks,
                            num_local_master_experts,
                            num_local_physical_experts,
                            num_local_redundant_experts,
@@ -473,7 +495,7 @@ Manager::Manager(const int& num_layers,
     auto placement_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::Device(torch::kCUDA, device_id));
     global_logical_expert_loads_tensor = torch::empty({num_global_logical_experts}, placement_opts);
     local_expert_loads_tensor = torch::empty({num_global_logical_experts}, placement_opts);
-    expert_loads_per_rank_tensor = torch::empty({runtime::num_ranks, num_global_logical_experts}, placement_opts);
+    expert_loads_per_rank_tensor = torch::empty({num_ranks, num_global_logical_experts}, placement_opts);
     // Initialize default placement (master-only) for all layers so sparse reroute
     // remains valid before the first placement update.
     for (int lid = 0; lid < num_layers; ++lid) {
@@ -488,10 +510,10 @@ Manager::Manager(const int& num_layers,
                                        at::cuda::getCurrentCUDAStream().stream(),
                                        num_global_physical_experts,
                                        num_global_logical_experts,
-                                       runtime::num_ranks,
+                                       num_ranks,
                                        num_local_master_experts,
                                        num_local_redundant_experts,
-                                       runtime::num_ranks);
+                                       num_ranks);
     }
     CUDA_RUNTIME_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream().stream()));
 
@@ -668,11 +690,11 @@ void Manager::solve_placement_legacy(const int& layer_id, torch::Tensor& global_
                                      rank_quota_prefix,
                                      stream.stream(),
                                      num_global_logical_experts,
-                                     runtime::num_ranks,
+                                     num_ranks,
                                      num_local_master_experts,
                                      num_local_redundant_experts,
-                                     runtime::num_nvl_ranks,
-                                     runtime::num_ranks,
+                                     num_nvl_ranks,
+                                     num_ranks,
                                      balance_threshold_,
                                      quota_min_tokens_per_replica_,
                                      quota_allow_zero_master_quota_,
@@ -687,8 +709,7 @@ void Manager::solve_placement(const int& layer_id, torch::Tensor& loads_per_rank
     EP_HOST_ASSERT(!legacy_placement_ && layer_id >= 0 && layer_id < num_layers);
     EP_HOST_ASSERT(loads_per_rank.is_cuda() && loads_per_rank.is_contiguous() &&
                    loads_per_rank.dtype() == torch::kInt32 && loads_per_rank.dim() == 2 &&
-                   loads_per_rank.size(0) == runtime::num_ranks &&
-                   loads_per_rank.size(1) == num_global_logical_experts);
+                   loads_per_rank.size(0) == num_ranks && loads_per_rank.size(1) == num_global_logical_experts);
 
     auto stream = at::cuda::getCurrentCUDAStream();
     if (loads_per_rank.data_ptr<int32_t>() != expert_loads_per_rank_tensor.data_ptr<int32_t>()) {
@@ -700,7 +721,7 @@ void Manager::solve_placement(const int& layer_id, torch::Tensor& loads_per_rank
         placement.get_quota_ptrs(layer_id);
     kernels::reduce_per_rank_loads(expert_loads_per_rank_tensor.data_ptr<int32_t>(),
                                    global_logical_expert_loads_tensor.data_ptr<int32_t>(),
-                                   runtime::num_ranks,
+                                   num_ranks,
                                    num_global_logical_experts,
                                    stream.stream());
     kernels::solve_placement(global_logical_expert_loads_tensor.data_ptr<int32_t>(),
@@ -713,17 +734,18 @@ void Manager::solve_placement(const int& layer_id, torch::Tensor& loads_per_rank
                              rank_quota_prefix,
                              stream.stream(),
                              num_global_logical_experts,
-                             runtime::num_ranks,
+                             num_ranks,
                              num_local_master_experts,
                              num_local_redundant_experts,
-                             runtime::num_nvl_ranks,
-                             runtime::num_ranks,
+                             num_nvl_ranks,
+                             num_ranks,
                              balance_threshold_,
                              quota_min_tokens_per_replica_,
                              quota_allow_zero_master_quota_,
                              quota_locality_aware_,
                              quota_oracle_eps_,
-                             quota_kernel_stage_);
+                             quota_kernel_stage_,
+                             rank_idx);
     record_placement_ready(layer_id, stream);
 }
 
@@ -752,7 +774,7 @@ void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
                                           T,
                                           K,
                                           num_global_logical_experts,
-                                          runtime::num_ranks,
+                                          num_ranks,
                                           stream);
     } else {
         kernels::run_sparse_reroute_round_robin(topk_ids.data_ptr<int64_t>(),
@@ -762,7 +784,7 @@ void Manager::reroute_sparse(const int& layer_id, torch::Tensor& topk_ids) {
                                                 T,
                                                 K,
                                                 num_global_logical_experts,
-                                                runtime::num_ranks,
+                                                num_ranks,
                                                 stream);
     }
 }
@@ -817,7 +839,7 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::dense_reroute_forward(const in
                                                      T,
                                                      L,
                                                      P,
-                                                     runtime::num_ranks,
+                                                     num_ranks,
                                                      quota_reroute_interleave_,
                                                      stream);
         } else {
@@ -831,7 +853,7 @@ std::tuple<torch::Tensor, torch::Tensor> Manager::dense_reroute_forward(const in
                                                            T,
                                                            L,
                                                            P,
-                                                           runtime::num_ranks,
+                                                           num_ranks,
                                                            stream);
         }
     }
@@ -872,7 +894,7 @@ torch::Tensor Manager::dense_reroute_backward(const int& layer_id,
                                             T,
                                             L,
                                             P,
-                                            runtime::num_ranks,
+                                            num_ranks,
                                             stream);
     }
 
@@ -898,6 +920,10 @@ void Manager::set_weight_sync_plan_mode(const int& plan_mode) {
     }
     kernels::TaskBuildConfig config_cpu = {};
     fill_task_build_config(config_cpu,
+                           rank_idx,
+                           nvl_rank_idx,
+                           num_nvl_ranks,
+                           num_ranks,
                            num_local_master_experts,
                            num_local_physical_experts,
                            num_local_redundant_experts,
@@ -926,7 +952,7 @@ void Manager::set_grad_reduce_deterministic(const bool& deterministic, const int
     EP_HOST_ASSERT(grad_reduce_num_sms > 0);
     EP_HOST_ASSERT(grad_reduce_num_sms % 2 == 0 && "grad_reduce_num_sms must be even");
     grad_reduce_deterministic_ = deterministic;
-    grad_reduce_num_sms_ = std::min(grad_reduce_num_sms, runtime::num_device_sms);
+    grad_reduce_num_sms_ = std::min(grad_reduce_num_sms, num_device_sms);
 }
 
 std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_ptrs(
@@ -943,8 +969,7 @@ std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_ptrs(
     }
 
     auto checked_ptr = [&](const torch::Tensor& map, at::IntArrayRef shape, const char* name) {
-        TORCH_CHECK(
-            map.is_cuda() && map.get_device() == runtime::device_id, name, " must be on the manager's CUDA device");
+        TORCH_CHECK(map.is_cuda() && map.get_device() == device_id, name, " must be on the manager's CUDA device");
         TORCH_CHECK(map.scalar_type() == torch::kInt32, name, " must have dtype int32");
         TORCH_CHECK(map.sizes() == shape, name, " must have shape ", shape);
         TORCH_CHECK(map.is_contiguous(), name, " must be contiguous");
@@ -954,8 +979,7 @@ std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_ptrs(
     };
     return std::make_tuple(
         checked_ptr(*physical_to_logical_map, {num_global_physical_experts}, "physical_to_logical_map"),
-        checked_ptr(
-            *logical_to_physical_map, {num_global_logical_experts, runtime::num_ranks}, "logical_to_physical_map"),
+        checked_ptr(*logical_to_physical_map, {num_global_logical_experts, num_ranks}, "logical_to_physical_map"),
         checked_ptr(*logical_replica_counts, {num_global_logical_experts}, "logical_replica_counts"));
 }
 
@@ -1074,7 +1098,7 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         EP_HOST_ASSERT(local_master_fc2_weight_scale_ptr_tensor.is_cuda());
     }
     const bool enable_relay_stages = weight_sync_plan_mode_ != static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
-        num_local_redundant_experts > 0 && runtime::num_nvl_ranks > 2;
+        num_local_redundant_experts > 0 && num_nvl_ranks > 2;
     const uint64_t current_epoch = ++_weight_sync_epoch;
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.is_cuda());
@@ -1122,8 +1146,8 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                              _remote_ready_flag_ptrs,
                              current_epoch,
                              comm_stream,
-                             runtime::num_device_sms,
-                             runtime::num_nvl_ranks,
+                             num_device_sms,
+                             num_nvl_ranks,
                              _max_ws_total_tiles,
                              2);
 
@@ -1137,8 +1161,8 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
                                  _remote_ready_flag_ptrs,
                                  current_epoch,
                                  relay_stream,
-                                 runtime::num_device_sms,
-                                 runtime::num_nvl_ranks,
+                                 num_device_sms,
+                                 num_nvl_ranks,
                                  _max_ws_total_tiles,
                                  1);
         stream_wait(comm_stream, relay_stream);

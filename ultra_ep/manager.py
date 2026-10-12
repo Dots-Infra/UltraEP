@@ -199,6 +199,9 @@ class Manager:
             remote_grad_ptrs = torch.empty(0, dtype=torch.int64)
 
         self.runtime = _C.Manager(
+            self.rank,
+            self.num_ranks,
+            self.nvl_domain_size,
             self.num_alloc_layers,
             num_local_master_experts,
             num_local_redundant_experts,

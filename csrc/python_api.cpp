@@ -1,7 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <torch/python.h>
 
-#include "runtime.hpp"
 #include "ultra_ep.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
@@ -13,6 +12,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // Register UltraEP APIs
     ultra_ep::register_apis(m);
-    ultra_ep::runtime::register_apis(m);
     ultra_ep::event::register_apis(m);
 }

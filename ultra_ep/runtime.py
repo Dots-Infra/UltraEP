@@ -8,7 +8,6 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from .util import print_rank_0
-import ultra_ep._C as _C
 
 _group = None
 _symmetric_group = None
@@ -58,7 +57,7 @@ def _nvlink_domain_key():
 def init_runtime(group: dist.ProcessGroup):
     """Use NCCL across EP ranks and symmetric memory within each NVLink domain."""
     global _group, _symmetric_group, _nvl_domain_size
-    if _C.is_runtime_initialized():
+    if _group is not None:
         if group != _group:
             raise ValueError("All live UltraEP managers must share the same EP group")
         return _nvl_domain_size
@@ -105,7 +104,6 @@ def init_runtime(group: dist.ProcessGroup):
             )
         symmetric_group = _symmetric_groups[key]
 
-    _C.init_runtime(group.rank(), group.size(), domain_size)
     _group, _symmetric_group, _nvl_domain_size = group, symmetric_group, domain_size
     print_rank_0(f"UltraEP: CUDA symmetric memory, NVLink domain size={domain_size}")
     return domain_size
@@ -124,5 +122,4 @@ def release_runtime():
     global _group, _symmetric_group, _nvl_domain_size, _manager_count
     _manager_count -= 1
     if _manager_count == 0:
-        _C.destroy_runtime()
         _group = _symmetric_group = _nvl_domain_size = None

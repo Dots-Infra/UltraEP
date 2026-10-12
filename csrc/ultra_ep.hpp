@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -11,7 +12,6 @@
 
 #include "kernels/api.cuh"
 #include "kernels/config.cuh"
-#include "runtime.hpp"
 #include "utils/event.hpp"
 #include "utils/exception.cuh"
 
@@ -98,6 +98,14 @@ struct GlobalExpertPlacement {
 };
 
 class Manager {
+    // Process-group topology (immutable after construction)
+    int rank_idx;
+    int nvl_rank_idx = -1;
+    int num_ranks;
+    int num_nvl_ranks;
+    int device_id = -1;
+    int num_device_sms = 0;
+
     // Model and expert settings
     int num_layers;
     int num_local_master_experts;
@@ -217,7 +225,10 @@ class Manager {
         const std::optional<torch::Tensor>& logical_replica_counts) const;
 
 public:
-    Manager(const int& num_layers,
+    Manager(const int& rank_idx,
+            const int& num_ranks,
+            const int& num_nvl_ranks,
+            const int& num_layers,
             const int& num_local_master_experts,
             const int& num_local_redundant_experts,
             const int64_t& expert_fc1_numel,
@@ -368,6 +379,9 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<int,
                             int,
                             int,
+                            int,
+                            int,
+                            int,
                             int64_t,
                             int64_t,
                             int,
@@ -399,6 +413,9 @@ static void register_apis(pybind11::module_& m) {
                             torch::Tensor,
                             torch::Tensor,
                             torch::Tensor>(),
+             pybind11::arg("rank_idx"),
+             pybind11::arg("num_ranks"),
+             pybind11::arg("num_nvl_ranks"),
              pybind11::arg("num_layers"),
              pybind11::arg("num_local_master_experts"),
              pybind11::arg("num_local_redundant_experts"),
