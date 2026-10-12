@@ -185,7 +185,9 @@ class Manager:
             remote_scale_ptrs = torch.empty(0, dtype=torch.int64)
 
         ready_region = alloc(max(ready_flag_count, 1), dtype=torch.uint64)
-        self._weight_lifetime_barrier_handle = weight_region.handle
+        # Lifetime barrier signals: kNumLifetimeBarrierChannels slots per peer.
+        barrier_region = alloc(4 * self.nvl_domain_size, dtype=torch.int32)
+        self._barrier_peer_ptrs = barrier_region.remote_ptrs.to(self.device)
 
         if is_train:
             grad_region = alloc(
@@ -236,12 +238,11 @@ class Manager:
             remote_scale_ptrs,
             remote_grad_ptrs,
             ready_region.remote_ptrs,
+            barrier_region.tensor,
+            barrier_region.remote_ptrs,
         )
         assert self.runtime.is_available()
         retain_runtime()
-        self.runtime.set_lifetime_barriers(
-            weight_region.handle.barrier, ready_region.handle.barrier
-        )
 
         # Symmetric rendezvous makes the mapped addresses visible, but the C++
         # constructor also initializes local relay flags and placement state.
@@ -409,8 +410,7 @@ class Manager:
             self._load_profiler.close()
         # Wait for all peers before C++ drops pointers to their shared buffers.
         torch.cuda.synchronize(device=self.device)
-        with torch.cuda.stream(torch.cuda.current_stream(device=self.device)):
-            self._weight_lifetime_barrier_handle.barrier(channel=2)
+        _C.nvl_barrier(self._barrier_peer_ptrs, self.rank % self.nvl_domain_size, 0)
         torch.cuda.synchronize(device=self.device)
         self.runtime.destroy()
         self.runtime = None
@@ -429,7 +429,7 @@ class Manager:
         # all local tensor views and asynchronous kernels have been synchronized.
         self._symm_regions.clear()
         self._nvl_load_peer_ptrs = None
-        self._weight_lifetime_barrier_handle = None
+        self._barrier_peer_ptrs = None
         release_runtime()
 
     def __del__(self):

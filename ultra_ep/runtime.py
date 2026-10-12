@@ -63,9 +63,9 @@ def init_runtime(group: dist.ProcessGroup):
         return _nvl_domain_size
     if group is None or group.size() <= 0 or group.rank() < 0:
         raise ValueError("UltraEP requires membership in a non-empty EP process group")
-    if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 11):
+    if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 9):
         raise RuntimeError(
-            "UltraEP requires PyTorch >= 2.11 for NVLink-domain barriers"
+            "UltraEP requires PyTorch >= 2.9 for CUDA symmetric memory"
         )
     if dist.get_backend(group) != "nccl":
         raise ValueError("UltraEP requires an NCCL EP process group")

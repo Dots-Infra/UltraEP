@@ -51,7 +51,7 @@ if __name__ == "__main__":
         "-Wno-reorder",
         "-Wno-attributes",
     ]
-    nvcc_flags = ["-O3", "-Xcompiler", "-O3"]
+    nvcc_flags = ["-O3", "-Xcompiler", "-O3", "-rdc=true"]
 
     sources = find_cpp_cuda_sources("csrc")
     include_dirs = ["csrc/"]
@@ -104,13 +104,14 @@ if __name__ == "__main__":
         name="ultra_ep",
         version=get_package_version(),
         packages=setuptools.find_packages(include=["ultra_ep", "ultra_ep.*"]),
-        install_requires=["torch>=2.11", "nvidia-ml-py>=12.570"],
+        install_requires=["torch>=2.9", "nvidia-ml-py>=12.570"],
         ext_modules=[
             CUDAExtension(
                 name="ultra_ep._C",
                 include_dirs=include_dirs,
                 sources=sources,
                 extra_compile_args=extra_compile_args,
+                dlink=True,
             )
         ],
         cmdclass={

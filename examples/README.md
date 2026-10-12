@@ -6,7 +6,7 @@ We provide a [Megatron-LM reference](https://github.com/Dots-Infra/Megatron-LM-U
 
 ## Setup
 
-Use a CUDA development image with PyTorch >= 2.11 and support for your GPU architecture.
+Use a CUDA development image with PyTorch >= 2.9 and support for your GPU architecture.
 
 ```bash
 docker run --gpus all -it --rm \
@@ -14,8 +14,7 @@ docker run --gpus all -it --rm \
     --network=host \
     -e PIP_CONSTRAINT= \
     -e TORCH_CUDA_ARCH_LIST= \
-    nvcr.io/nvidia/pytorch:26.03-py3
-
+    nvcr.io/nvidia/pytorch:25.10-py3
 ```
 
 Clone and install UltraEP.

@@ -139,8 +139,10 @@ class Manager {
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
     at::cuda::CUDAStream relay_stream;
-    // Bound handle methods keep Torch's synchronization implementation outside our ABI.
-    pybind11::function weight_lifetime_barrier_, grad_lifetime_barrier_;
+    // NVLink-domain lifetime barriers protect replica buffer publication/reuse.
+    int32_t* local_barrier_signals = nullptr;  // [kNumLifetimeBarrierChannels * num_nvl_ranks]
+    torch::Tensor local_barrier_signals_tensor;
+    int32_t** _remote_barrier_signal_ptrs = nullptr;  // [kMaxNvlDomainSize]
     // Completion event for the latest placement update / forward-buffer pre-zero.
     // Train mode tracks one slot per layer; inference mode uses slot 0 as the shared buffer.
     std::vector<std::optional<EventHandle>> placement_ready_events_;
@@ -216,6 +218,7 @@ class Manager {
     torch::Tensor expert_loads_per_rank_tensor;        // [num_ranks, L]
 
     int placement_sync_slot(const int layer_id) const { return is_train ? layer_id : 0; }
+    void lifetime_barrier(int channel);
     void record_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream);
     void wait_for_placement_ready(const int layer_id, const at::cuda::CUDAStream& stream) const;
     std::tuple<int32_t*, int32_t*, int32_t*> get_placement_ptrs(
@@ -261,7 +264,9 @@ public:
             const torch::Tensor& remote_weight_ptrs_external = torch::Tensor(),
             const torch::Tensor& remote_weight_scale_ptrs_external = torch::Tensor(),
             const torch::Tensor& remote_grad_ptrs_external = torch::Tensor(),
-            const torch::Tensor& remote_ready_ptrs_external = torch::Tensor());
+            const torch::Tensor& remote_ready_ptrs_external = torch::Tensor(),
+            const torch::Tensor& local_barrier_signals_external = torch::Tensor(),
+            const torch::Tensor& remote_barrier_ptrs_external = torch::Tensor());
     ~Manager() noexcept(false);
     void destroy();
     bool is_available() const { return _available; }
@@ -279,7 +284,6 @@ public:
                                            const std::optional<torch::Tensor>& physical_to_logical_map = std::nullopt,
                                            const std::optional<torch::Tensor>& logical_to_physical_map = std::nullopt,
                                            const std::optional<torch::Tensor>& logical_replica_counts = std::nullopt);
-    void set_lifetime_barriers(pybind11::function weight_barrier, pybind11::function grad_barrier);
     // Sync replica weights with masters
     // Parameters (ptr tensor of local master weight buffers, for the current layer):
     // - local_master_fc1_weight_ptr_tensor: [num_local_master_experts]
@@ -375,6 +379,17 @@ static void register_apis(pybind11::module_& m) {
                                       input.numel(),
                                       at::cuda::getCurrentCUDAStream().stream());
     });
+    m.def("nvl_barrier", [](torch::Tensor peers, int rank, int channel) {
+        EP_HOST_ASSERT(peers.is_cuda() && peers.scalar_type() == torch::kInt64 && peers.dim() == 1 &&
+                       peers.is_contiguous());
+        EP_HOST_ASSERT(rank >= 0 && rank < peers.numel() && peers.numel() <= kernels::kMaxNvlDomainSize);
+        const at::cuda::CUDAGuard guard(peers.device());
+        kernels::nvl_barrier(reinterpret_cast<int32_t**>(peers.data_ptr<int64_t>()),
+                             rank,
+                             peers.numel(),
+                             channel,
+                             at::cuda::getCurrentCUDAStream().stream());
+    });
     pybind11::class_<Manager>(m, "Manager")
         .def(pybind11::init<int,
                             int,
@@ -405,6 +420,8 @@ static void register_apis(pybind11::module_& m) {
                             int,
                             int,
                             int,
+                            torch::Tensor,
+                            torch::Tensor,
                             torch::Tensor,
                             torch::Tensor,
                             torch::Tensor,
@@ -449,9 +466,10 @@ static void register_apis(pybind11::module_& m) {
              pybind11::arg("remote_weight_ptrs_external") = torch::Tensor(),
              pybind11::arg("remote_weight_scale_ptrs_external") = torch::Tensor(),
              pybind11::arg("remote_grad_ptrs_external") = torch::Tensor(),
-             pybind11::arg("remote_ready_ptrs_external") = torch::Tensor())
+             pybind11::arg("remote_ready_ptrs_external") = torch::Tensor(),
+             pybind11::arg("local_barrier_signals_external") = torch::Tensor(),
+             pybind11::arg("remote_barrier_ptrs_external") = torch::Tensor())
         .def("destroy", &Manager::destroy)
-        .def("set_lifetime_barriers", &Manager::set_lifetime_barriers)
         .def("is_available", &Manager::is_available)
         .def("compute_local_loads", &Manager::compute_local_loads)
         .def("compute_local_loads_sparse", &Manager::compute_local_loads_sparse)

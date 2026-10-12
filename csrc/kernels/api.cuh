@@ -294,6 +294,22 @@ void reduce_per_rank_loads(const int32_t* loads_per_rank, int32_t* global_loads,
 void nvl_all_gather_loads(
     int32_t* output, const int32_t* input, int32_t** peers, int rank, int G, int L, cudaStream_t stream);
 
+// NVLink-domain barrier over a dedicated per-rank signal region of
+// kNumLifetimeBarrierChannels * G int32 slots. Channels 0/1 are the two weight
+// lifetime phases, 2/3 the grad lifetime phases.
+inline constexpr int kNumLifetimeBarrierChannels = 4;
+inline constexpr int kWeightBarrierChannelBase = 0;
+inline constexpr int kGradBarrierChannelBase = 2;
+void nvl_barrier(int32_t** peers, int rank, int G, int channel, cudaStream_t stream);
+
+// Pairwise release/acquire handshake barrier across the NVLink domain. Each
+// rank sends its flag to every peer's slot and waits for every peer's flag in
+// its own slots, resetting each flag after consuming it. Pairing barriers on
+// alternating offsets guarantees a peer clears a flag before the next
+// handshake can send it again, so slots are reusable without a host epoch or
+// CAS. Defined in utils.cu; the build enables RDC for cross-TU device calls.
+__device__ void nvl_domain_barrier(int32_t** peers, int rank, int G, int offset);
+
 // In-place remap topk_ids from logical to physical expert IDs using current
 // placement. The sparse path uses a per-expert local ordinal produced by
 // atomicAdd on `counters`, then:
@@ -330,6 +346,9 @@ static __host__ __device__ __forceinline__ int ceil_div(const int a, const int b
 }
 static __host__ __device__ __forceinline__ int64_t ceil_div(const int64_t a, const int64_t b) {
     return static_cast<int>((a + b - 1) / b);
+}
+static __host__ __device__ __forceinline__ int align_up(const int a, const int b) {
+    return ceil_div(a, b) * b;
 }
 static __host__ __device__ __forceinline__ int weight_sync_num_tiles(const size_t num_bytes) {
     return static_cast<int>((num_bytes + kWeightSyncTileSizeBytes - 1) / kWeightSyncTileSizeBytes);

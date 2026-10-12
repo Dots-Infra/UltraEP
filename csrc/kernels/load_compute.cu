@@ -1,35 +1,14 @@
-#include <cuda/atomic>
-
 #include "../utils/exception.cuh"
 #include "api.cuh"
 #include "launch.cuh"
 
 namespace ultra_ep::kernels {
 
-// Separate ready/done handshakes protect both publication and reuse. A peer
-// clears ready before sending done, and clears done before sending next ready;
-// therefore each flag is reset before its next send, without a host epoch or CAS.
-// The block barriers transfer all load/store ordering to/from the signal threads.
-__device__ void nvl_load_barrier(int32_t** peers, int rank, int G, int offset) {
-    __syncthreads();
-    for (int peer = threadIdx.x; peer < G; peer += blockDim.x) {
-        if (peer == rank)
-            continue;
-        cuda::atomic_ref<int32_t, cuda::thread_scope_system> send(peers[peer][offset + rank]);
-        send.store(1, cuda::memory_order_release);
-        cuda::atomic_ref<int32_t, cuda::thread_scope_system> recv(peers[rank][offset + peer]);
-        while (recv.load(cuda::memory_order_acquire) == 0) {
-        }
-        recv.store(0, cuda::memory_order_relaxed);
-    }
-    __syncthreads();
-}
-
 __global__ __launch_bounds__(1024) void nvl_all_gather_loads_kernel(
     int32_t* output, const int32_t* input, int32_t** peers, int rank, int G, int L) {
     for (int i = threadIdx.x; i < L; i += blockDim.x)
         peers[rank][i] = input[i];
-    nvl_load_barrier(peers, rank, G, L);
+    nvl_domain_barrier(peers, rank, G, L);
 
     // Pull each peer's published load vector into our ordinary CUDA output.
     if (L % 4 == 0) {
@@ -42,13 +21,13 @@ __global__ __launch_bounds__(1024) void nvl_all_gather_loads_kernel(
     }
 
     // Every peer must finish reading before anyone overwrites its load vector.
-    nvl_load_barrier(peers, rank, G, L + G);
+    nvl_domain_barrier(peers, rank, G, L + G);
 }
 
 void nvl_all_gather_loads(
     int32_t* output, const int32_t* input, int32_t** peers, int rank, int G, int L, cudaStream_t stream) {
     const int work = G * (L % 4 == 0 ? L / 4 : L);
-    const int threads = min(1024, ((work + 31) / 32) * 32);
+    const int threads = min(1024, align_up(work, 32));
     launch_kernel(
         nvl_all_gather_loads_kernel, make_launch_config(1, threads, stream), output, input, peers, rank, G, L);
 }

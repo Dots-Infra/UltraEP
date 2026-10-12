@@ -263,7 +263,9 @@ Manager::Manager(const int& rank_idx,
                  const torch::Tensor& remote_weight_ptrs_external,
                  const torch::Tensor& remote_weight_scale_ptrs_external,
                  const torch::Tensor& remote_grad_ptrs_external,
-                 const torch::Tensor& remote_ready_ptrs_external)
+                 const torch::Tensor& remote_ready_ptrs_external,
+                 const torch::Tensor& local_barrier_signals_external,
+                 const torch::Tensor& remote_barrier_ptrs_external)
     : rank_idx(rank_idx),
       num_ranks(num_ranks),
       num_nvl_ranks(num_nvl_ranks),
@@ -436,6 +438,15 @@ Manager::Manager(const int& rank_idx,
     }
     copy_remote_pointer_table(remote_ready_ptrs_external, _remote_ready_flag_ptrs, num_nvl_ranks);
 
+    // NVLink-domain lifetime barrier signals, one slot per (channel, peer).
+    validate_cuda_tensor(local_barrier_signals_external, torch::kInt32);
+    EP_HOST_ASSERT(local_barrier_signals_external.numel() >= kernels::kNumLifetimeBarrierChannels * num_nvl_ranks);
+    local_barrier_signals_tensor = local_barrier_signals_external;
+    local_barrier_signals = local_barrier_signals_tensor.data_ptr<int32_t>();
+    CUDA_RUNTIME_CHECK(
+        cudaMemset(local_barrier_signals, 0, kernels::kNumLifetimeBarrierChannels * num_nvl_ranks * sizeof(int32_t)));
+    copy_remote_pointer_table(remote_barrier_ptrs_external, _remote_barrier_signal_ptrs, num_nvl_ranks);
+
     // Allocate intermediate buffers for task-build and persistent kernels.
     CUDA_RUNTIME_CHECK(
         cudaMalloc((void**)&_grad_reduce_tasks, kernels::kMaxGradReduceTaskCount * sizeof(kernels::GradReduceTask)));
@@ -604,6 +615,12 @@ void Manager::destroy() {
         CUDA_RUNTIME_CHECK(cudaFree(_remote_ready_flag_ptrs));
         _remote_ready_flag_ptrs = nullptr;
     }
+    if (_remote_barrier_signal_ptrs) {
+        CUDA_RUNTIME_CHECK(cudaFree(_remote_barrier_signal_ptrs));
+        _remote_barrier_signal_ptrs = nullptr;
+    }
+    local_barrier_signals = nullptr;
+    local_barrier_signals_tensor = torch::Tensor();
 
     // Free sparse reroute counters
     CUDA_RUNTIME_CHECK(cudaFree(_reroute_sparse_counters));
@@ -611,9 +628,6 @@ void Manager::destroy() {
 
     // Free placement buffers.
     placement.cleanup();
-
-    weight_lifetime_barrier_ = pybind11::function();
-    grad_lifetime_barrier_ = pybind11::function();
 
     // Ready to destroy
     _available = false;
@@ -983,10 +997,9 @@ std::tuple<int32_t*, int32_t*, int32_t*> Manager::get_placement_ptrs(
         checked_ptr(*logical_replica_counts, {num_global_logical_experts}, "logical_replica_counts"));
 }
 
-void Manager::set_lifetime_barriers(pybind11::function weight_barrier, pybind11::function grad_barrier) {
-    EP_HOST_ASSERT(is_available());
-    weight_lifetime_barrier_ = std::move(weight_barrier);
-    grad_lifetime_barrier_ = std::move(grad_barrier);
+void Manager::lifetime_barrier(const int channel) {
+    kernels::nvl_barrier(
+        _remote_barrier_signal_ptrs, nvl_rank_idx, num_nvl_ranks, channel, at::cuda::getCurrentCUDAStream().stream());
 }
 
 std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
@@ -1012,7 +1025,7 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
     }
 
     // Peers must finish Wgrad before any rank reads or clears their replicas.
-    grad_lifetime_barrier_(0);
+    lifetime_barrier(kernels::kGradBarrierChannelBase);
 
     EP_HOST_ASSERT(local_master_fc1_grad_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_grad_ptr_tensor.dtype() == torch::kInt64);
@@ -1046,7 +1059,7 @@ std::optional<EventHandle> Manager::grad_reduce(const int& layer_id,
                              grad_reduce_deterministic_);
 
     // Include remote reads and clears before the caller may reuse replica buffers.
-    grad_lifetime_barrier_(1);
+    lifetime_barrier(kernels::kGradBarrierChannelBase + 1);
 
     // Wait streams
     if (async) {
@@ -1083,7 +1096,7 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     }
 
     // All peers must finish consuming the previous replica weights before overwrite.
-    weight_lifetime_barrier_(0);
+    lifetime_barrier(kernels::kWeightBarrierChannelBase);
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.dtype() == torch::kInt64);
@@ -1169,7 +1182,7 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
     }
 
     // The completion event covers incoming writes, including both relay stages.
-    weight_lifetime_barrier_(1);
+    lifetime_barrier(kernels::kWeightBarrierChannelBase + 1);
 
     // Wait streams
     if (async) {

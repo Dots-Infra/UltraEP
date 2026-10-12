@@ -33,7 +33,7 @@ We display the overall performance on representative MoE models. Training uses E
 The requirements are:
 
 - NVIDIA GPUs with SM90 or SM100
-- Python >= 3.10 and PyTorch >= 2.11
+- Python >= 3.10 and PyTorch >= 2.9
 - Compiler with C++17 support
 - CUDA Toolkit:
     - CUDA 12.3 or higher for SM90
