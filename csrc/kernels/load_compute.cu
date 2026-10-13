@@ -84,6 +84,10 @@ void rmap_local_sum(int T,
     // 1. Zero out the target array (since we accumulate via atomicAdd)
     // For 128/256 int32s, cudaMemsetAsync has very little overhead on the stream
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(expert_loads_ptr, 0, L * sizeof(int32_t), stream));
+    // Empty ranks still publish a zero load vector and join the EP collective.
+    // CUDA does not permit a kernel launch with a zero-sized grid.
+    if (T == 0)
+        return;
 
     // 2. Launch local sum kernel
     int block_x = ((L + 31) / 32) * 32;  // block_x = 32 * ceil(L/32)

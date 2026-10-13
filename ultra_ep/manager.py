@@ -403,16 +403,23 @@ class Manager:
         Outstanding CUDA graphs and user-held buffer aliases must be released
         first. Calling this method more than once is harmless.
         """
+        self._destroy(collective=True)
+
+    def _destroy(self, *, collective: bool):
         if self.runtime is None:
             return
 
         if hasattr(self, "_load_profiler"):
             self._load_profiler.close()
-        # Wait for all peers before C++ drops pointers to their shared buffers.
+        # Explicit destruction joins peers. Garbage collection cannot impose a
+        # collective order: each peer's imported allocation handles keep the
+        # backing memory alive until that peer releases its own mappings.
         torch.cuda.synchronize(device=self.device)
-        _C.nvl_barrier(self._barrier_peer_ptrs, self.rank % self.nvl_domain_size, 0)
-        torch.cuda.synchronize(device=self.device)
-        self.runtime.destroy()
+        if collective:
+            _C.nvl_barrier(self._barrier_peer_ptrs, self.rank % self.nvl_domain_size, 0)
+            torch.cuda.synchronize(device=self.device)
+        with torch.cuda.device(self.device):
+            self.runtime.destroy()
         self.runtime = None
         # Release local aliases before the owning regions. User-held aliases and
         # captured graphs must no longer be in use when collectively destroying.
@@ -433,13 +440,13 @@ class Manager:
         release_runtime()
 
     def __del__(self):
-        # Preserve automatic cleanup for the default lifetime mode. Explicit
-        # collective destroy() before process-group shutdown is recommended.
+        # Finalizers can run in different orders on different ranks. Only the
+        # explicit destroy() API may enter a collective.
         if (
             not getattr(self, "explicitly_destroy", True)
             and getattr(self, "runtime", None) is not None
         ):
-            self.destroy()
+            self._destroy(collective=False)
 
     def allocate_microbatch_slot(self, real_layer_id: int) -> int:
         """Allocate the next virtual layer ID for this real layer.

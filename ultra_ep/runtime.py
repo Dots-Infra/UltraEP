@@ -58,15 +58,16 @@ def init_runtime(group: dist.ProcessGroup):
     """Use NCCL across EP ranks and symmetric memory within each NVLink domain."""
     global _group, _symmetric_group, _nvl_domain_size
     if _group is not None:
-        if group != _group:
+        if group == _group:
+            return _nvl_domain_size
+        if _manager_count:
             raise ValueError("All live UltraEP managers must share the same EP group")
-        return _nvl_domain_size
+        # A constructor can fail after discovery but before retaining a runtime.
+        # Such a group has no live allocation owner and must not pin the runtime.
     if group is None or group.size() <= 0 or group.rank() < 0:
         raise ValueError("UltraEP requires membership in a non-empty EP process group")
     if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 9):
-        raise RuntimeError(
-            "UltraEP requires PyTorch >= 2.9 for CUDA symmetric memory"
-        )
+        raise RuntimeError("UltraEP requires PyTorch >= 2.9 for CUDA symmetric memory")
     if dist.get_backend(group) != "nccl":
         raise ValueError("UltraEP requires an NCCL EP process group")
     if symm_mem.get_backend("cuda") != "CUDA":

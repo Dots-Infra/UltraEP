@@ -405,7 +405,7 @@ Manager::Manager(const int& rank_idx,
         local_replica_fc2_weight_scale_buffer_tensor = local_replica_weight_scale_buffer_tensor;
     }
 
-    const int64_t local_ready_flag_count = num_local_redundant_experts * ready_flags_per_expert;
+    local_ready_flag_count = num_local_redundant_experts * ready_flags_per_expert;
     validate_cuda_tensor(local_weight_sync_ready_flags_external, torch::kUInt64);
     EP_HOST_ASSERT(local_weight_sync_ready_flags_external.dim() == 1 &&
                    local_weight_sync_ready_flags_external.numel() >= std::max<int64_t>(local_ready_flag_count, 1));
@@ -588,7 +588,6 @@ void Manager::destroy() {
     _relay_task_metadata = nullptr;
     _relay_global_tile_counter = nullptr;
     _weight_sync_task_capacity = 0;
-    _weight_sync_epoch = 0;
 
     // Free task metadata buffer
     CUDA_RUNTIME_CHECK(cudaFree(_task_metadata));
@@ -922,13 +921,6 @@ void Manager::set_weight_sync_plan_mode(const int& plan_mode) {
     weight_sync_plan_mode_ = plan_mode;
     auto stream = at::cuda::getCurrentCUDAStream();
     if (local_weight_sync_ready_flags != nullptr) {
-        const int max_relay_chunks_per_shard = max_weight_sync_chunks_per_shard(expert_fc1_numel,
-                                                                                expert_fc2_numel,
-                                                                                expert_fc1_weight_scale_bytes,
-                                                                                expert_fc2_weight_scale_bytes,
-                                                                                weight_data_element_bytes);
-        const int64_t local_ready_flag_count = static_cast<int64_t>(num_local_redundant_experts) *
-            weight_sync_num_shards(expert_weight_scale_total_numel) * max_relay_chunks_per_shard;
         CUDA_RUNTIME_CHECK(cudaMemsetAsync(
             local_weight_sync_ready_flags, 0, local_ready_flag_count * sizeof(uint64_t), stream.stream()));
     }
@@ -1095,7 +1087,18 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         stream_wait(comm_stream, compute_stream);
     }
 
-    // All peers must finish consuming the previous replica weights before overwrite.
+    const bool enable_relay_stages = weight_sync_plan_mode_ != static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
+        num_local_redundant_experts > 0 && num_nvl_ranks > 2;
+    // A host epoch is frozen during graph capture. Reset the ready slots on
+    // every execution, including replay, before any peer may publish new data.
+    // The preceding call's completion barrier covers all old relay readers.
+    if (enable_relay_stages) {
+        CUDA_RUNTIME_CHECK(cudaMemsetAsync(
+            local_weight_sync_ready_flags, 0, local_ready_flag_count * sizeof(uint64_t), comm_stream));
+    }
+    constexpr uint64_t current_epoch = 1;
+
+    // All peers finish consuming old weights and resetting relay flags before overwrite.
     lifetime_barrier(kernels::kWeightBarrierChannelBase);
 
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.dtype() == torch::kInt64);
@@ -1110,10 +1113,6 @@ std::optional<EventHandle> Manager::weight_sync(const int& layer_id,
         EP_HOST_ASSERT(local_master_fc1_weight_scale_ptr_tensor.is_cuda());
         EP_HOST_ASSERT(local_master_fc2_weight_scale_ptr_tensor.is_cuda());
     }
-    const bool enable_relay_stages = weight_sync_plan_mode_ != static_cast<int>(kernels::WeightSyncPlanMode::kDirect) &&
-        num_local_redundant_experts > 0 && num_nvl_ranks > 2;
-    const uint64_t current_epoch = ++_weight_sync_epoch;
-
     EP_HOST_ASSERT(local_master_fc1_weight_ptr_tensor.is_cuda());
     EP_HOST_ASSERT(local_master_fc2_weight_ptr_tensor.is_cuda());
     int64_t* local_master_fc1_weight_ptrs = local_master_fc1_weight_ptr_tensor.data_ptr<int64_t>();

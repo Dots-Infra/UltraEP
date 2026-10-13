@@ -177,7 +177,7 @@ class Manager {
     int* _relay_task_metadata = nullptr;
     int* _relay_global_tile_counter = nullptr;
     uint64_t* local_weight_sync_ready_flags = nullptr;
-    uint64_t _weight_sync_epoch = 0;
+    int64_t local_ready_flag_count = 0;
 
     // Task metadata: [total_tasks, total_tiles], written by task-build kernels and
     // consumed by the stage-1 persistent kernels.
