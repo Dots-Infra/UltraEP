@@ -4,6 +4,34 @@
 
 namespace ultra_ep::kernels {
 
+__global__ __launch_bounds__(1024) void nvl_all_gather_loads_kernel(
+    int32_t* output, const int32_t* input, int32_t** peers, int rank, int G, int L) {
+    for (int i = threadIdx.x; i < L; i += blockDim.x)
+        peers[rank][i] = input[i];
+    nvl_domain_barrier(peers, rank, G, L);
+
+    // Pull each peer's published load vector into our ordinary CUDA output.
+    if (L % 4 == 0) {
+        const int vectors = L / 4;
+        for (int i = threadIdx.x; i < G * vectors; i += blockDim.x)
+            reinterpret_cast<int4*>(output)[i] = reinterpret_cast<int4*>(peers[i / vectors])[i % vectors];
+    } else {
+        for (int i = threadIdx.x; i < G * L; i += blockDim.x)
+            output[i] = peers[i / L][i % L];
+    }
+
+    // Every peer must finish reading before anyone overwrites its load vector.
+    nvl_domain_barrier(peers, rank, G, L + G);
+}
+
+void nvl_all_gather_loads(
+    int32_t* output, const int32_t* input, int32_t** peers, int rank, int G, int L, cudaStream_t stream) {
+    const int work = G * (L % 4 == 0 ? L / 4 : L);
+    const int threads = min(1024, align_up(work, 32));
+    launch_kernel(
+        nvl_all_gather_loads_kernel, make_launch_config(1, threads, stream), output, input, peers, rank, G, L);
+}
+
 __global__ __launch_bounds__(1024) void rmap_local_sum_kernel(const bool* __restrict__ routing_map,
                                                               int32_t* __restrict__ expert_loads,
                                                               int T,
@@ -51,11 +79,15 @@ __global__ __launch_bounds__(1024) void rmap_local_sum_kernel(const bool* __rest
 void rmap_local_sum(int T,
                     int L,
                     const bool* routing_map_ptr,  // [T, L] bool
-                    int32_t* expert_loads_ptr,    // [L] int32, alloc by nvshmem
+                    int32_t* expert_loads_ptr,    // [L] int32
                     cudaStream_t stream) {
     // 1. Zero out the target array (since we accumulate via atomicAdd)
     // For 128/256 int32s, cudaMemsetAsync has very little overhead on the stream
     CUDA_RUNTIME_CHECK(cudaMemsetAsync(expert_loads_ptr, 0, L * sizeof(int32_t), stream));
+    // Empty ranks still publish a zero load vector and join the EP collective.
+    // CUDA does not permit a kernel launch with a zero-sized grid.
+    if (T == 0)
+        return;
 
     // 2. Launch local sum kernel
     int block_x = ((L + 31) / 32) * 32;  // block_x = 32 * ceil(L/32)

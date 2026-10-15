@@ -1,60 +1,126 @@
 import os
+from collections import Counter
+from ctypes import byref
+
+import pynvml
+import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
+
 from .util import print_rank_0
 
-# noinspection PyUnresolvedReferences
-import ultra_ep._C as _C
-
 _group = None
+_symmetric_group = None
 _nvl_domain_size = None
+_manager_count = 0
+_symmetric_groups = {}
+
+
+def _nvlink_domain_key():
+    """Identify the current GPU's fabric clique or fully connected local NVLink domain."""
+    uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
+    pynvml.nvmlInit()
+    try:
+        device = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+        info = pynvml.c_nvmlGpuFabricInfoV_t()
+        try:
+            pynvml.nvmlDeviceGetGpuFabricInfoV(device, byref(info))
+        except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_FunctionNotFound):
+            pass
+        if any(info.clusterUuid):
+            if (
+                info.state != pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+                or info.status != pynvml.NVML_SUCCESS
+            ):
+                raise RuntimeError("GPU fabric registration is not ready")
+            return ("fabric", bytes(info.clusterUuid).hex(), info.cliqueId)
+
+        # NVML enumerates physical GPUs independently of CUDA_VISIBLE_DEVICES.
+        # Including our own UUID gives every GPU in a local clique the same key.
+        peers = [uuid]
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            peer = pynvml.nvmlDeviceGetHandleByIndex(index)
+            peer_uuid = pynvml.nvmlDeviceGetUUID(peer)
+            if (
+                peer_uuid != uuid
+                and pynvml.nvmlDeviceGetP2PStatus(
+                    device, peer, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                )
+                == pynvml.NVML_P2P_STATUS_OK
+            ):
+                peers.append(peer_uuid)
+        return ("nvlink", tuple(sorted(peers)))
+    finally:
+        pynvml.nvmlShutdown()
 
 
 def init_runtime(group: dist.ProcessGroup):
-    global _group, _nvl_domain_size
-    if _C.is_runtime_initialized():
-        assert group == _group, "All EP buffers should share the same process group"
-        return _nvl_domain_size
+    """Use NCCL across EP ranks and symmetric memory within each NVLink domain."""
+    global _group, _symmetric_group, _nvl_domain_size
+    if _group is not None:
+        if group == _group:
+            return _nvl_domain_size
+        if _manager_count:
+            raise ValueError("All live UltraEP managers must share the same EP group")
+        # A constructor can fail after discovery but before retaining a runtime.
+        # Such a group has no live allocation owner and must not pin the runtime.
+    if group is None or group.size() <= 0 or group.rank() < 0:
+        raise ValueError("UltraEP requires membership in a non-empty EP process group")
+    if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 9):
+        raise RuntimeError("UltraEP requires PyTorch >= 2.9 for CUDA symmetric memory")
+    if dist.get_backend(group) != "nccl":
+        raise ValueError("UltraEP requires an NCCL EP process group")
+    if symm_mem.get_backend("cuda") != "CUDA":
+        symm_mem.set_backend("CUDA")
 
-    # * IMPORTANT: NVSHMEM environment variables
-    # Disable NVLink SHArP to avoid cuMemMap failure
-    os.environ["NVSHMEM_DISABLE_NVLS"] = "1"
-    # NOTES: NVSHMEM initialization requires at least 256 MiB
-    os.environ["NVSHMEM_CUMEM_GRANULARITY"] = f"{2 ** 29}"
-    # Use primitive NVSHMEM for low-latency expert load all-reduce
-    os.environ.setdefault("NVSHMEM_DISABLE_NCCL", "1")
-
-    # Synchronize NVSHMEM unique IDs
-    root_unique_id = None
-    if group.rank() == 0:
-        root_unique_id = _C.get_local_nvshmem_unique_id(group.rank())
-    nvshmem_unique_ids = [None] * group.size()
-    dist.all_gather_object(nvshmem_unique_ids, root_unique_id, group)
-    root_unique_id = nvshmem_unique_ids[0]
-
-    # Support both MNNVL and RDMA by setting MAX_NVL_PEERS
-    _ipc_manager = _C.IpcManager()
-    print_rank_0(f"[INFO] Use MNNVL fabric: {_ipc_manager.is_fabric_supported()}")
-    detected_ranks = _ipc_manager.detect_accessible_ranks(group)
-    del _ipc_manager
-
-    max_nvl_peers = os.getenv("MAX_NUM_NVL_PEERS")
-    if max_nvl_peers is not None:
-        max_nvl_peers = int(max_nvl_peers)
-        if max_nvl_peers != detected_ranks:
-            print_rank_0(
-                f"[WARN] MAX_NUM_NVL_PEERS={max_nvl_peers} differs from detected value {detected_ranks}. Using environment variable."
-            )
-    else:
-        max_nvl_peers = detected_ranks
-        print_rank_0(
-            f"[WARN] MAX_NUM_NVL_PEERS is not set. Using detected value {detected_ranks}."
+    domains = [None] * group.size()
+    dist.all_gather_object(domains, _nvlink_domain_key(), group=group)
+    counts = Counter(domains)
+    detected = counts[domains[group.rank()]]
+    domain_size = int(os.getenv("MAX_NUM_NVL_PEERS", detected))
+    if (
+        len(set(counts.values())) != 1
+        or domain_size <= 0
+        or detected % domain_size != 0
+        or any(
+            domains[i] != domains[i // domain_size * domain_size]
+            for i in range(group.size())
+        )
+    ):
+        raise ValueError(
+            "NVLink domains must form equal contiguous EP-rank blocks; "
+            f"MAX_NUM_NVL_PEERS={domain_size} must divide the detected size {detected}"
         )
 
-    # Initialize CPP runtime with NVSHMEM
-    _C.init_runtime(group.rank(), group.size(), max_nvl_peers, root_unique_id)
+    symmetric_group = group
+    if domain_size < group.size():
+        key = (group, domain_size)
+        if key not in _symmetric_groups:
+            ranks = dist.get_process_group_ranks(group)
+            first = group.rank() // domain_size * domain_size
+            _symmetric_groups[key] = dist.new_group(
+                ranks=ranks[first : first + domain_size],
+                backend="nccl",
+                use_local_synchronization=True,
+            )
+        symmetric_group = _symmetric_groups[key]
 
-    # Remember the EP group, which can not be changed anymore
-    _group = group
-    _nvl_domain_size = max_nvl_peers
+    _group, _symmetric_group, _nvl_domain_size = group, symmetric_group, domain_size
+    print_rank_0(f"UltraEP: CUDA symmetric memory, NVLink domain size={domain_size}")
+    return domain_size
 
-    return max_nvl_peers
+
+def get_symmetric_group():
+    return _symmetric_group
+
+
+def retain_runtime():
+    global _manager_count
+    _manager_count += 1
+
+
+def release_runtime():
+    global _group, _symmetric_group, _nvl_domain_size, _manager_count
+    _manager_count -= 1
+    if _manager_count == 0:
+        _group = _symmetric_group = _nvl_domain_size = None

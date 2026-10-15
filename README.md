@@ -33,19 +33,12 @@ We display the overall performance on representative MoE models. Training uses E
 The requirements are:
 
 - NVIDIA GPUs with SM90 or SM100
-- Python >= 3.10 and PyTorch >= 2.10
+- Python >= 3.10 and PyTorch >= 2.9
 - Compiler with C++17 support
 - CUDA Toolkit:
     - CUDA 12.3 or higher for SM90
     - CUDA 12.9 or higher for SM100
-- NVLink for intra-node expert replication
-
-NVSHMEM is the only dependency (will switch to the more lightweight [NCCL GIN](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/deviceapi.html) in future). Install the runtime wheel and UltraEP can locate it automatically:
-
-```bash
-pip install "nvidia-nvshmem-cu13==3.4.5"
-# or nvidia-nvshmem-cu12==3.4.5 for CUDA 12.x
-```
+- NVLink/P2P access among the GPUs within each NVLink domain
 
 Then build and install. The builder can auto-detect CUDA compute capability; if failed, explicitly set `TORCH_CUDA_ARCH_LIST` to `9.0` (SM90) or `10.0` (SM100).
 
@@ -212,10 +205,6 @@ Algorithm and kernel behaviors are controlled entirely through `ULTRA_EP_*` envi
 - `ULTRA_EP_QUOTA_ALLOW_ZERO_MASTER_QUOTA` (default `0`): allow zero-load master expert.
 - `ULTRA_EP_QUOTA_KERNEL_STAGE` (default `1`): quota kernel stage (`0` or `1`).
 - `ULTRA_EP_QUOTA_REROUTE_INTERLEAVE` (default `1`): interleave token order to avoid congestion in subsequent dispatch.
-
-**NVSHMEM**
-
-- `NVSHMEM_DISABLE_NCCL` (default `1`): controls the backend for UltraEP's small global-load metadata all-gather before planning. With `1`, UltraEP uses NVSHMEM-native collectives, which appears faster in larger NVLink domain. On 8-GPU RDMA clusters where the EP group spans nodes, NCCL can be faster; set to `0` and benchmark both settings.
 
 ### Load profiler and viewer
 

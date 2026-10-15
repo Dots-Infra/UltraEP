@@ -4,7 +4,8 @@ from typing import List, Optional, Tuple
 
 import ultra_ep._C as _C
 from .config import load_tuning_from_env
-from .runtime import init_runtime
+from .runtime import init_runtime, get_symmetric_group, retain_runtime, release_runtime
+from .symm_mem import symm_alloc
 from .event import EventHandle
 from .profiling import ExpertLoadProfiler, load_profile_config
 from .reroute import _DenseRerouteFunction
@@ -127,7 +128,82 @@ class Manager:
             tuning.weight_sync_relay_min_fanout_gain
         )
         self.reroute_mode = "round_robin" if legacy_placement else "quota"
+
+        # Allocation layout comes from the same native helper used by the kernels.
+        expert_total_weight_bytes = (
+            self.expert_total_numel * self.weight_data_element_bytes
+        )
+        _, scale_stride_bytes, ready_flags_per_expert = _C.get_replica_buffer_layout(
+            expert_fc1_numel,
+            expert_fc2_numel,
+            self.weight_data_element_bytes,
+            expert_fc1_weight_scale_numel,
+            expert_fc2_weight_scale_numel,
+            self.weight_scale_element_bytes,
+        )
+        ready_flag_count = self.num_local_redundant_experts * ready_flags_per_expert
+
+        device = torch.device("cuda", self.device)
+        symmetric_group = get_symmetric_group()
+        self._symm_regions = []
+
+        def alloc(shape, dtype):
+            region = symm_alloc(
+                shape, dtype=dtype, device=device, group=symmetric_group
+            )
+            self._symm_regions.append(region)
+            return region
+
+        self._nvl_load_peer_ptrs = None
+        if not legacy_placement and self.num_ranks == self.nvl_domain_size:
+            # One reusable load vector and two peer handshakes, independent of
+            # layer IDs and graph replay counts. Placement calls are serialized.
+            load_region = alloc(
+                self.num_global_logical_experts + 2 * self.num_ranks,
+                dtype=torch.int32,
+            )
+            load_region.tensor.zero_()
+            self._nvl_load_peer_ptrs = load_region.remote_ptrs.to(self.device)
+
+        weight_region = alloc(
+            (self.num_local_redundant_experts, expert_total_weight_bytes),
+            dtype=torch.uint8,
+        )
+        if self.expert_weight_scale_total_numel > 0:
+            scale_region = alloc(
+                (self.num_local_redundant_experts, scale_stride_bytes),
+                dtype=torch.uint8,
+            )
+            local_scale_buffer = scale_region.tensor
+            remote_scale_ptrs = scale_region.remote_ptrs
+        else:
+            local_scale_buffer = torch.empty(
+                (self.num_local_redundant_experts, 0),
+                dtype=torch.uint8,
+                device=device,
+            )
+            remote_scale_ptrs = torch.empty(0, dtype=torch.int64)
+
+        ready_region = alloc(max(ready_flag_count, 1), dtype=torch.uint64)
+        # Lifetime barrier signals: kNumLifetimeBarrierChannels slots per peer.
+        barrier_region = alloc(4 * self.nvl_domain_size, dtype=torch.int32)
+        self._barrier_peer_ptrs = barrier_region.remote_ptrs.to(self.device)
+
+        if is_train:
+            grad_region = alloc(
+                (self.num_local_redundant_experts, self.expert_total_numel),
+                dtype=torch.float32,
+            )
+            local_grad_buffer = grad_region.tensor
+            remote_grad_ptrs = grad_region.remote_ptrs
+        else:
+            local_grad_buffer = torch.empty(0, dtype=torch.float32, device=device)
+            remote_grad_ptrs = torch.empty(0, dtype=torch.int64)
+
         self.runtime = _C.Manager(
+            self.rank,
+            self.num_ranks,
+            self.nvl_domain_size,
             self.num_alloc_layers,
             num_local_master_experts,
             num_local_redundant_experts,
@@ -154,8 +230,25 @@ class Manager:
             tuning.weight_sync_relay_min_replicas,
             tuning.weight_sync_relay_max_relays,
             tuning.weight_sync_relay_min_fanout_gain,
+            weight_region.tensor,
+            local_scale_buffer,
+            ready_region.tensor,
+            local_grad_buffer,
+            weight_region.remote_ptrs,
+            remote_scale_ptrs,
+            remote_grad_ptrs,
+            ready_region.remote_ptrs,
+            barrier_region.tensor,
+            barrier_region.remote_ptrs,
         )
         assert self.runtime.is_available()
+        retain_runtime()
+
+        # Symmetric rendezvous makes the mapped addresses visible, but the C++
+        # constructor also initializes local relay flags and placement state.
+        # Keep the old constructor-level readiness guarantee without a
+        # communication-library-specific barrier.
+        dist.barrier(group=self.group)
 
         # Placement maps are device-resident. Tests and diagnostics should reduce
         # metrics on GPU and only materialize small scalar summaries for printing.
@@ -176,6 +269,12 @@ class Manager:
         )
         self._rank_quota_prefix: torch.Tensor = (
             self.runtime.get_rank_quota_prefix_tensor()
+        )
+        self._local_expert_loads: torch.Tensor = (
+            self.runtime.get_local_expert_loads_tensor()
+        )
+        self._expert_loads_per_rank: torch.Tensor = (
+            self.runtime.get_expert_loads_per_rank_tensor()
         )
         # Full buffers keep the original contiguous expert layout for backward
         # compatibility. The fc1/fc2 tensors below are strided views into these
@@ -299,12 +398,55 @@ class Manager:
         return self._rank_quota_prefix[layer_id]
 
     def destroy(self):
-        assert self.explicitly_destroy
+        """Collectively release buffers before destroying the EP process group.
 
-        self._load_profiler.close()
-        if self.runtime is not None:
+        Outstanding CUDA graphs and user-held buffer aliases must be released
+        first. Calling this method more than once is harmless.
+        """
+        self._destroy(collective=True)
+
+    def _destroy(self, *, collective: bool):
+        if self.runtime is None:
+            return
+
+        if hasattr(self, "_load_profiler"):
+            self._load_profiler.close()
+        # Explicit destruction joins peers. Garbage collection cannot impose a
+        # collective order: each peer's imported allocation handles keep the
+        # backing memory alive until that peer releases its own mappings.
+        torch.cuda.synchronize(device=self.device)
+        if collective:
+            _C.nvl_barrier(self._barrier_peer_ptrs, self.rank % self.nvl_domain_size, 0)
+            torch.cuda.synchronize(device=self.device)
+        with torch.cuda.device(self.device):
             self.runtime.destroy()
         self.runtime = None
+        # Release local aliases before the owning regions. User-held aliases and
+        # captured graphs must no longer be in use when collectively destroying.
+        self.local_replica_weight_buffer = None
+        self.local_replica_fc1_weight_buffer = None
+        self.local_replica_fc2_weight_buffer = None
+        self.local_replica_weight_scale_buffer_raw = None
+        self.local_replica_fc1_weight_scale_buffer = None
+        self.local_replica_fc2_weight_scale_buffer = None
+        self.local_replica_grad_buffer = None
+        self.local_replica_fc1_grad_buffer = None
+        self.local_replica_fc2_grad_buffer = None
+        # Drop the Python Symmetric Memory handles only after C++ has released
+        # all local tensor views and asynchronous kernels have been synchronized.
+        self._symm_regions.clear()
+        self._nvl_load_peer_ptrs = None
+        self._barrier_peer_ptrs = None
+        release_runtime()
+
+    def __del__(self):
+        # Finalizers can run in different orders on different ranks. Only the
+        # explicit destroy() API may enter a collective.
+        if (
+            not getattr(self, "explicitly_destroy", True)
+            and getattr(self, "runtime", None) is not None
+        ):
+            self._destroy(collective=False)
 
     def allocate_microbatch_slot(self, real_layer_id: int) -> int:
         """Allocate the next virtual layer ID for this real layer.
@@ -445,6 +587,10 @@ class Manager:
                 pools are looked up by the real layer ID derived from this.
 
         Notes:
+            All domain ranks must participate, including ranks without tasks.
+            The calling stream or previous_event must cover local Wgrad producers.
+            Completion covers remote reads and clearing of replica gradients.
+            Wait on the returned event before reuse when async_finish=True.
             Supply all three placement tensors or omit all of them. Explicit
             placement has the same contract as ``weight_sync`` and must match
             the placement used by the corresponding forward pass.
@@ -481,8 +627,7 @@ class Manager:
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_counts: Optional[torch.Tensor] = None,
     ):
-        """
-        Synchronize master weights to replicas.
+        """Collectively copy master weights to replicas within each NVLink domain.
 
         The runtime derives a deterministic communication plan from the current
         placement. Mild cases stay on the flat direct fan-out path; extreme hot
@@ -498,6 +643,10 @@ class Manager:
             logical_replica_counts: Optional CUDA int32 [L] counts including masters.
 
         Notes:
+            All domain ranks must participate, including ranks without tasks.
+            The calling stream or previous_event must cover previous replica consumers.
+            Completion covers incoming peer writes; wait on the returned event
+            before consuming replica weights when async_finish=True.
             Supply all three maps or omit all to use internal placement.
             External maps must be contiguous on the manager's device and agree
             across ranks: fixed masters first, at most one instance per rank,
@@ -508,14 +657,10 @@ class Manager:
         Returns:
             EventHandle if async_finish=True, else None.
         """
-        assert layer_id < self.num_alloc_layers
+        assert 0 <= layer_id < self.num_alloc_layers
         real_lid = self._real_layer_id(layer_id)
-        assert (
-            self.local_master_fc1_weight_ptr_pool[real_lid] is not None
-            and self.local_master_fc2_weight_ptr_pool[real_lid] is not None
-            and self.local_master_fc1_weight_scale_ptr_pool[real_lid] is not None
-            and self.local_master_fc2_weight_scale_ptr_pool[real_lid] is not None
-        )
+        assert self.local_master_fc1_weight_ptr_pool[real_lid] is not None
+        assert self.local_master_fc2_weight_ptr_pool[real_lid] is not None
         with torch.cuda.nvtx.range(f"Launch weight_sync (layer {layer_id})"):
             event = self.runtime.weight_sync(
                 layer_id,
@@ -547,6 +692,34 @@ class Manager:
             self.grad_reduce_deterministic, self.grad_reduce_num_sms
         )
 
+    def _solve_placement_from_local_loads(self, layer_id: int):
+        """Gather EP-wide metadata and solve on the calling CUDA stream."""
+        if self.legacy_placement:
+            global_loads = self.runtime.get_global_logical_expert_loads_tensor()
+            global_loads.copy_(self._local_expert_loads)
+            dist.all_reduce(global_loads, group=self.group)
+            self.runtime.solve_placement_legacy(layer_id, global_loads)
+        else:
+            if self._nvl_load_peer_ptrs is not None:
+                _C.nvl_all_gather_loads(
+                    self._expert_loads_per_rank,
+                    self._local_expert_loads,
+                    self._nvl_load_peer_ptrs,
+                    self.rank,
+                )
+            else:
+                dist.all_gather_into_tensor(
+                    self._expert_loads_per_rank,
+                    self._local_expert_loads,
+                    group=self.group,
+                )
+            self.runtime.solve_placement(layer_id, self._expert_loads_per_rank)
+        self._load_profiler.stage_pre(
+            layer_id,
+            self._real_layer_id(layer_id),
+            self.runtime.get_global_logical_expert_loads_tensor(),
+        )
+
     def update_placement(
         self,
         layer_id: int,
@@ -575,13 +748,10 @@ class Manager:
             they remain valid until this slot is updated or the manager is destroyed.
         """
         assert layer_id < self.num_alloc_layers
+        routing_map = routing_map.contiguous()
         with torch.cuda.nvtx.range(f"Update placement (layer {layer_id})"):
-            self.runtime.update_placement(layer_id, routing_map)
-        self._load_profiler.stage_pre(
-            layer_id,
-            self._real_layer_id(layer_id),
-            self.runtime.get_global_logical_expert_loads_tensor(),
-        )
+            self.runtime.compute_local_loads(routing_map)
+            self._solve_placement_from_local_loads(layer_id)
         if verify_reduced_loads:
             global_logical_expert_loads = routing_map.sum(dim=0, dtype=torch.int32)
             dist.all_reduce(global_logical_expert_loads, group=self.group)
@@ -602,18 +772,13 @@ class Manager:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Plan from topk IDs and return the same views as ``update_placement``.
 
-        The calling stream waits for the placement to be ready, without blocking
-        the CPU. Other consumer streams must establish their own dependency.
+        Planning runs on the calling CUDA stream without blocking the CPU.
+        Other consumer streams must establish their own dependency.
         """
         assert layer_id < self.num_alloc_layers
-        self.runtime.update_placement_sparse(layer_id, topk_ids)
-        with torch.cuda.stream(self.get_comm_stream()):
-            self._load_profiler.stage_pre(
-                layer_id,
-                self._real_layer_id(layer_id),
-                self.runtime.get_global_logical_expert_loads_tensor(),
-            )
-        torch.cuda.current_stream().wait_stream(self.get_comm_stream())
+        topk_ids = topk_ids.contiguous()
+        self.runtime.compute_local_loads_sparse(topk_ids)
+        self._solve_placement_from_local_loads(layer_id)
         return (
             self._physical_to_logical_map[layer_id],
             self._logical_to_physical_map[layer_id],
@@ -670,7 +835,7 @@ class Manager:
             expanded_probs, expanded_routing_map = _DenseRerouteFunction.apply(
                 probs,
                 routing_map,
-                self.runtime,
+                self,
                 layer_id,
             )
         else:
@@ -735,6 +900,15 @@ class Manager:
             self.num_alloc_layers,
             self.num_global_logical_experts,
             self.num_ranks,
+        )
+        assert self._local_expert_loads.device == torch.device("cuda", self.device)
+        assert self._expert_loads_per_rank.device == torch.device("cuda", self.device)
+        assert self._local_expert_loads.dtype == torch.int32
+        assert self._expert_loads_per_rank.dtype == torch.int32
+        assert self._local_expert_loads.shape == (self.num_global_logical_experts,)
+        assert self._expert_loads_per_rank.shape == (
+            self.num_ranks,
+            self.num_global_logical_experts,
         )
         assert self.local_replica_weight_buffer.device == torch.device(
             "cuda", self.device

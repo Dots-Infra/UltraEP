@@ -9,12 +9,6 @@
 #include "launch.cuh"
 #include "ptx.cuh"
 
-// Forward declarations avoid pulling NVSHMEM device headers into this TU.
-namespace ultra_ep::runtime {
-extern bool is_runtime_initialized;
-extern int rank_idx;
-}  // namespace ultra_ep::runtime
-
 namespace ultra_ep::kernels {
 
 namespace {
@@ -1627,8 +1621,7 @@ void solve_placement(const int32_t* expert_loads,
     const int stride_elems = ((num_logical_per_nvl + 3) / 4) * 4;
     const size_t domain_loads_bytes = static_cast<size_t>(num_nvl_ranks) * stride_elems * sizeof(int32_t);
     const size_t occ_offset = (domain_loads_bytes + 7u) & ~size_t(7);
-    const int my_rank = rank_quota_source_rank >= 0 ? rank_quota_source_rank
-                                                    : (runtime::is_runtime_initialized ? runtime::rank_idx : 0);
+    const int my_rank = rank_quota_source_rank >= 0 ? rank_quota_source_rank : 0;
     const dim3 grid(num_nvl_domains);
 
     const size_t occ_bytes = 2 * static_cast<size_t>(QUOTA_SOLVER_WARPS) * num_logical_per_nvl * sizeof(uint64_t);
